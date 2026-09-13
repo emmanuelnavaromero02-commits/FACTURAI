@@ -8,15 +8,19 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, File, Form, Header, Query, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from ..db import tenant_session
 from ..deps import TenantContext, get_tenant_context
-from ..errors import RecursoNoEncontradoException
+from ..errors import (
+    MaximoIntentosExcedidoException,
+    RecursoNoEncontradoException,
+    ReintentoInvalidoException,
+)
 from ..models import Merchant, Ticket, TicketEstado, TicketEvent
-from ..services.queue import enqueue_ticket_extraction
+from ..services.queue import enqueue_ticket_extraction, enqueue_ticket_facturacion
 from ..services.upload import process_and_stream_upload
-from ..state_machine import FINAL_STATES
+from ..state_machine import FINAL_STATES, transition
 from ..storage import get_storage_service
 
 router = APIRouter(prefix="/v1/tickets", tags=["Tickets"])
@@ -26,6 +30,7 @@ class TicketResponse(BaseModel):
     id: str
     tenant_id: str
     estado: str
+    intentos: int = 0
     folio: Optional[str] = None
     web_id: Optional[str] = None
     fecha_ticket: Optional[str] = None
@@ -50,6 +55,7 @@ class TicketResponse(BaseModel):
             id=str(t.id),
             tenant_id=str(t.tenant_id),
             estado=t.estado.value,
+            intentos=t.intentos,
             folio=t.folio,
             web_id=t.web_id,
             fecha_ticket=str(t.fecha_ticket) if t.fecha_ticket else None,
@@ -274,3 +280,88 @@ async def stream_ticket_events(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/{ticket_id}/retry", response_model=TicketResponse, status_code=status.HTTP_202_ACCEPTED)
+async def retry_ticket(
+    ticket_id: uuid.UUID,
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Reintenta el proceso de facturación de un ticket previamente RECHAZADO:
+    - Solo permitido si el estado actual es 'rechazado'.
+    - Límite estricto de máximo 3 intentos.
+    - Transiciona a 'encolado' y encola de nuevo en ARQ.
+    """
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        res = await session.execute(
+            select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
+        )
+        ticket = res.scalar_one_or_none()
+        if not ticket:
+            raise RecursoNoEncontradoException("El ticket no fue encontrado.")
+
+        if ticket.estado != TicketEstado.RECHAZADO:
+            raise ReintentoInvalidoException(
+                f"Solo se pueden reintentar tickets en estado 'rechazado'. Estado actual: '{ticket.estado.value}'."
+            )
+
+        if ticket.intentos >= 3:
+            raise MaximoIntentosExcedidoException(
+                f"El ticket ha alcanzado el límite máximo de 3 intentos (intentos actuales: {ticket.intentos})."
+            )
+
+        await transition(
+            session,
+            ticket,
+            TicketEstado.ENCOLADO,
+            f"Reintento manual solicitado por usuario (intento previo {ticket.intentos}/3).",
+            tipo="reintento",
+        )
+        ticket.error_code = None
+        ticket.error_msg = None
+        await session.flush()
+        response_data = TicketResponse.from_model(ticket)
+
+    # Encolar en la cola ARQ de facturación
+    await enqueue_ticket_facturacion(ctx.tenant_id, ticket_id)
+
+    return response_data
+
+
+@router.delete("/{ticket_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_ticket(
+    ticket_id: uuid.UUID,
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Elimina un ticket del tenant:
+    - Borra la imagen de S3/MinIO si no ha sido borrada aún.
+    - Borra los eventos asociados y el ticket de la base de datos (con RLS activo).
+    """
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        res = await session.execute(
+            select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
+        )
+        ticket = res.scalar_one_or_none()
+        if not ticket:
+            raise RecursoNoEncontradoException("El ticket no fue encontrado.")
+
+        # Borrar imagen en S3/MinIO si existe
+        if ticket.image_key and not ticket.image_deleted_at:
+            storage = get_storage_service()
+            try:
+                await storage.delete(ticket.image_key)
+            except Exception:
+                pass
+
+        # Borrar eventos del ticket explícitamente y el ticket
+        await session.execute(
+            delete(TicketEvent).where(
+                TicketEvent.ticket_id == ticket_id,
+                TicketEvent.tenant_id == ctx.tenant_id,
+            )
+        )
+        await session.delete(ticket)
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

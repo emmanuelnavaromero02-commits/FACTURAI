@@ -1,5 +1,6 @@
 from functools import lru_cache
 from typing import Optional
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,8 +15,18 @@ class Settings(BaseSettings):
 
     # Entorno y logs
     ENVIRONMENT: str = "development"
+    ALLOW_MOCK_AUTH: bool = False
     DEBUG: bool = True
     LOG_LEVEL: str = "INFO"
+
+    @model_validator(mode="after")
+    def validate_security_settings(self) -> "Settings":
+        if self.ENVIRONMENT in ("production", "staging") and self.ALLOW_MOCK_AUTH:
+            raise ValueError(
+                "Configuración inválida y prohibida por seguridad: "
+                "ALLOW_MOCK_AUTH no puede ser True en entornos de 'production' o 'staging'."
+            )
+        return self
 
     # Base de Datos (Regla 2: facturia_app para runtime)
     DATABASE_URL: str = (

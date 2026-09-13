@@ -176,6 +176,34 @@ class RecursoNoEncontradoException(AppException):
         )
 
 
+class ReintentoInvalidoException(AppException):
+    def __init__(
+        self,
+        message: str = "Solo se pueden reintentar tickets en estado 'rechazado'.",
+        detail: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="reintento_invalido",
+            message=message,
+            detail=detail,
+        )
+
+
+class MaximoIntentosExcedidoException(AppException):
+    def __init__(
+        self,
+        message: str = "El ticket ha alcanzado el límite máximo de 3 intentos permitidos.",
+        detail: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="maximo_intentos_excedido",
+            message=message,
+            detail=detail,
+        )
+
+
 def register_error_handlers(app: FastAPI) -> None:
     """Registra los manejadores de error para que toda la API responda en formato uniforme."""
 

@@ -42,16 +42,9 @@ def detect_file_type_from_magic_bytes(header: bytes) -> Tuple[str, str]:
     # 5. HEIC / HEIF / ISO Media: ftyp en offset 4
     if header[4:8] == b"ftyp":
         brand = header[8:12]
-        if brand in (
-            b"heic",
-            b"heix",
-            b"hevc",
-            b"hevx",
-            b"mif1",
-            b"msf1",
-            b"heim",
-            b"heis",
-        ):
+        compatible = header[8:min(32, len(header))]
+        heic_brands = (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1", b"heim", b"heis")
+        if brand in heic_brands or any(b in compatible for b in (b"heic", b"heix", b"mif1", b"hevc")):
             return "heic", "image/heic"
 
     raise TipoArchivoInvalidoException(

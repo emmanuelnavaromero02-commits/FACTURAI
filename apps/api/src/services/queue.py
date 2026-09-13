@@ -53,3 +53,41 @@ async def enqueue_ticket_extraction(
         asyncio.create_task(
             process_ticket_extraction(tenant_id, ticket_id, explicit_merchant_slug)
         )
+
+
+async def enqueue_ticket_facturacion(
+    tenant_id: uuid.UUID,
+    ticket_id: uuid.UUID,
+    defer_seconds: int = 0,
+) -> None:
+    """
+    Encola el job de facturación con el motor correspondiente en ARQ.
+    Trampa 1 evitada: el payload lleva tenant_id explícito.
+    """
+    from ..worker import process_ticket_facturacion
+
+    if settings.ENVIRONMENT in ("test", "testing"):
+        if defer_seconds == 0:
+            await process_ticket_facturacion(tenant_id, ticket_id)
+        return
+
+    pool = await get_arq_pool()
+    if pool is not None:
+        kwargs = {}
+        if defer_seconds > 0:
+            kwargs["_defer_by"] = defer_seconds
+        await pool.enqueue_job(
+            "facturar_ticket_task",
+            str(tenant_id),
+            str(ticket_id),
+            **kwargs,
+        )
+    else:
+        import asyncio
+
+        async def run_delayed():
+            if defer_seconds > 0:
+                await asyncio.sleep(defer_seconds)
+            await process_ticket_facturacion(tenant_id, ticket_id)
+
+        asyncio.create_task(run_delayed())

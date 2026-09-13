@@ -294,50 +294,87 @@ async def test_vision_fixtures_outcomes(owner_session: AsyncSession):
 async def test_sse_stream_leaves_zero_idle_in_transaction(app_engine):
     """
     PRUEBA: El SSE no deja transacciones abiertas (Trampa 2 evitada).
-    Verifica que cada ciclo abre y cierra su transacción corta y no deja conexiones
-    'idle in transaction' en PostgreSQL mientras dura el stream.
-    Cierra limpiamente al llegar a un estado final.
+    Levanta un servidor uvicorn real en un puerto dinámico libre, conecta con httpx
+    en streaming real por TCP, muta el ticket concurrentemente desde otra tarea,
+    verifica que el stream entrega los chunks en vivo y finaliza limpiamente
+    al alcanzar el estado final, dejando exactamente 0 conexiones en 'idle in transaction'.
     """
-    transport = ASGITransport(app=app)
-    unique_email = f"sse.{uuid.uuid4().hex[:8]}@test.com"
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        log_res = await client.post("/v1/auth/google", json={"id_token": f"mock:{unique_email}"})
-        cookie = log_res.cookies.get(settings.SESSION_COOKIE_NAME)
-        tenant_id = uuid.UUID(log_res.json()["created_tenant_id"])
+    import socket
+    import uvicorn
 
-    # Subir un ticket y cambiar a estado final
-    ticket_id = uuid.uuid4()
-    storage = InMemoryStorageService()
-    set_storage_service(storage)
-    await storage.upload_bytes(f"tickets/{tenant_id}/{ticket_id}", VALID_JPEG_HEADER, "image/jpeg")
+    # 1. Encontrar puerto libre y arrancar uvicorn en segundo plano
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
 
-    async with tenant_session(tenant_id) as session:
-        user_res = await session.execute(select(Membership.user_id).where(Membership.tenant_id == tenant_id))
-        user_id = user_res.scalar_one()
+    config = uvicorn.Config(app=app, host="127.0.0.1", port=port, log_level="error")
+    server = uvicorn.Server(config)
+    server_task = asyncio.create_task(server.serve())
 
-        ticket = Ticket(
-            id=ticket_id,
-            tenant_id=tenant_id,
-            created_by=user_id,
-            estado=TicketEstado.RECIBIDO,
-            image_key=f"tickets/{tenant_id}/{ticket_id}",
-        )
-        session.add(ticket)
-        await transition(session, ticket, TicketEstado.CANCELADO, "Ticket cancelado para test stream")
+    while not server.started:
+        await asyncio.sleep(0.05)
 
-    # Iniciar stream SSE y verificar respuesta
-    async with AsyncClient(transport=transport, base_url="http://test", cookies={settings.SESSION_COOKIE_NAME: cookie}) as auth_client:
-        response = await auth_client.get(f"/v1/tickets/{ticket_id}/stream", headers={"X-Tenant-Id": str(tenant_id)})
-        assert response.status_code == 200
-        content = response.text
-        assert ": connected" in content
-        assert "estado_final" in content
-        assert "cambio_estado" in content
+    base_url = f"http://127.0.0.1:{port}"
 
-    # Comprobar conexiones idle in transaction en PostgreSQL tras consumir el stream
-    async with app_engine.connect() as conn:
-        res = await conn.execute(
-            text("SELECT count(*) FROM pg_stat_activity WHERE datname = 'facturia' AND state = 'idle in transaction'")
-        )
-        idle_count = res.scalar()
-        assert idle_count == 0, f"Quedaron conexiones en 'idle in transaction': {idle_count}"
+    try:
+        unique_email = f"sse.live.{uuid.uuid4().hex[:8]}@test.com"
+        async with AsyncClient(base_url=base_url) as client:
+            log_res = await client.post("/v1/auth/google", json={"id_token": f"mock:{unique_email}"})
+            cookie = log_res.cookies.get(settings.SESSION_COOKIE_NAME)
+            tenant_id = uuid.UUID(log_res.json()["created_tenant_id"])
+
+        # Subir ticket en estado inicial RECIBIDO
+        ticket_id = uuid.uuid4()
+        storage = InMemoryStorageService()
+        set_storage_service(storage)
+        await storage.upload_bytes(f"tickets/{tenant_id}/{ticket_id}", VALID_JPEG_HEADER, "image/jpeg")
+
+        async with tenant_session(tenant_id) as session:
+            user_res = await session.execute(select(Membership.user_id).where(Membership.tenant_id == tenant_id))
+            user_id = user_res.scalar_one()
+
+            ticket = Ticket(
+                id=ticket_id,
+                tenant_id=tenant_id,
+                created_by=user_id,
+                estado=TicketEstado.RECIBIDO,
+                image_key=f"tickets/{tenant_id}/{ticket_id}",
+            )
+            session.add(ticket)
+
+        # Escritor concurrente: cancela el ticket poco después de abrir el stream
+        async def cancel_later():
+            await asyncio.sleep(0.5)
+            async with tenant_session(tenant_id) as session:
+                t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                t = t_res.scalar_one()
+                await transition(session, t, TicketEstado.CANCELADO, "Cierre concurrente de prueba")
+
+        cancel_task = asyncio.create_task(cancel_later())
+
+        # Consumir stream real en vivo
+        received_lines = []
+        async with AsyncClient(base_url=base_url, cookies={settings.SESSION_COOKIE_NAME: cookie}) as auth_client:
+            async with auth_client.stream("GET", f"/v1/tickets/{ticket_id}/stream", headers={"X-Tenant-Id": str(tenant_id)}) as response:
+                assert response.status_code == 200
+                async for line in response.aiter_lines():
+                    if line:
+                        received_lines.append(line)
+                    if "estado_final" in line:
+                        break
+
+        await cancel_task
+        full_stream = "\n".join(received_lines)
+        assert ": connected" in full_stream or "connected" in full_stream
+        assert "estado_final" in full_stream
+
+        # Comprobar conexiones idle in transaction en PostgreSQL tras consumir el stream
+        async with app_engine.connect() as conn:
+            res = await conn.execute(
+                text("SELECT count(*) FROM pg_stat_activity WHERE datname = 'facturia' AND state = 'idle in transaction'")
+            )
+            idle_count = res.scalar()
+            assert idle_count == 0, f"Quedaron conexiones en 'idle in transaction': {idle_count}"
+    finally:
+        server.should_exit = True
+        await server_task

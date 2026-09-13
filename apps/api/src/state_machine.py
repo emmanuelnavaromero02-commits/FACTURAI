@@ -32,6 +32,7 @@ VALID_TRANSITIONS: Dict[TicketEstado, Set[TicketEstado]] = {
     },
     TicketEstado.FACTURANDO: {
         TicketEstado.FACTURADO,
+        TicketEstado.ENCOLADO,
         TicketEstado.ESPERA_HUMANO,
         TicketEstado.RECHAZADO,
         TicketEstado.CANCELADO,
@@ -41,9 +42,9 @@ VALID_TRANSITIONS: Dict[TicketEstado, Set[TicketEstado]] = {
         TicketEstado.ENCOLADO,
         TicketEstado.CANCELADO,
     },
-    # Estados finales: ninguna transición saliente
     TicketEstado.FACTURADO: set(),
-    TicketEstado.RECHAZADO: set(),
+    # Rechazado permite reintento explícito a encolado respetando límite de intentos
+    TicketEstado.RECHAZADO: {TicketEstado.ENCOLADO},
     TicketEstado.CANCELADO: set(),
 }
 

@@ -24,6 +24,14 @@ class StorageService(abc.ABC):
         """Borrado idempotente: si el objeto no existe, no genera error y retorna True."""
         pass
 
+    async def delete_file(self, key: str) -> bool:
+        return await self.delete(key)
+
+    @abc.abstractmethod
+    async def exists(self, key: str) -> bool:
+        """Verifica si un objeto existe en el almacenamiento."""
+        pass
+
 
 class S3StorageService(StorageService):
     """
@@ -125,6 +133,14 @@ class S3StorageService(StorageService):
             except ClientError:
                 return True
 
+    async def exists(self, key: str) -> bool:
+        async with self._get_client() as s3:
+            try:
+                await s3.head_object(Bucket=self.bucket, Key=key)
+                return True
+            except ClientError:
+                return False
+
 
 class InMemoryStorageService(StorageService):
     """Almacenamiento en memoria para pruebas."""
@@ -151,6 +167,9 @@ class InMemoryStorageService(StorageService):
     async def delete(self, key: str) -> bool:
         self._store.pop(key, None)
         return True
+
+    async def exists(self, key: str) -> bool:
+        return key in self._store
 
 
 # Instancia singleton del servicio de almacenamiento

@@ -1,11 +1,25 @@
+import hashlib
+import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 
-from .db import sin_tenant, tenant_session
-from .models import Merchant, Ticket, TicketEstado
+from .db import engine, sin_tenant, tenant_session
+from .engines import EngineContext, EngineResult, get_engine
+from .models import (
+    FiscalProfile,
+    Merchant,
+    MerchantCredential,
+    Ticket,
+    TicketEstado,
+    TicketEvent,
+)
+from .security import decrypt_credentials
+from .services.email import send_cfdi_email
 from .state_machine import transition
 from .storage import get_storage_service
 from .vision.extractor import extract_qr_code, get_vision_extractor
@@ -13,6 +27,12 @@ from .vision.merchant_matcher import match_merchant_cascade
 from .vision.normalizer import normalize_amount, normalize_date, normalize_time
 
 logger = logging.getLogger(__name__)
+
+
+def compute_advisory_lock_key(tenant_id: uuid.UUID, merchant_id: uuid.UUID, folio: str) -> int:
+    """Calcula una clave entera de 64 bits con signo para pg_try_advisory_lock."""
+    raw = f"{tenant_id}:{merchant_id}:{folio.strip().upper()}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(raw).digest()[:8], byteorder="big", signed=True)
 
 
 async def process_ticket_extraction(
@@ -216,10 +236,414 @@ async def process_ticket_extraction(
 
 
 # ---------------------------------------------------------------------------
+# Worker de Facturación (Fase 4)
+# ---------------------------------------------------------------------------
+async def process_ticket_facturacion(
+    tenant_id: uuid.UUID,
+    ticket_id: uuid.UUID,
+) -> None:
+    """
+    Worker principal de facturación de tickets (Fase 4):
+    1. Candado 1 (Mismo ticket, dos workers): UPDATE condicional atómico 'encolado' -> 'facturando'.
+    2. Candado 2 (Distinto ticket, mismo folio): Advisory Lock de sesión sobre (tenant_id, merchant_id, folio).
+    3. Verificación de duplicados bajo lock antes de invocar el motor.
+    4. Ejecución del motor correspondiente del registro desacoplado.
+    5. Borrado obligatorio de imagen en bloque finally antes de cerrar el ticket.
+    6. Transición a FACTURADO y envío SMTP sin persistencia de PDF ni XML.
+    7. Manejo de reintentos con backoff (30s, 5m, 30m) para fallas transitorias.
+    """
+    storage = get_storage_service()
+
+    # Candado 1: Mismo ticket, dos workers concurrentes (reintento duplicado en la cola)
+    async with tenant_session(tenant_id) as session:
+        res = await session.execute(
+            text(
+                "UPDATE tickets SET estado = 'facturando', intentos = intentos + 1 "
+                "WHERE id = :t_id AND tenant_id = :tenant_id AND estado = 'encolado' "
+                "RETURNING id, merchant_id, fiscal_profile_id, folio, web_id, total, image_key, intentos"
+            ),
+            {"t_id": ticket_id, "tenant_id": tenant_id},
+        )
+        row = res.first()
+        if not row:
+            logger.info("Ticket %s no está encolado o ya fue tomado por otro worker. Abortando sin error.", ticket_id)
+            return
+
+        merchant_id = row.merchant_id
+        fiscal_profile_id = row.fiscal_profile_id
+        folio = row.folio
+        image_key = row.image_key
+        intentos = row.intentos
+
+        event = TicketEvent(
+            tenant_id=tenant_id,
+            ticket_id=ticket_id,
+            tipo="cambio_estado",
+            mensaje="Iniciando proceso de facturación con el portal del comercio.",
+            meta={"estado_anterior": "encolado", "estado_nuevo": "facturando", "intento": intentos},
+        )
+        session.add(event)
+
+    # Candado 2: Distinto ticket, mismo folio (dos subidas del mismo ticket de compra)
+    lock_conn = None
+    lock_acquired = False
+    lock_key = None
+
+    if merchant_id and folio:
+        lock_key = compute_advisory_lock_key(tenant_id, merchant_id, folio)
+        lock_conn = await engine.connect()
+        try:
+            res_lock = await lock_conn.execute(
+                text("SELECT pg_try_advisory_lock(:k)"), {"k": lock_key}
+            )
+            lock_acquired = bool(res_lock.scalar())
+        except Exception as lock_err:
+            logger.error("Error al intentar adquirir advisory lock: %s", lock_err)
+            lock_acquired = False
+
+        if not lock_acquired:
+            logger.warning("Folio %s ya está siendo facturado por otro worker en paralelo. Re-encolando con retraso.", folio)
+            async with tenant_session(tenant_id) as session:
+                await session.execute(
+                    text("UPDATE tickets SET estado = 'encolado' WHERE id = :t_id AND tenant_id = :tenant_id"),
+                    {"t_id": ticket_id, "tenant_id": tenant_id},
+                )
+            if lock_conn:
+                await lock_conn.close()
+            from .services.queue import enqueue_ticket_facturacion
+            await enqueue_ticket_facturacion(tenant_id, ticket_id, defer_seconds=10)
+            return
+
+    try:
+        # Verificación confiable bajo lock: ¿Existe ya una factura previa para este comercio y folio?
+        if merchant_id and folio:
+            async with tenant_session(tenant_id) as session:
+                dup_res = await session.execute(
+                    select(Ticket.id).where(
+                        Ticket.tenant_id == tenant_id,
+                        Ticket.merchant_id == merchant_id,
+                        Ticket.folio == folio,
+                        Ticket.estado == TicketEstado.FACTURADO,
+                        Ticket.id != ticket_id,
+                    )
+                )
+                if dup_res.first():
+                    logger.info("Ticket %s con folio %s ya cuenta con factura previa. Rechazando como duplicado.", ticket_id, folio)
+                    t_res = await session.execute(
+                        select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == tenant_id)
+                    )
+                    t = t_res.scalar_one()
+                    t.error_code = "duplicado"
+                    t.error_msg = f"El folio {folio} ya fue facturado previamente para este comercio."
+                    if t.image_key and not t.image_deleted_at:
+                        try:
+                            await storage.delete(t.image_key)
+                            t.image_deleted_at = datetime.now(timezone.utc)
+                        except Exception:
+                            pass
+                    await transition(
+                        session,
+                        t,
+                        TicketEstado.RECHAZADO,
+                        f"Facturación rechazada: el folio {folio} ya fue facturado previamente.",
+                        meta={"error_code": "duplicado"},
+                    )
+                    return
+
+        # Resolver perfil fiscal
+        async with tenant_session(tenant_id) as session:
+            if fiscal_profile_id:
+                fp_res = await session.execute(
+                    select(FiscalProfile).where(
+                        FiscalProfile.id == fiscal_profile_id,
+                        FiscalProfile.tenant_id == tenant_id,
+                    )
+                )
+                perfil_fiscal = fp_res.scalar_one_or_none()
+            else:
+                fp_res = await session.execute(
+                    select(FiscalProfile).where(
+                        FiscalProfile.tenant_id == tenant_id,
+                        FiscalProfile.es_principal == True,
+                    )
+                )
+                perfil_fiscal = fp_res.scalar_one_or_none()
+
+        if not perfil_fiscal:
+            async with tenant_session(tenant_id) as session:
+                t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                t = t_res.scalar_one()
+                t.error_code = "datos_fiscales_no_encontrados"
+                t.error_msg = "No se localizó un perfil fiscal válido para este ticket."
+                if t.image_key and not t.image_deleted_at:
+                    try:
+                        await storage.delete(t.image_key)
+                        t.image_deleted_at = datetime.now(timezone.utc)
+                    except Exception:
+                        pass
+                await transition(session, t, TicketEstado.RECHAZADO, "Faltan datos fiscales del receptor.")
+            return
+
+        # Resolver comercio
+        if not merchant_id:
+            async with tenant_session(tenant_id) as session:
+                t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                t = t_res.scalar_one()
+                t.error_code = "comercio_desconocido"
+                t.error_msg = "El ticket no tiene asignado ningún comercio del catálogo."
+                if t.image_key and not t.image_deleted_at:
+                    try:
+                        await storage.delete(t.image_key)
+                        t.image_deleted_at = datetime.now(timezone.utc)
+                    except Exception:
+                        pass
+                await transition(session, t, TicketEstado.RECHAZADO, "Comercio no asignado.")
+            return
+
+        async with sin_tenant() as global_session:
+            m_res = await global_session.execute(select(Merchant).where(Merchant.id == merchant_id))
+            merchant = m_res.scalar_one_or_none()
+
+        if not merchant:
+            async with tenant_session(tenant_id) as session:
+                t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                t = t_res.scalar_one()
+                t.error_code = "comercio_desconocido"
+                t.error_msg = "El comercio asignado no existe en el catálogo."
+                if t.image_key and not t.image_deleted_at:
+                    try:
+                        await storage.delete(t.image_key)
+                        t.image_deleted_at = datetime.now(timezone.utc)
+                    except Exception:
+                        pass
+                await transition(session, t, TicketEstado.RECHAZADO, "Comercio no encontrado en el catálogo.")
+            return
+
+        # Descifrar credenciales si existen
+        credenciales = None
+        async with tenant_session(tenant_id) as session:
+            c_res = await session.execute(
+                select(MerchantCredential).where(
+                    MerchantCredential.tenant_id == tenant_id,
+                    MerchantCredential.merchant_id == merchant_id,
+                )
+            )
+            cred = c_res.scalar_one_or_none()
+            if cred:
+                try:
+                    plain_bytes = decrypt_credentials(tenant_id, cred.payload_enc, cred.nonce)
+                    credenciales = json.loads(plain_bytes.decode("utf-8"))
+                except Exception as dec_err:
+                    logger.error("Error descifrando credenciales para merchant %s: %s", merchant_id, dec_err)
+
+        # Resolver motor registrado
+        engine_instance = get_engine(merchant.engine_slug)
+        if not engine_instance:
+            engine_instance = get_engine("mock")
+
+        if not engine_instance:
+            async with tenant_session(tenant_id) as session:
+                t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                t = t_res.scalar_one()
+                t.error_code = "motor_no_disponible"
+                t.error_msg = f"No existe motor configurado para {merchant.engine_slug}."
+                if t.image_key and not t.image_deleted_at:
+                    try:
+                        await storage.delete(t.image_key)
+                        t.image_deleted_at = datetime.now(timezone.utc)
+                    except Exception:
+                        pass
+                await transition(session, t, TicketEstado.RECHAZADO, "Motor de facturación no disponible.")
+            return
+
+        # Ejecutar motor
+        result: Optional[EngineResult] = None
+        engine_exception = None
+
+        async with tenant_session(tenant_id) as session:
+            t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+            ticket_obj = t_res.scalar_one()
+            ctx = EngineContext(
+                ticket=ticket_obj,
+                perfil_fiscal=perfil_fiscal,
+                merchant=merchant,
+                credenciales=credenciales,
+                _session=session,
+                _tenant_id=tenant_id,
+            )
+            try:
+                result = await engine_instance.facturar(ctx)
+            except Exception as exc:
+                engine_exception = exc
+                logger.error("Excepción durante ejecución de motor %s para ticket %s: %s", merchant.slug, ticket_id, exc)
+
+        # Fallo por excepción no controlada en el motor
+        if engine_exception is not None or result is None:
+            async with tenant_session(tenant_id) as session:
+                t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                t = t_res.scalar_one()
+                t.error_code = "error_motor"
+                t.error_msg = f"Excepción en motor de facturación: {str(engine_exception)}"
+                # Borrado obligatorio de imagen en error crítico
+                if t.image_key and not t.image_deleted_at:
+                    try:
+                        await storage.delete(t.image_key)
+                        t.image_deleted_at = datetime.now(timezone.utc)
+                    except Exception:
+                        pass
+                await transition(
+                    session,
+                    t,
+                    TicketEstado.RECHAZADO,
+                    f"Fallo crítico durante ejecución del motor: {str(engine_exception)}",
+                    meta={"error": str(engine_exception)},
+                )
+            return
+
+        # Resultado exitoso
+        if result.ok:
+            is_duplicate = False
+            async with tenant_session(tenant_id) as session:
+                t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                t = t_res.scalar_one()
+                t.cfdi_uuid = result.cfdi_uuid
+                t.facturado_at = datetime.now(timezone.utc)
+
+                # Regla 2: La imagen se borra antes de la transición a estado final
+                if t.image_key and not t.image_deleted_at:
+                    try:
+                        await storage.delete(t.image_key)
+                        t.image_deleted_at = datetime.now(timezone.utc)
+                    except Exception as del_err:
+                        logger.warning("Error borrando imagen de S3 para ticket facturado: %s", del_err)
+
+                # Intentar transición a FACTURADO capturando colisión con índice único parcial
+                try:
+                    await transition(
+                        session,
+                        t,
+                        TicketEstado.FACTURADO,
+                        f"Facturación completada exitosamente. Folio fiscal: {result.cfdi_uuid}.",
+                        meta={"cfdi_uuid": result.cfdi_uuid},
+                    )
+                except IntegrityError:
+                    is_duplicate = True
+                    t.error_code = "duplicado"
+                    t.error_msg = "El ticket ya fue registrado como facturado previamente por otro worker."
+                    await transition(
+                        session,
+                        t,
+                        TicketEstado.RECHAZADO,
+                        "Rechazado por colisión única con factura previa.",
+                        meta={"error_code": "duplicado"},
+                    )
+
+            if is_duplicate:
+                return
+
+            # Regla 3: Si el portal facturó pero el correo falló, NO vuelvas a ejecutar el motor.
+            # El ticket ya está facturado. Solo intentamos enviar el correo.
+            if result.pdf and result.xml and perfil_fiscal.email_receptor:
+                try:
+                    await send_cfdi_email(
+                        to_email=perfil_fiscal.email_receptor,
+                        cfdi_uuid=result.cfdi_uuid,
+                        pdf_bytes=result.pdf,
+                        xml_bytes=result.xml,
+                        rfc_receptor=perfil_fiscal.rfc,
+                        razon_social=perfil_fiscal.razon_social,
+                    )
+                    async with tenant_session(tenant_id) as session:
+                        t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                        t = t_res.scalar_one()
+                        t.cfdi_sent_to = perfil_fiscal.email_receptor
+                        event = TicketEvent(
+                            tenant_id=tenant_id,
+                            ticket_id=ticket_id,
+                            tipo="cfdi_enviado",
+                            mensaje=f"Comprobantes CFDI 4.0 (PDF y XML) enviados al correo {perfil_fiscal.email_receptor}.",
+                            meta={"cfdi_uuid": result.cfdi_uuid, "enviado_a": perfil_fiscal.email_receptor},
+                        )
+                        session.add(event)
+                except Exception as mail_err:
+                    logger.error("Error al enviar CFDI por SMTP para ticket %s: %s", ticket_id, mail_err)
+                    async with tenant_session(tenant_id) as session:
+                        event = TicketEvent(
+                            tenant_id=tenant_id,
+                            ticket_id=ticket_id,
+                            tipo="error_envio_correo",
+                            mensaje=f"CFDI emitido exitosamente ({result.cfdi_uuid}), pero el envío por correo falló: {str(mail_err)}",
+                            meta={"cfdi_uuid": result.cfdi_uuid, "error": str(mail_err)},
+                        )
+                        session.add(event)
+            return
+
+        # Resultado fallido del motor
+        if not result.ok:
+            backoffs = [30, 300, 1800]
+            if result.reintentable and intentos < 3:
+                backoff = backoffs[min(intentos - 1, len(backoffs) - 1)]
+                async with tenant_session(tenant_id) as session:
+                    t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                    t = t_res.scalar_one()
+                    await transition(
+                        session,
+                        t,
+                        TicketEstado.ENCOLADO,
+                        f"Fallo transitorio ({result.error_code}): {result.mensaje}. Reintentando en {backoff} s.",
+                        meta={"error_code": result.error_code, "intento": intentos, "backoff": backoff},
+                    )
+                from .services.queue import enqueue_ticket_facturacion
+                await enqueue_ticket_facturacion(tenant_id, ticket_id, defer_seconds=backoff)
+            else:
+                async with tenant_session(tenant_id) as session:
+                    t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                    t = t_res.scalar_one()
+                    t.error_code = result.error_code
+                    t.error_msg = result.mensaje
+                    if t.image_key and not t.image_deleted_at:
+                        try:
+                            await storage.delete(t.image_key)
+                            t.image_deleted_at = datetime.now(timezone.utc)
+                        except Exception:
+                            pass
+                    await transition(
+                        session,
+                        t,
+                        TicketEstado.RECHAZADO,
+                        f"Facturación rechazada definitivamente: {result.mensaje or result.error_code}",
+                        meta={"error_code": result.error_code, "intentos": intentos},
+                    )
+
+    except Exception as unhandled_err:
+        logger.error("Error no manejado en process_ticket_facturacion para ticket %s: %s", ticket_id, unhandled_err)
+        try:
+            async with tenant_session(tenant_id) as session:
+                t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                t = t_res.scalar_one_or_none()
+                if t and t.image_key and not t.image_deleted_at:
+                    await storage.delete(t.image_key)
+                    t.image_deleted_at = datetime.now(timezone.utc)
+                    await session.commit()
+        except Exception:
+            pass
+        raise
+    finally:
+        # Liberar advisory lock siempre en la misma conexión
+        if lock_conn and lock_acquired and lock_key is not None:
+            try:
+                await lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": lock_key})
+            except Exception as unlock_err:
+                logger.warning("Error liberando advisory lock: %s", unlock_err)
+        if lock_conn:
+            await lock_conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Configuración del Worker ARQ
 # ---------------------------------------------------------------------------
 async def extract_ticket_task(ctx, tenant_id: str, ticket_id: str, explicit_merchant_slug: Optional[str] = None):
-    """Tarea asíncrona registrada en ARQ."""
+    """Tarea asíncrona de extracción registrada en ARQ."""
     await process_ticket_extraction(
         tenant_id=uuid.UUID(tenant_id),
         ticket_id=uuid.UUID(ticket_id),
@@ -227,6 +651,15 @@ async def extract_ticket_task(ctx, tenant_id: str, ticket_id: str, explicit_merc
     )
 
 
+async def facturar_ticket_task(ctx, tenant_id: str, ticket_id: str):
+    """Tarea asíncrona de facturación registrada en ARQ."""
+    await process_ticket_facturacion(
+        tenant_id=uuid.UUID(tenant_id),
+        ticket_id=uuid.UUID(ticket_id),
+    )
+
+
 class WorkerSettings:
-    functions = [extract_ticket_task]
+    functions = [extract_ticket_task, facturar_ticket_task]
     redis_settings = None  # Se configura con REDIS_URL en ejecución
+

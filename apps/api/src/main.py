@@ -12,7 +12,12 @@ from .routers.tenants import router as tenants_router
 from .routers.team import router as team_router
 from .routers.tickets import router as tickets_router
 
+import pillow_heif
+
 settings = get_settings()
+
+# Registrar compatibilidad con formato HEIC de iPhone en Pillow
+pillow_heif.register_heif_opener()
 
 
 @asynccontextmanager

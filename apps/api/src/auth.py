@@ -163,8 +163,15 @@ class FakeGoogleTokenVerifier(GoogleTokenVerifier):
         return payload
 
 
-# Instancia singleton del verificador (Fake en desarrollo y tests para permitir pruebas locales con curl)
-_verifier: GoogleTokenVerifier = FakeGoogleTokenVerifier() if settings.ENVIRONMENT != "production" else ProductionGoogleTokenVerifier()
+def is_mock_auth_allowed() -> bool:
+    """La autenticación simulada solo se permite si el entorno es desarrollo Y ALLOW_MOCK_AUTH es True."""
+    return settings.ENVIRONMENT == "development" and settings.ALLOW_MOCK_AUTH is True
+
+
+# Instancia singleton del verificador
+_verifier: GoogleTokenVerifier = (
+    FakeGoogleTokenVerifier() if is_mock_auth_allowed() else ProductionGoogleTokenVerifier()
+)
 
 
 def get_google_verifier() -> GoogleTokenVerifier:
