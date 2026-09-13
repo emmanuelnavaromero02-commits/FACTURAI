@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     SMTP_FROM: str = "no-reply@facturia.mx"
 
     # Cifrado de credenciales (Regla 6: AES-256-GCM derivado)
-    MASTER_ENCRYPTION_KEY: str = "dGhpc2lzYTMyeWJ0ZXNlY3JldGtleWZvcmFlcw=="
+    MASTER_ENCRYPTION_KEY: str = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
 
 
 @lru_cache

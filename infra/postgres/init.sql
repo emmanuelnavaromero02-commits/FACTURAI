@@ -6,7 +6,11 @@
 --    Row-Level Security (RLS) is strictly enforced on non-owners.
 -- ==============================================================================
 
--- 1. Create Roles
+-- 1. Enable Required Extensions
+CREATE EXTENSION IF NOT EXISTS citext;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 2. Create Roles
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'facturia_owner') THEN
