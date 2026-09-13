@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Dict, Any
+from typing import AsyncGenerator, Dict, Any, Optional
 from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -13,13 +13,30 @@ from .config import get_settings
 
 settings = get_settings()
 
-engine: AsyncEngine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=settings.DEBUG,
-    pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
+import os
+import sys
+from sqlalchemy.pool import NullPool
+
+is_testing = (
+    "pytest" in sys.modules
+    or os.getenv("PYTEST_CURRENT_TEST") is not None
+    or settings.ENVIRONMENT in ("test", "testing")
 )
+
+if is_testing:
+    engine: AsyncEngine = create_async_engine(
+        settings.DATABASE_URL,
+        echo=False,
+        poolclass=NullPool,
+    )
+else:
+    engine: AsyncEngine = create_async_engine(
+        settings.DATABASE_URL,
+        echo=settings.DEBUG,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20,
+    )
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
@@ -30,12 +47,13 @@ AsyncSessionLocal = async_sessionmaker(
 
 
 @asynccontextmanager
-async def tenant_session(tenant_id: UUID) -> AsyncGenerator[AsyncSession, None]:
+async def tenant_session(
+    tenant_id: UUID, user_id: Optional[UUID] = None
+) -> AsyncGenerator[AsyncSession, None]:
     """
     Context manager para operaciones con aislamiento RLS (Reglas 1 y 2).
-    Abre una transacción y fija 'app.tenant_id' estrictamente a nivel local de transacción.
-    El tercer argumento en 'true' garantiza que la variable se limpie al terminar la transacción
-    y nunca se contamine la conexión devuelta al pool.
+    Abre una transacción y fija 'app.tenant_id' y opcionalmente 'app.user_id'
+    estrictamente a nivel local de transacción (is_local = true).
     """
     async with AsyncSessionLocal() as session:
         async with session.begin():
@@ -43,20 +61,36 @@ async def tenant_session(tenant_id: UUID) -> AsyncGenerator[AsyncSession, None]:
                 text("SELECT set_config('app.tenant_id', :valor, true)"),
                 {"valor": str(tenant_id)},
             )
+            if user_id is not None:
+                await session.execute(
+                    text("SELECT set_config('app.user_id', :u, true)"),
+                    {"u": str(user_id)},
+                )
+            else:
+                await session.execute(text("SELECT set_config('app.user_id', '', true)"))
             yield session
 
 
 @asynccontextmanager
-async def sin_tenant() -> AsyncGenerator[AsyncSession, None]:
+async def sin_tenant(
+    user_id: Optional[UUID] = None
+) -> AsyncGenerator[AsyncSession, None]:
     """
-    Context manager para consultas de tablas globales (tenants, users, merchants).
+    Context manager para consultas de tablas globales o descubrimiento de membresías.
     Fija 'app.tenant_id' como cadena vacía a nivel local de transacción.
-    Si por error una consulta accede a tablas con RLS bajo este contexto,
-    Postgres devolverá cero filas sin lanzar error (gracias al nullif).
+    Si se especifica user_id, fija 'app.user_id', permitiendo consultar 'memberships'
+    mediante la policy 'propias_membresias' sin fijar tenant_id.
     """
     async with AsyncSessionLocal() as session:
         async with session.begin():
             await session.execute(text("SELECT set_config('app.tenant_id', '', true)"))
+            if user_id is not None:
+                await session.execute(
+                    text("SELECT set_config('app.user_id', :u, true)"),
+                    {"u": str(user_id)},
+                )
+            else:
+                await session.execute(text("SELECT set_config('app.user_id', '', true)"))
             yield session
 
 

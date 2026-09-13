@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     # Cifrado de credenciales (Regla 6: AES-256-GCM derivado)
     MASTER_ENCRYPTION_KEY: str = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
 
+    # Google OAuth y Sesiones
+    GOOGLE_CLIENT_ID: str = "facturia-local-client-id.apps.googleusercontent.com"
+    SESSION_COOKIE_NAME: str = "facturia_session"
+    SESSION_MAX_AGE_SECONDS: int = 60 * 60 * 24 * 7  # 7 días
+    SESSION_REFRESH_THRESHOLD_SECONDS: int = 60 * 60 * 24 * 2  # 2 días
+
 
 @lru_cache
 def get_settings() -> Settings:

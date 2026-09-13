@@ -5,6 +5,11 @@ from fastapi.responses import JSONResponse
 
 from .config import get_settings
 from .db import check_database_health, engine
+from .errors import register_error_handlers
+from .routers.auth import router as auth_router
+from .routers.me import router as me_router
+from .routers.tenants import router as tenants_router
+from .routers.team import router as team_router
 
 settings = get_settings()
 
@@ -13,7 +18,6 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     """Gestor de ciclo de vida para arranque y cierre limpio de la API."""
     yield
-    # Cierre de conexiones
     await engine.dispose()
 
 
@@ -25,6 +29,15 @@ app = FastAPI(
     docs_url="/docs" if settings.DEBUG else None,
     redoc_url="/redoc" if settings.DEBUG else None,
 )
+
+# 1. Registrar manejadores uniformes de error
+register_error_handlers(app)
+
+# 2. Registrar routers de endpoints
+app.include_router(auth_router)
+app.include_router(me_router)
+app.include_router(tenants_router)
+app.include_router(team_router)
 
 
 @app.get("/v1/health", tags=["Health"])

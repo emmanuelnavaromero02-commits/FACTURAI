@@ -1,3 +1,6 @@
+import os
+os.environ["ENVIRONMENT"] = "test"
+
 import uuid
 from decimal import Decimal
 from typing import AsyncGenerator, Dict, Any
