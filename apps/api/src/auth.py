@@ -163,8 +163,8 @@ class FakeGoogleTokenVerifier(GoogleTokenVerifier):
         return payload
 
 
-# Instancia singleton del verificador (configurable en tests)
-_verifier: GoogleTokenVerifier = FakeGoogleTokenVerifier() if settings.ENVIRONMENT == "test" else ProductionGoogleTokenVerifier()
+# Instancia singleton del verificador (Fake en desarrollo y tests para permitir pruebas locales con curl)
+_verifier: GoogleTokenVerifier = FakeGoogleTokenVerifier() if settings.ENVIRONMENT != "production" else ProductionGoogleTokenVerifier()
 
 
 def get_google_verifier() -> GoogleTokenVerifier:

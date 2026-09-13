@@ -10,6 +10,7 @@ from .routers.auth import router as auth_router
 from .routers.me import router as me_router
 from .routers.tenants import router as tenants_router
 from .routers.team import router as team_router
+from .routers.tickets import router as tickets_router
 
 settings = get_settings()
 
@@ -38,6 +39,7 @@ app.include_router(auth_router)
 app.include_router(me_router)
 app.include_router(tenants_router)
 app.include_router(team_router)
+app.include_router(tickets_router)
 
 
 @app.get("/v1/health", tags=["Health"])

@@ -10,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from src.auth import FakeGoogleTokenVerifier, set_google_verifier
 from src.config import get_settings
 from src.models import (
     Tenant,
@@ -21,6 +22,14 @@ from src.models import (
 )
 
 settings = get_settings()
+
+
+@pytest.fixture(autouse=True)
+def setup_fake_verifier():
+    """Configura el verificador falso de Google para todas las pruebas."""
+    fake_verifier = FakeGoogleTokenVerifier()
+    set_google_verifier(fake_verifier)
+    yield fake_verifier
 
 
 async def is_postgres_available() -> bool:

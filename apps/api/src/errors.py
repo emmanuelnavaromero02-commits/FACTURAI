@@ -134,6 +134,34 @@ class RolSuperiorNoPermitidoException(AppException):
         )
 
 
+class TipoArchivoInvalidoException(AppException):
+    def __init__(
+        self,
+        message: str = "El archivo enviado no es un formato válido. Aceptamos imágenes JPEG, PNG, HEIC, WebP y documentos PDF.",
+        detail: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="tipo_archivo_no_soportado",
+            message=message,
+            detail=detail,
+        )
+
+
+class ArchivoDemasiadoGrandeException(AppException):
+    def __init__(
+        self,
+        message: str = "El archivo supera el tamaño máximo permitido de 10 MB. Toma una foto más ligera o comprime el documento.",
+        detail: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="archivo_demasiado_grande",
+            message=message,
+            detail=detail,
+        )
+
+
 class RecursoNoEncontradoException(AppException):
     def __init__(
         self,
