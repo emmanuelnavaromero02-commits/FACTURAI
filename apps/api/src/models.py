@@ -135,6 +135,7 @@ class Merchant(Base):
     config: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     requiere_captcha: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     activo: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    entrega_esperada: Mapped[str] = mapped_column(String(20), default="emisor", server_default="emisor", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -206,6 +207,14 @@ class FiscalProfile(Base):
     uso_cfdi: Mapped[str] = mapped_column(String(10), default="G03", nullable=False)
     email_receptor: Mapped[str] = mapped_column(CITEXT, nullable=False)
     telefono: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    calle: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    numero_exterior: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    numero_interior: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    colonia: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    municipio_alcaldia: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    estado: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    pais: Mapped[str] = mapped_column(String(10), default="MEX", server_default="MEX", nullable=False)
+    curp: Mapped[Optional[str]] = mapped_column(String(18), nullable=True)
     es_principal: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -307,14 +316,23 @@ class Ticket(Base):
     image_key: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     image_deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    # CFDI nunca persistido (Regla 4: solo UUID y destino)
+    # CFDI nunca persistido (Regla 4: solo UUID y correo capturado en portal)
     cfdi_uuid: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
-    cfdi_sent_to: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    correo_capturado_en_portal: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    cfdi_disponible_hasta: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     facturado_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     error_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     error_msg: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     intentos: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Motor Genérico y Medición de Costos (Paso B)
+    url_facturacion: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    costo_total_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 5), nullable=True)
+    tokens_input_total: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    tokens_output_total: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pasos_agente: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    duracion_segundos: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 2), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -325,6 +343,7 @@ class Ticket(Base):
 
     tenant: Mapped["Tenant"] = relationship(back_populates="tickets")
     events: Mapped[List["TicketEvent"]] = relationship(back_populates="ticket", cascade="all, delete-orphan")
+    handoff_sessions: Mapped[List["HandoffSession"]] = relationship(back_populates="ticket", cascade="all, delete-orphan")
 
 
 class TicketEvent(Base):
@@ -384,3 +403,5 @@ class HandoffSession(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+    ticket: Mapped["Ticket"] = relationship(back_populates="handoff_sessions")

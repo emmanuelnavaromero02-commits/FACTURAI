@@ -94,6 +94,30 @@ async def sin_tenant(
             yield session
 
 
+admin_engine: AsyncEngine = create_async_engine(
+    settings.DATABASE_MIGRATION_URL,
+    poolclass=NullPool,
+)
+
+AdminSessionLocal = async_sessionmaker(
+    bind=admin_engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autoflush=False,
+)
+
+
+@asynccontextmanager
+async def admin_session() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Context manager para operaciones administrativas del sistema (rol facturia_owner).
+    Bypasses Row-Level Security para resolución de handoffs y migraciones.
+    """
+    async with AdminSessionLocal() as session:
+        async with session.begin():
+            yield session
+
+
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """Generador de sesiones asíncronas para inyección de dependencias en FastAPI."""
     async with AsyncSessionLocal() as session:

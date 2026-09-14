@@ -1,5 +1,6 @@
 import asyncio
 import io
+import logging
 import uuid
 from decimal import Decimal
 from typing import Any, Dict
@@ -33,7 +34,11 @@ from src.models import (
     TipoMotor,
     User,
 )
-from src.services.email import set_email_sender
+from src.services.cfdi_storage import (
+    InMemoryCfdiStorageService,
+    get_cfdi_storage,
+    set_cfdi_storage,
+)
 from src.state_machine import transition
 from src.storage import InMemoryStorageService, set_storage_service
 from src.worker import process_ticket_facturacion
@@ -41,86 +46,22 @@ from src.worker import process_ticket_facturacion
 settings = get_settings()
 
 
+from src.vision.extractor import FakeVisionExtractor, set_vision_extractor
+
 @pytest.fixture(autouse=True)
 def configure_test_services():
     """Configura storage en memoria y resetea mocks para cada test."""
     storage = InMemoryStorageService()
     set_storage_service(storage)
-    set_email_sender(None)
+    cfdi_storage = InMemoryCfdiStorageService()
+    set_cfdi_storage(cfdi_storage)
+    vision = FakeVisionExtractor()
+    set_vision_extractor(vision)
     MockFacturacionEngine.reset_invocations_count()
     return storage
 
 
-@pytest_asyncio.fixture(scope="function")
-async def setup_phase4_scenario(owner_session: AsyncSession) -> Dict[str, Any]:
-    """Crea tenant, usuario, membresía, comercio mock y perfil fiscal en la BD."""
-    t_id = uuid.uuid4()
-    u_id = uuid.uuid4()
-    m_id = uuid.uuid4()
-    fp_id = uuid.uuid4()
-
-    tenant = Tenant(
-        id=t_id,
-        nombre="Factura Corp SA",
-        slug=f"factura-corp-{t_id.hex[:6]}",
-        plan="pro",
-    )
-    user = User(
-        id=u_id,
-        email=f"owner-{u_id.hex[:6]}@factura.com",
-        nombre="Dueño Factura",
-        google_sub=f"google-sub-{u_id.hex[:8]}",
-    )
-    owner_session.add_all([tenant, user])
-    await owner_session.flush()
-
-    # Membresía owner
-    await owner_session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(t_id)})
-    membership = Membership(
-        tenant_id=t_id,
-        user_id=u_id,
-        rol=MembershipRole.OWNER,
-    )
-    owner_session.add(membership)
-
-    # Catálogo de comercio con motor mock
-    merchant = Merchant(
-        id=m_id,
-        nombre="Comercio Simulado OXXO",
-        slug=f"oxxo-mock-{m_id.hex[:6]}",
-        tipo_motor=TipoMotor.API,
-        engine_slug="mock",
-        activo=True,
-    )
-    owner_session.add(merchant)
-
-    # Perfil fiscal principal
-    fiscal_profile = FiscalProfile(
-        id=fp_id,
-        tenant_id=t_id,
-        razon_social="EMPRESA PRUEBA SA DE CV",
-        rfc="XAXX010101000",
-        cp="01000",
-        regimen_fiscal="601",
-        email_receptor="facturas@receptor.com",
-        es_principal=True,
-    )
-    owner_session.add(fiscal_profile)
-
-    await owner_session.commit()
-
-    session_token = sign_session_token(u_id, user.email)
-
-    return {
-        "tenant_id": t_id,
-        "user_id": u_id,
-        "merchant_id": m_id,
-        "fiscal_profile_id": fp_id,
-        "user_email": user.email,
-        "session_token": session_token,
-        "merchant": merchant,
-        "fiscal_profile": fiscal_profile,
-    }
+# Fixture setup_phase4_scenario provisto globalmente por conftest.py
 
 
 # ---------------------------------------------------------------------------
@@ -367,15 +308,16 @@ async def test_4_worker_concurrency_same_folio_exactly_one_invoice(setup_phase4_
 
 
 # ---------------------------------------------------------------------------
-# TEST 5: Desacoplamiento SMTP y no re-ejecución del motor
+# TEST 5: Entrega por emisor captura correo y no re-ejecuta el motor
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_5_smtp_failure_keeps_ticket_facturado_and_never_reruns_engine(setup_phase4_scenario: Dict[str, Any]):
+async def test_5_emisor_delivery_captures_email_and_never_reruns_engine(setup_phase4_scenario: Dict[str, Any]):
     """
-    PRUEBA: Si el motor emite la factura pero el envío por SMTP falla:
-    - El ticket queda en estado FACTURADO con su cfdi_uuid intacto.
-    - Se registra un evento de error de envío de correo.
-    - Si el worker vuelve a correr, el motor NUNCA se vuelve a ejecutar.
+    PRUEBA:
+    - Cuando el comercio/motor realiza entrega por 'emisor', el comprobante queda FACTURADO.
+    - Se registra correo_capturado_en_portal y el evento 'cfdi_enviado_por_emisor'.
+    - Facturia NUNCA envía correos SMTP por su cuenta.
+    - Si el worker vuelve a correr sobre el mismo ticket, el motor NUNCA se vuelve a ejecutar.
     """
     data = setup_phase4_scenario
     t_id = data["tenant_id"]
@@ -383,15 +325,10 @@ async def test_5_smtp_failure_keeps_ticket_facturado_and_never_reruns_engine(set
     storage = InMemoryStorageService()
     set_storage_service(storage)
 
-    # Simular caída de servidor SMTP
-    async def failing_email_sender(*args, **kwargs):
-        raise ConnectionRefusedError("SMTP server down: connection refused on port 25")
-
-    set_email_sender(failing_email_sender)
     MockFacturacionEngine.reset_invocations_count()
 
     image_key = f"tickets/{t_id}/{ticket_id}.jpg"
-    await storage.upload_bytes(image_key, b"IMG_SMTP_TEST", "image/jpeg")
+    await storage.upload_bytes(image_key, b"IMG_EMISOR_TEST", "image/jpeg")
 
     async with tenant_session(t_id) as session:
         ticket = Ticket(
@@ -401,7 +338,7 @@ async def test_5_smtp_failure_keeps_ticket_facturado_and_never_reruns_engine(set
             merchant_id=data["merchant_id"],
             fiscal_profile_id=data["fiscal_profile_id"],
             estado=TicketEstado.ENCOLADO,
-            folio="FOLIO-SMTP-FAIL-01",
+            folio="FOLIO-EMISOR-01",
             total=Decimal("200.00"),
             image_key=image_key,
         )
@@ -418,17 +355,18 @@ async def test_5_smtp_failure_keeps_ticket_facturado_and_never_reruns_engine(set
         # El ticket está FACTURADO
         assert t.estado == TicketEstado.FACTURADO
         assert t.cfdi_uuid is not None
+        assert t.correo_capturado_en_portal == "facturas@receptor.com"
 
-        # Revisar evento de error de correo
+        # Revisar evento de confirmación de entrega por emisor
         res_ev = await session.execute(
             select(TicketEvent).where(
                 TicketEvent.ticket_id == ticket_id,
-                TicketEvent.tipo == "error_envio_correo",
+                TicketEvent.tipo == "cfdi_enviado_por_emisor",
             )
         )
-        ev_smtp = res_ev.scalar_one_or_none()
-        assert ev_smtp is not None
-        assert "SMTP server down" in ev_smtp.mensaje
+        ev_emisor = res_ev.scalar_one_or_none()
+        assert ev_emisor is not None
+        assert "facturas@receptor.com" in ev_emisor.mensaje
 
     assert MockFacturacionEngine.invocations_count == 1
 
@@ -440,27 +378,23 @@ async def test_5_smtp_failure_keeps_ticket_facturado_and_never_reruns_engine(set
 
 
 # ---------------------------------------------------------------------------
-# TEST 6: Cero persistencia de PDF y XML
+# TEST 6: Cero persistencia de PDF y XML en DB, S3 y logs (con caplog)
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_6_zero_persistence_of_pdf_and_xml(setup_phase4_scenario: Dict[str, Any]):
+async def test_6_zero_persistence_of_pdf_and_xml_in_db_s3_and_logs(
+    setup_phase4_scenario: Dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+):
     """
     PRUEBA: Certificar que ni el PDF ni el XML generados se persisten en la
-    base de datos (columnas ni jsonb), ni en storage, ni en logs.
+    base de datos (columnas ni jsonb), ni en storage S3, ni en logs (auditoría caplog).
+    Solo residen temporalmente en el storage efímero cifrado.
     """
     data = setup_phase4_scenario
     t_id = data["tenant_id"]
     ticket_id = uuid.uuid4()
     storage = InMemoryStorageService()
     set_storage_service(storage)
-
-    captured_mail = {}
-
-    async def capturing_email_sender(to, uuid_str, pdf, xml, rfc, razon):
-        captured_mail["pdf"] = pdf
-        captured_mail["xml"] = xml
-
-    set_email_sender(capturing_email_sender)
 
     image_key = f"tickets/{t_id}/{ticket_id}.jpg"
     await storage.upload_bytes(image_key, b"IMG_ZERO_PERSIST", "image/jpeg")
@@ -473,19 +407,17 @@ async def test_6_zero_persistence_of_pdf_and_xml(setup_phase4_scenario: Dict[str
             merchant_id=data["merchant_id"],
             fiscal_profile_id=data["fiscal_profile_id"],
             estado=TicketEstado.ENCOLADO,
-            folio="FOLIO-ZERO-PERSIST",
+            folio="FOLIO-DESCARGA-ZERO-PERSIST",
             total=Decimal("450.00"),
             image_key=image_key,
         )
         session.add(ticket)
         await session.flush()
 
-    await process_ticket_facturacion(t_id, ticket_id)
+    with caplog.at_level(logging.DEBUG):
+        await process_ticket_facturacion(t_id, ticket_id)
 
-    assert "pdf" in captured_mail
-    assert "xml" in captured_mail
-
-    # 1. En storage no debe haber ningún archivo .pdf o .xml
+    # 1. En storage de imágenes S3 no debe haber ningún archivo .pdf o .xml
     for key in storage._store.keys():
         assert not key.endswith(".pdf")
         assert not key.endswith(".xml")
@@ -495,9 +427,8 @@ async def test_6_zero_persistence_of_pdf_and_xml(setup_phase4_scenario: Dict[str
         res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
         t = res.scalar_one()
 
-        # Solo UUID y destinatario
         assert t.cfdi_uuid is not None
-        assert t.cfdi_sent_to == "facturas@receptor.com"
+        assert t.cfdi_disponible_hasta is not None
 
         # Verificar eventos
         res_events = await session.execute(
@@ -510,6 +441,13 @@ async def test_6_zero_persistence_of_pdf_and_xml(setup_phase4_scenario: Dict[str
             assert "<cfdi:Comprobante" not in ev.mensaje
             assert "pdf" not in ev.meta
             assert "xml" not in ev.meta
+
+    # 3. Auditoría de logs: el contenido de comprobantes (%PDF y <cfdi:Comprobante)
+    # y datos PII nunca se imprimieron en logs
+    log_content = caplog.text
+    assert "%PDF" not in log_content
+    assert "<cfdi:Comprobante" not in log_content
+    assert "XAXX010101000" not in log_content
 
 
 # ---------------------------------------------------------------------------
@@ -845,11 +783,6 @@ async def test_11_full_ticket_lifecycle_events_trace(setup_phase4_scenario: Dict
     image_key = f"tickets/{t_id}/{ticket_id}.jpg"
     await storage.upload_bytes(image_key, b"FULL_LIFECYCLE_IMAGE", "image/jpeg")
 
-    async def successful_email_sender(*args, **kwargs):
-        pass
-
-    set_email_sender(successful_email_sender)
-
     # 1. Crear en estado RECIBIDO
     async with tenant_session(t_id) as session:
         ticket = Ticket(
@@ -911,3 +844,379 @@ async def test_11_full_ticket_lifecycle_events_trace(setup_phase4_scenario: Dict
     for ev in all_events:
         print(f"[{ev.id}] {ev.ts.isoformat()} | Tipo: {ev.tipo:<16} | Mensaje: {ev.mensaje}")
     print("----------------------------------------\n")
+
+
+# ---------------------------------------------------------------------------
+# TEST 12: Descarga efímera y límite de 5 descargas (Corrección A)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_12_cfdi_download_endpoint_and_5_downloads_limit(setup_phase4_scenario: Dict[str, Any]):
+    """
+    PRUEBA:
+    - Ticket facturado con entrega='descarga' empaqueta ZIP con PDF y XML cifrado en Redis/storage.
+    - Endpoint GET /v1/tickets/{id}/cfdi permite hasta 5 descargas exitosas (200 OK con Content-Type application/zip).
+    - El 6to intento devuelve 404 con error cfdi_expirado.
+    """
+    import zipfile
+    data = setup_phase4_scenario
+    t_id = data["tenant_id"]
+    u_id = data["user_id"]
+    m_id = data["merchant_id"]
+    fp_id = data["fiscal_profile_id"]
+    ticket_id = uuid.uuid4()
+    storage = InMemoryStorageService()
+    set_storage_service(storage)
+
+    image_key = f"tickets/{t_id}/{ticket_id}.jpg"
+    await storage.upload_bytes(image_key, b"IMG_DESCARGA", "image/jpeg")
+
+    async with tenant_session(t_id) as session:
+        ticket = Ticket(
+            id=ticket_id,
+            tenant_id=t_id,
+            created_by=u_id,
+            merchant_id=m_id,
+            fiscal_profile_id=fp_id,
+            estado=TicketEstado.ENCOLADO,
+            folio="FOLIO-DESCARGA-LIMIT",
+            total=Decimal("800.00"),
+            image_key=image_key,
+        )
+        session.add(ticket)
+        await session.flush()
+
+    await process_ticket_facturacion(t_id, ticket_id)
+
+    async with tenant_session(t_id) as session:
+        t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+        t = t_res.scalar_one()
+        assert t.estado == TicketEstado.FACTURADO
+        assert t.cfdi_disponible_hasta is not None
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        cookies={settings.SESSION_COOKIE_NAME: data["session_token"]},
+    ) as client:
+        # Descargas 1 a 5 deben responder 200 OK con el ZIP válido
+        for i in range(1, 6):
+            res = await client.get(
+                f"/v1/tickets/{ticket_id}/cfdi",
+                headers={"X-Tenant-Id": str(t_id)},
+            )
+            assert res.status_code == 200, f"Descarga {i} falló con status {res.status_code}"
+            assert res.headers["content-type"] == "application/zip"
+            zip_buf = io.BytesIO(res.content)
+            with zipfile.ZipFile(zip_buf, "r") as zf:
+                filenames = zf.namelist()
+                assert any(name.endswith(".pdf") for name in filenames)
+                assert any(name.endswith(".xml") for name in filenames)
+
+        # Descarga 6: El límite de 5 descargas se agotó; debe responder 404 cfdi_expirado
+        res_6 = await client.get(
+            f"/v1/tickets/{ticket_id}/cfdi",
+            headers={"X-Tenant-Id": str(t_id)},
+        )
+        assert res_6.status_code == 404
+        assert res_6.json()["error"]["code"] == "cfdi_expirado"
+
+
+# ---------------------------------------------------------------------------
+# TEST 13: Descarga de CFDI expirado tras TTL (Corrección A)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_13_cfdi_download_expired_returns_404(setup_phase4_scenario: Dict[str, Any]):
+    """
+    PRUEBA:
+    - Pasado el TTL o eliminado el bundle de storage efímero,
+      GET /v1/tickets/{id}/cfdi responde 404 con code 'cfdi_expirado'.
+    """
+    data = setup_phase4_scenario
+    t_id = data["tenant_id"]
+    u_id = data["user_id"]
+    m_id = data["merchant_id"]
+    fp_id = data["fiscal_profile_id"]
+    ticket_id = uuid.uuid4()
+    storage = InMemoryStorageService()
+    set_storage_service(storage)
+
+    image_key = f"tickets/{t_id}/{ticket_id}.jpg"
+    await storage.upload_bytes(image_key, b"IMG_EXP", "image/jpeg")
+
+    async with tenant_session(t_id) as session:
+        ticket = Ticket(
+            id=ticket_id,
+            tenant_id=t_id,
+            created_by=u_id,
+            merchant_id=m_id,
+            fiscal_profile_id=fp_id,
+            estado=TicketEstado.ENCOLADO,
+            folio="FOLIO-DESCARGA-EXP",
+            total=Decimal("150.00"),
+            image_key=image_key,
+        )
+        session.add(ticket)
+        await session.flush()
+
+    await process_ticket_facturacion(t_id, ticket_id)
+
+    # Simular expiración de TTL en Redis/cfdi_storage
+    cfdi_storage = get_cfdi_storage()
+    await cfdi_storage.delete_cfdi_bundle(t_id, ticket_id)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        cookies={settings.SESSION_COOKIE_NAME: data["session_token"]},
+    ) as client:
+        res = await client.get(
+            f"/v1/tickets/{ticket_id}/cfdi",
+            headers={"X-Tenant-Id": str(t_id)},
+        )
+        assert res.status_code == 404
+        assert res.json()["error"]["code"] == "cfdi_expirado"
+
+
+# ---------------------------------------------------------------------------
+# TEST 14: Aviso de divergencia de entrega esperada vs obtenida (Corrección B)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_14_divergence_of_expected_delivery_logs_event(setup_phase4_scenario: Dict[str, Any]):
+    """
+    PRUEBA:
+    - Si el comercio tiene entrega_esperada='emisor', pero el motor termina con entrega='descarga',
+      se registra un TicketEvent de tipo 'aviso_entrega_inesperada' detallando la discrepancia.
+    """
+    data = setup_phase4_scenario
+    t_id = data["tenant_id"]
+    u_id = data["user_id"]
+    m_id = data["merchant_id"]
+    fp_id = data["fiscal_profile_id"]
+    ticket_id = uuid.uuid4()
+    storage = InMemoryStorageService()
+    set_storage_service(storage)
+
+    image_key = f"tickets/{t_id}/{ticket_id}.jpg"
+    await storage.upload_bytes(image_key, b"IMG_DIVERGENTE", "image/jpeg")
+
+    async with tenant_session(t_id) as session:
+        ticket = Ticket(
+            id=ticket_id,
+            tenant_id=t_id,
+            created_by=u_id,
+            merchant_id=m_id,
+            fiscal_profile_id=fp_id,
+            estado=TicketEstado.ENCOLADO,
+            folio="FOLIO-DESCARGA-DIVERGENTE",  # motor dará descarga, pero merchant espera emisor
+            total=Decimal("320.00"),
+            image_key=image_key,
+        )
+        session.add(ticket)
+        await session.flush()
+
+    await process_ticket_facturacion(t_id, ticket_id)
+
+    async with tenant_session(t_id) as session:
+        t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+        t = t_res.scalar_one()
+        assert t.estado == TicketEstado.FACTURADO
+
+        ev_res = await session.execute(
+            select(TicketEvent).where(
+                TicketEvent.ticket_id == ticket_id,
+                TicketEvent.tipo == "aviso_entrega_inesperada",
+            )
+        )
+        ev_div = ev_res.scalar_one_or_none()
+        assert ev_div is not None
+        assert ev_div.meta["entrega_obtenida"] == "descarga"
+        assert ev_div.meta["entrega_esperada"] == "emisor"
+
+
+# ---------------------------------------------------------------------------
+# TEST 15: Validación previa de email_receptor cuando entrega_esperada=='emisor' (Corrección B)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_15_pre_validation_fails_without_email_and_does_not_execute_engine(
+    setup_phase4_scenario: Dict[str, Any],
+):
+    """
+    PRUEBA:
+    - Si el comercio tiene entrega_esperada='emisor' y el perfil fiscal NO tiene email_receptor (vacío):
+      1. El motor NO se ejecuta (MockFacturacionEngine.invocations_count == 0).
+      2. El ticket pasa a RECHAZADO con error_code='perfil_incompleto'.
+      3. No se gastan intentos (intentos permanece en 0).
+    """
+    data = setup_phase4_scenario
+    t_id = data["tenant_id"]
+    u_id = data["user_id"]
+    m_id = data["merchant_id"]
+    fp_id = data["fiscal_profile_id"]
+    ticket_id = uuid.uuid4()
+    storage = InMemoryStorageService()
+    set_storage_service(storage)
+    MockFacturacionEngine.reset_invocations_count()
+
+    # Dejar en blanco el email del perfil fiscal bajo tenant_session (email_receptor es NOT NULL)
+    async with tenant_session(t_id) as session:
+        await session.execute(
+            text("UPDATE fiscal_profiles SET email_receptor = '' WHERE id = :fp_id"),
+            {"fp_id": fp_id},
+        )
+        await session.commit()
+
+    image_key = f"tickets/{t_id}/{ticket_id}.jpg"
+    await storage.upload_bytes(image_key, b"IMG_NO_EMAIL", "image/jpeg")
+
+    async with tenant_session(t_id) as session:
+        ticket = Ticket(
+            id=ticket_id,
+            tenant_id=t_id,
+            created_by=u_id,
+            merchant_id=m_id,
+            fiscal_profile_id=fp_id,
+            estado=TicketEstado.ENCOLADO,
+            folio="FOLIO-EMISOR-SIN-EMAIL",
+            total=Decimal("199.00"),
+            image_key=image_key,
+        )
+        session.add(ticket)
+        await session.flush()
+
+    await process_ticket_facturacion(t_id, ticket_id)
+
+    # 1. El motor NO se ejecutó
+    assert MockFacturacionEngine.invocations_count == 0
+
+    # 2. El ticket queda en RECHAZADO con perfil_incompleto y 0 intentos
+    async with tenant_session(t_id) as session:
+        t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+        t = t_res.scalar_one()
+        assert t.estado == TicketEstado.RECHAZADO
+        assert t.error_code == "perfil_incompleto"
+        assert t.intentos == 0
+
+
+# ---------------------------------------------------------------------------
+# TEST 16: Regla 10 - Faltante fiscal no agota intentos y reintenta tras completar perfil
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_16_regla_10_missing_colonia_does_not_consume_attempts_and_can_be_retried(
+    setup_phase4_scenario: Dict[str, Any],
+):
+    """
+    PRUEBA DE REGLA 10 (Corrección C y D):
+    - El portal pide colonia (folio PERFIL-INCOMPLETO).
+    - El perfil fiscal no tiene colonia configurada.
+    - Se simulan 4 ejecuciones del worker (más del límite de 3).
+    - En cada una: el ticket se rechaza con error_code='perfil_incompleto' y NO incrementa intentos.
+    - El endpoint POST /v1/tickets/{id}/retry no bloquea el reintento por límite de intentos.
+    - Al actualizar la colonia en el perfil y reintentar, la facturación culmina en FACTURADO
+      sin necesidad de resubir la fotografía del ticket.
+    """
+    data = setup_phase4_scenario
+    t_id = data["tenant_id"]
+    u_id = data["user_id"]
+    m_id = data["merchant_id"]
+    fp_id = data["fiscal_profile_id"]
+    ticket_id = uuid.uuid4()
+    storage = InMemoryStorageService()
+    set_storage_service(storage)
+
+    # Dejar colonia en NULL bajo tenant_session
+    async with tenant_session(t_id) as session:
+        await session.execute(
+            text("UPDATE fiscal_profiles SET colonia = NULL, email_receptor = 'facturas@receptor.com' WHERE id = :fp_id"),
+            {"fp_id": fp_id},
+        )
+
+    image_key = f"tickets/{t_id}/{ticket_id}.jpg"
+    await storage.upload_bytes(image_key, b"IMG_PERFIL_INCOMPLETO", "image/jpeg")
+
+    async with tenant_session(t_id) as session:
+        ticket = Ticket(
+            id=ticket_id,
+            tenant_id=t_id,
+            created_by=u_id,
+            merchant_id=m_id,
+            fiscal_profile_id=fp_id,
+            estado=TicketEstado.ENCOLADO,
+            folio="FOLIO-PERFIL-INCOMPLETO-TEST",
+            total=Decimal("540.00"),
+            image_key=image_key,
+        )
+        session.add(ticket)
+        await session.flush()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        cookies={settings.SESSION_COOKIE_NAME: data["session_token"]},
+    ) as client:
+        # Ejecutar worker y reintentar 3 veces consecutivas con el perfil incompleto
+        for attempt in range(1, 4):
+            await process_ticket_facturacion(t_id, ticket_id)
+
+            async with tenant_session(t_id) as session:
+                t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                t = t_res.scalar_one()
+                assert t.estado == TicketEstado.RECHAZADO
+                assert t.error_code == "perfil_incompleto"
+                # Corrección C: NO incrementa el contador de intentos
+                assert t.intentos == 0
+
+            # Reintentar vía API (no debe fallar con 400 por límite excedido a pesar de múltiples intentos)
+            retry_res = await client.post(
+                f"/v1/tickets/{ticket_id}/retry",
+                headers={"X-Tenant-Id": str(t_id)},
+            )
+            assert retry_res.status_code == 202
+
+        # Ahora el usuario completa su perfil agregando la colonia
+        async with tenant_session(t_id) as session:
+            await session.execute(
+                text("UPDATE fiscal_profiles SET colonia = 'Del Valle Sur' WHERE id = :fp_id"),
+                {"fp_id": fp_id},
+            )
+
+        # El usuario solicita reintento con el perfil corregido
+        retry_res = await client.post(
+            f"/v1/tickets/{ticket_id}/retry",
+            headers={"X-Tenant-Id": str(t_id)},
+        )
+        assert retry_res.status_code == 202
+
+        # El worker procesa y culmina en FACTURADO exitosamente sin resubir foto
+        async with tenant_session(t_id) as session:
+            t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+            t_final = t_res.scalar_one()
+            assert t_final.estado == TicketEstado.FACTURADO
+            assert t_final.cfdi_uuid is not None
+
+
+# ---------------------------------------------------------------------------
+# TEST 17: Ausencia absoluta de dependencias SMTP en Facturia
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_17_absolute_absence_of_smtp_and_email_dependencies():
+    """
+    PRUEBA ARQUITECTÓNICA:
+    - aiosmtplib no existe en el entorno ni en dependencias.
+    - No existe el módulo src.services.email.
+    - Settings no contiene ninguna configuración de servidor SMTP.
+    """
+    import importlib.util
+
+    # 1. aiosmtplib no está disponible
+    assert importlib.util.find_spec("aiosmtplib") is None
+
+    # 2. src.services.email no existe
+    assert importlib.util.find_spec("src.services.email") is None
+
+    # 3. Settings no tiene campos SMTP_*
+    current_settings = get_settings()
+    for attr in dir(current_settings):
+        assert not attr.startswith("SMTP_"), f"Encontrado residuo de configuración SMTP: {attr}"

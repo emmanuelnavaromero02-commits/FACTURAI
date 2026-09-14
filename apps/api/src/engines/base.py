@@ -1,25 +1,37 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, Type
+from typing import Any, Callable, Dict, Literal, Optional, Type
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import FiscalProfile, Merchant, Ticket, TicketEvent, TipoMotor
 
 
+class HandoffConcurrenciaExcedidaException(Exception):
+    """Excepción lanzada cuando se alcanza HANDOFF_MAX_CONCURRENTES."""
+    pass
+
+
 class HandoffInterface:
     """
     Protocolo de solicitud de intervención humana para resolver captchas o retos en vivo.
-    En Fase 4 es un stub que levanta NotImplementedError. Se implementa con WebSocket en Fase 5.
     """
 
-    async def request(self, motivo: str, timeout: int = 120) -> bool:
+    async def request(
+        self,
+        motivo: str,
+        page: Any = None,
+        ctx: Any = None,
+        submission_attempted: bool = False,
+        timeout_seconds: Optional[int] = None,
+    ) -> bool:
         """
-        Solicita resolución humana. Devuelve True si un humano resolvió a tiempo, False si expiró.
-        El motor no conoce ni le importa el transporte ni la mecánica interna.
+        Solicita resolución humana. Devuelve True si un humano resolvió a tiempo, False si expiró o se canceló.
         """
-        raise NotImplementedError("Handoff humano se implementa en Fase 5")
+        raise NotImplementedError("HandoffInterface base debe implementarse.")
 
+
+from decimal import Decimal
 
 @dataclass
 class EngineResult:
@@ -27,12 +39,20 @@ class EngineResult:
 
     ok: bool
     cfdi_uuid: Optional[str] = None
-    enviado_a: Optional[str] = None
+    entrega: Literal["emisor", "descarga", "ninguna"] = "ninguna"
+    correo_capturado: Optional[str] = None
     pdf: Optional[bytes] = None
     xml: Optional[bytes] = None
     error_code: Optional[str] = None
     mensaje: Optional[str] = None
     reintentable: bool = False
+
+    # Métricas de costo y pasos del agente (Paso B)
+    costo_usd: Optional[Decimal] = None
+    tokens_input: Optional[int] = None
+    tokens_output: Optional[int] = None
+    pasos: Optional[int] = None
+    duracion_segundos: Optional[Decimal] = None
 
 
 @dataclass
@@ -44,7 +64,7 @@ class EngineContext:
 
     ticket: Ticket
     perfil_fiscal: FiscalProfile
-    merchant: Merchant
+    merchant: Optional[Merchant] = None
     credenciales: Optional[Dict[str, Any]] = None
     handoff: HandoffInterface = field(default_factory=HandoffInterface)
     _session: Optional[AsyncSession] = None

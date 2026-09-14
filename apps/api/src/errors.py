@@ -204,6 +204,38 @@ class MaximoIntentosExcedidoException(AppException):
         )
 
 
+class CfdiExpiradoException(AppException):
+    def __init__(
+        self,
+        message: str = (
+            "El archivo de este CFDI ya expiró o superó el límite de descargas. "
+            "Por política de privacidad y seguridad no conservamos copias permanentes de tus comprobantes. "
+            "Puedes consultar o descargar tu factura directamente en el portal del SAT o del comercio emisor."
+        ),
+        detail: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(
+            status_code=status.HTTP_404_NOT_FOUND,
+            code="cfdi_expirado",
+            message=message,
+            detail=detail,
+        )
+
+
+class PerfilIncompletoException(AppException):
+    def __init__(
+        self,
+        message: str = "Faltan datos fiscales requeridos por el comercio en el perfil fiscal del tenant.",
+        detail: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="perfil_incompleto",
+            message=message,
+            detail=detail,
+        )
+
+
 def register_error_handlers(app: FastAPI) -> None:
     """Registra los manejadores de error para que toda la API responda en formato uniforme."""
 

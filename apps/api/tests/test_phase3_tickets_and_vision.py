@@ -18,6 +18,7 @@ from src.models import (
     Tenant,
     Ticket,
     TicketEstado,
+    TicketEvent,
     TipoMotor,
     User,
 )
@@ -291,6 +292,79 @@ async def test_vision_fixtures_outcomes(owner_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_vision_model_escalation_records_ticket_events(owner_session):
+    """
+    PRUEBA: Si la confianza es baja (< 0.6) con ANTHROPIC_MODEL_VISION,
+    el worker escala UNA vez a ANTHROPIC_MODEL_AGENTE y registra el evento en ticket_events.
+    """
+    storage = InMemoryStorageService()
+    set_storage_service(storage)
+    vision = FakeVisionExtractor()
+    set_vision_extractor(vision)
+
+    t_id = uuid.uuid4()
+    u_id = uuid.uuid4()
+    ticket_id = uuid.uuid4()
+
+    tenant = Tenant(id=t_id, nombre="Empresa Escalamiento", slug=f"esc-{t_id.hex[:6]}", plan="free")
+    user = User(id=u_id, email=f"user-{u_id.hex[:6]}@test.com", nombre="User", google_sub=f"sub-{u_id.hex}")
+    m_res = await owner_session.execute(select(Merchant).where(Merchant.slug == "oxxo"))
+    merchant = m_res.scalar_one_or_none()
+    if not merchant:
+        merchant = Merchant(
+            id=uuid.uuid4(),
+            slug="oxxo",
+            nombre="Cadena Comercial Oxxo",
+            tipo_motor=TipoMotor.WEB,
+            engine_slug="oxxo_web",
+            patrones=["oxxo.com", "CCO8605231N4", "Oxxo"],
+            activo=True,
+        )
+        owner_session.add(merchant)
+    owner_session.add_all([tenant, user])
+    await owner_session.flush()
+
+    image_key = f"tickets/{t_id}/{ticket_id}"
+    await storage.upload_bytes(image_key, VALID_JPEG_HEADER, "image/jpeg")
+
+    ticket = Ticket(
+        id=ticket_id,
+        tenant_id=t_id,
+        created_by=u_id,
+        estado=TicketEstado.RECIBIDO,
+        image_key=image_key,
+    )
+    await owner_session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(t_id)})
+    owner_session.add(ticket)
+    await owner_session.commit()
+
+    # Configurar modo borroso_escalable: con VISION da borroso (0.45), con AGENTE da bueno (0.95)
+    vision.set_mode("borroso_escalable")
+
+    await process_ticket_extraction(t_id, ticket_id)
+
+    async with tenant_session(t_id) as session:
+        # Verificar ticket_events
+        ev_res = await session.execute(
+            select(TicketEvent).where(TicketEvent.ticket_id == ticket_id).order_by(TicketEvent.id.asc())
+        )
+        events = ev_res.scalars().all()
+        tipos_evento = [e.tipo for e in events]
+        assert "escalamiento_modelo" in tipos_evento
+
+        ev_esc = next(e for e in events if e.tipo == "escalamiento_modelo")
+        assert ev_esc.meta["modelo_origen"] == settings.ANTHROPIC_MODEL_VISION
+        assert ev_esc.meta["modelo_destino"] == settings.ANTHROPIC_MODEL_AGENTE
+        assert ev_esc.meta["confianza_previa"] < 0.6
+
+        # Verificar que el ticket logró procesarse con éxito gracias al escalamiento
+        t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+        t = t_res.scalar_one()
+        assert t.estado in (TicketEstado.EXTRAIDO, TicketEstado.ENCOLADO)
+        assert t.confianza >= Decimal("0.6")
+
+
+@pytest.mark.asyncio
 async def test_sse_stream_leaves_zero_idle_in_transaction(app_engine):
     """
     PRUEBA: El SSE no deja transacciones abiertas (Trampa 2 evitada).
@@ -378,3 +452,80 @@ async def test_sse_stream_leaves_zero_idle_in_transaction(app_engine):
     finally:
         server.should_exit = True
         await server_task
+
+
+@pytest.mark.asyncio
+async def test_thermal_wrinkled_ticket_and_enhancement(owner_session: AsyncSession):
+    """
+    PRUEBA:
+    1. enhance_receipt_image procesa imágenes JPEG correctamente.
+    2. Si un ticket no tiene etiqueta 'folio' pero tiene web_id o transaccion,
+       el worker lo recupera y no lo marca como imagen_ilegible.
+    """
+    from PIL import Image as PILImage
+    from src.vision.extractor import enhance_receipt_image, VisionKeyValue
+
+    # 1. Test unitario de enhance_receipt_image
+    buf = io.BytesIO()
+    img = PILImage.new("RGB", (120, 120), color=(200, 200, 200))
+    img.save(buf, format="JPEG")
+    orig_bytes = buf.getvalue()
+
+    enhanced = enhance_receipt_image(orig_bytes)
+    assert isinstance(enhanced, bytes)
+    assert len(enhanced) > 0
+    opened = PILImage.open(io.BytesIO(enhanced))
+    assert opened.size == (120, 120)
+
+    # 2. Test de recuperación de folio desde web_id
+    storage = InMemoryStorageService()
+    set_storage_service(storage)
+    vision = FakeVisionExtractor()
+    set_vision_extractor(vision)
+
+    t_id = uuid.uuid4()
+    u_id = uuid.uuid4()
+    tenant = Tenant(id=t_id, nombre="Empresa Termicos", slug=f"term-{t_id.hex[:6]}", plan="free")
+    user = User(id=u_id, email=f"user-{u_id.hex[:6]}@test.com", nombre="User", google_sub=f"sub-{u_id.hex}")
+    owner_session.add_all([tenant, user])
+    await owner_session.flush()
+
+    # Fixture sin folio explícito pero con web_id
+    vision.register_fixture(
+        "arrugado_con_web_id",
+        VisionExtractionSchema(
+            comercio="Dominos Pizza",
+            url_facturacion="https://facturacion.alsea.com.mx",
+            folio=None,
+            web_id="WID-ALSEA-998877",
+            total="340.00",
+            confianza=0.85,
+        ),
+    )
+    vision.set_mode("arrugado_con_web_id")
+
+    ticket_id = uuid.uuid4()
+    image_key = f"tickets/{t_id}/{ticket_id}"
+    await storage.upload_bytes(image_key, orig_bytes, "image/jpeg")
+
+    ticket = Ticket(
+        id=ticket_id,
+        tenant_id=t_id,
+        created_by=u_id,
+        estado=TicketEstado.RECIBIDO,
+        image_key=image_key,
+    )
+    await owner_session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(t_id)})
+    owner_session.add(ticket)
+    await owner_session.commit()
+
+    # Ejecutar worker
+    await process_ticket_extraction(t_id, ticket_id)
+
+    # Verificar en BD que el ticket llegó a EXTRAIDO y recuperó el folio
+    async with tenant_session(t_id) as session:
+        t_db = (await session.execute(select(Ticket).where(Ticket.id == ticket_id))).scalar_one()
+        assert t_db.estado == TicketEstado.EXTRAIDO
+        assert t_db.folio == "WID-ALSEA-998877"
+        assert t_db.total == Decimal("340.00")
+

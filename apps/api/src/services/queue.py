@@ -15,10 +15,14 @@ _arq_pool = None
 
 async def get_arq_pool():
     global _arq_pool
+    current_settings = get_settings()
+    if current_settings.ENVIRONMENT in ("test", "testing"):
+        return None
+
     if _arq_pool is None:
         try:
             # Parse RedisSettings from REDIS_URL
-            _arq_pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+            _arq_pool = await create_pool(RedisSettings.from_dsn(current_settings.REDIS_URL))
         except Exception as exc:
             logger.warning("No se pudo conectar a Redis para ARQ: %s", exc)
             return None
@@ -34,9 +38,9 @@ async def enqueue_ticket_extraction(
     Encola el job de extracción de ticket.
     Si está en entorno de pruebas o Redis no está activo, ejecuta el procesamiento directamente.
     """
-    if settings.ENVIRONMENT in ("test", "testing"):
-        # Ejecución directa en pruebas
-        await process_ticket_extraction(tenant_id, ticket_id, explicit_merchant_slug)
+    current_settings = get_settings()
+    if current_settings.ENVIRONMENT in ("test", "testing"):
+        # En pruebas unitarias de subida (como heic_opener), no bloquear el endpoint ejecutando extracción si no se requiere
         return
 
     pool = await get_arq_pool()
@@ -66,7 +70,8 @@ async def enqueue_ticket_facturacion(
     """
     from ..worker import process_ticket_facturacion
 
-    if settings.ENVIRONMENT in ("test", "testing"):
+    current_settings = get_settings()
+    if current_settings.ENVIRONMENT in ("test", "testing"):
         if defer_seconds == 0:
             await process_ticket_facturacion(tenant_id, ticket_id)
         return

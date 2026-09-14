@@ -8,6 +8,7 @@ from .base import (
     register_engine,
 )
 from .mock import MockFacturacionEngine
+from .generic_web import GenericWebEngine
 
 __all__ = [
     "ENGINE_REGISTRY",
@@ -16,6 +17,7 @@ __all__ = [
     "FacturacionEngine",
     "HandoffInterface",
     "MockFacturacionEngine",
+    "GenericWebEngine",
     "get_engine",
     "register_engine",
 ]

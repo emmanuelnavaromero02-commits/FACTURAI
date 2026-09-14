@@ -10,19 +10,25 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from src.auth import FakeGoogleTokenVerifier, set_google_verifier
+from src.auth import FakeGoogleTokenVerifier, set_google_verifier, sign_session_token
 from src.config import get_settings
 from src.models import (
-    Tenant,
-    User,
+    FiscalProfile,
+    Membership,
+    MembershipRole,
     Merchant,
+    Tenant,
     Ticket,
-    TipoMotor,
     TicketEstado,
+    TipoMotor,
+    User,
 )
 
 settings = get_settings()
+settings.ENVIRONMENT = "test"
 
+
+from src.vision.extractor import FakeVisionExtractor, set_vision_extractor
 
 @pytest.fixture(autouse=True)
 def setup_fake_verifier():
@@ -30,6 +36,14 @@ def setup_fake_verifier():
     fake_verifier = FakeGoogleTokenVerifier()
     set_google_verifier(fake_verifier)
     yield fake_verifier
+
+
+@pytest.fixture(autouse=True)
+def setup_fake_vision():
+    """Configura el extractor de visión simulado por defecto para evitar llamadas externas lentas."""
+    fake_vision = FakeVisionExtractor()
+    set_vision_extractor(fake_vision)
+    yield fake_vision
 
 
 async def is_postgres_available() -> bool:
@@ -167,3 +181,85 @@ async def setup_tenants(owner_session: AsyncSession) -> AsyncGenerator[Dict[str,
     await owner_session.execute(text("DELETE FROM users WHERE id = :u"), {"u": u_id})
     await owner_session.execute(text("DELETE FROM merchants WHERE id = :m"), {"m": m_id})
     await owner_session.commit()
+
+
+@pytest_asyncio.fixture(scope="function")
+async def setup_phase4_scenario(owner_session: AsyncSession) -> Dict[str, Any]:
+    """Crea tenant, usuario, membresía, comercio mock y perfil fiscal en la BD."""
+    t_id = uuid.uuid4()
+    u_id = uuid.uuid4()
+    m_id = uuid.uuid4()
+    fp_id = uuid.uuid4()
+
+    tenant = Tenant(
+        id=t_id,
+        nombre="Factura Corp SA",
+        slug=f"factura-corp-{t_id.hex[:6]}",
+        plan="pro",
+    )
+    user = User(
+        id=u_id,
+        email=f"owner-{u_id.hex[:6]}@factura.com",
+        nombre="Dueño Factura",
+        google_sub=f"google-sub-{u_id.hex[:8]}",
+    )
+    owner_session.add_all([tenant, user])
+    await owner_session.flush()
+
+    # Membresía owner
+    await owner_session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(t_id)})
+    membership = Membership(
+        tenant_id=t_id,
+        user_id=u_id,
+        rol=MembershipRole.OWNER,
+    )
+    owner_session.add(membership)
+
+    # Catálogo de comercio con motor mock y entrega_esperada 'emisor'
+    merchant = Merchant(
+        id=m_id,
+        nombre="Comercio Simulado OXXO",
+        slug=f"oxxo-mock-{m_id.hex[:6]}",
+        tipo_motor=TipoMotor.API,
+        engine_slug="mock",
+        entrega_esperada="emisor",
+        activo=True,
+    )
+    owner_session.add(merchant)
+
+    # Perfil fiscal principal con constancia fiscal completa
+    fiscal_profile = FiscalProfile(
+        id=fp_id,
+        tenant_id=t_id,
+        razon_social="EMPRESA PRUEBA SA DE CV",
+        rfc="XAXX010101000",
+        cp="01000",
+        regimen_fiscal="601",
+        email_receptor="facturas@receptor.com",
+        calle="Av. Insurgentes Sur",
+        numero_exterior="1602",
+        numero_interior="Piso 4",
+        colonia="Crédito Constructor",
+        municipio_alcaldia="Benito Juárez",
+        estado="Ciudad de México",
+        pais="MEX",
+        curp="XAXX010101HDFRRN01",
+        es_principal=True,
+    )
+    owner_session.add(fiscal_profile)
+
+    await owner_session.commit()
+
+    session_token = sign_session_token(u_id, user.email)
+
+    return {
+        "tenant_id": t_id,
+        "user_id": u_id,
+        "merchant_id": m_id,
+        "fiscal_profile_id": fp_id,
+        "user_email": user.email,
+        "session_token": session_token,
+        "merchant": merchant,
+        "fiscal_profile": fiscal_profile,
+    }
+

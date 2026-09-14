@@ -115,13 +115,14 @@ async def get_tenant_context(
 
     target_tenant_id_str: str
 
-    if not x_tenant_id:
+    tenant_header_or_param = x_tenant_id or request.query_params.get("tenant_id")
+    if not tenant_header_or_param:
         if len(user_tenants) == 1:
             target_tenant_id_str = list(user_tenants.keys())[0]
         else:
             raise TenantRequeridoException()
     else:
-        target_tenant_id_str = x_tenant_id.strip()
+        target_tenant_id_str = tenant_header_or_param.strip()
 
     # Validar pertenencia del usuario al tenant
     if target_tenant_id_str not in user_tenants:

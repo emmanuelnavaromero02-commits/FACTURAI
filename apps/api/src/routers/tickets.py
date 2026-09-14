@@ -13,11 +13,13 @@ from sqlalchemy import delete, select
 from ..db import tenant_session
 from ..deps import TenantContext, get_tenant_context
 from ..errors import (
+    CfdiExpiradoException,
     MaximoIntentosExcedidoException,
     RecursoNoEncontradoException,
     ReintentoInvalidoException,
 )
-from ..models import Merchant, Ticket, TicketEstado, TicketEvent
+from ..models import FiscalProfile, Merchant, Ticket, TicketEstado, TicketEvent
+from ..services.cfdi_storage import get_cfdi_storage
 from ..services.queue import enqueue_ticket_extraction, enqueue_ticket_facturacion
 from ..services.upload import process_and_stream_upload
 from ..state_machine import FINAL_STATES, transition
@@ -46,7 +48,14 @@ class TicketResponse(BaseModel):
     error_msg: Optional[str] = None
     image_key: Optional[str] = None
     cfdi_uuid: Optional[str] = None
-    cfdi_sent_to: Optional[str] = None
+    correo_capturado_en_portal: Optional[str] = None
+    cfdi_disponible_hasta: Optional[str] = None
+    url_facturacion: Optional[str] = None
+    costo_total_usd: Optional[Decimal] = None
+    tokens_input_total: Optional[int] = None
+    tokens_output_total: Optional[int] = None
+    pasos_agente: Optional[int] = None
+    duracion_segundos: Optional[Decimal] = None
     created_at: str
 
     @classmethod
@@ -71,7 +80,14 @@ class TicketResponse(BaseModel):
             error_msg=t.error_msg,
             image_key=t.image_key,
             cfdi_uuid=t.cfdi_uuid,
-            cfdi_sent_to=t.cfdi_sent_to,
+            correo_capturado_en_portal=t.correo_capturado_en_portal,
+            cfdi_disponible_hasta=t.cfdi_disponible_hasta.isoformat() if t.cfdi_disponible_hasta else None,
+            url_facturacion=t.url_facturacion,
+            costo_total_usd=t.costo_total_usd,
+            tokens_input_total=t.tokens_input_total,
+            tokens_output_total=t.tokens_output_total,
+            pasos_agente=t.pasos_agente,
+            duracion_segundos=t.duracion_segundos,
             created_at=t.created_at.isoformat(),
         )
 
@@ -306,7 +322,8 @@ async def retry_ticket(
                 f"Solo se pueden reintentar tickets en estado 'rechazado'. Estado actual: '{ticket.estado.value}'."
             )
 
-        if ticket.intentos >= 3:
+        es_error_datos = ticket.error_code in ("perfil_incompleto", "datos_no_coinciden")
+        if not es_error_datos and ticket.intentos >= 3:
             raise MaximoIntentosExcedidoException(
                 f"El ticket ha alcanzado el límite máximo de 3 intentos (intentos actuales: {ticket.intentos})."
             )
@@ -329,6 +346,225 @@ async def retry_ticket(
     return response_data
 
 
+@router.post("/{ticket_id}/facturar", response_model=TicketResponse, status_code=status.HTTP_202_ACCEPTED)
+async def facturar_ticket(
+    ticket_id: uuid.UUID,
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Inicia la facturación automática de un ticket en estado 'extraido' o 'rechazado':
+    1. Verifica que pertenezca al tenant bajo RLS.
+    2. Valida que el tenant cuente con un perfil fiscal principal.
+    3. Transiciona el ticket a 'encolado'.
+    4. Encola la tarea en ARQ con tenant_id y ticket_id.
+    """
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        t_res = await session.execute(
+            select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
+        )
+        ticket = t_res.scalar_one_or_none()
+        if not ticket:
+            raise RecursoNoEncontradoException(f"Ticket {ticket_id} no encontrado.")
+
+        if ticket.estado == TicketEstado.ENCOLADO:
+            return TicketResponse.from_model(ticket)
+
+        if ticket.estado not in (TicketEstado.EXTRAIDO, TicketEstado.RECHAZADO):
+            from ..errors import AppException
+            raise AppException(
+                status_code=400,
+                code="estado_invalido",
+                message=f"No se puede facturar un ticket en estado '{ticket.estado.value}'. Solo 'extraido' o 'rechazado'."
+            )
+
+        # Verificar que el tenant tenga perfil fiscal principal
+        fp_res = await session.execute(
+            select(FiscalProfile).where(
+                FiscalProfile.tenant_id == ctx.tenant_id,
+                FiscalProfile.es_principal == True,
+            )
+        )
+        if not fp_res.scalar_one_or_none():
+            from ..errors import AppException
+            raise AppException(
+                status_code=400,
+                code="perfil_incompleto",
+                message="No tienes configurado un perfil fiscal principal. Ve a 'Datos fiscales' para configurarlo antes de facturar."
+            )
+
+        await transition(
+            session,
+            ticket,
+            TicketEstado.ENCOLADO,
+            "Facturación iniciada por usuario.",
+            tipo="encolado",
+        )
+        ticket.error_code = None
+        ticket.error_msg = None
+        await session.flush()
+        response_data = TicketResponse.from_model(ticket)
+
+    await enqueue_ticket_facturacion(ctx.tenant_id, ticket_id)
+    return response_data
+
+
+@router.get("/{ticket_id}/cfdi")
+async def download_cfdi_bundle(
+    ticket_id: uuid.UUID,
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Descarga efímera del CFDI 4.0 (ZIP con PDF y XML):
+    - Solo disponible si el portal entregó archivos directos (entrega='descarga').
+    - Recupera el archivo de Redis descifrado con la llave del tenant.
+    - Máximo 5 descargas dentro de los 30 minutos; al expirar o superar el límite devuelve 404 cfdi_expirado.
+    """
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        res = await session.execute(
+            select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
+        )
+        ticket = res.scalar_one_or_none()
+        if not ticket:
+            raise RecursoNoEncontradoException("El ticket no fue encontrado.")
+
+    cfdi_storage = get_cfdi_storage()
+    zip_bytes = await cfdi_storage.get_cfdi_bundle(ctx.tenant_id, ticket_id)
+    if not zip_bytes:
+        raise CfdiExpiradoException()
+
+    filename = f"cfdi-{ticket.cfdi_uuid or ticket_id}.zip"
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+        },
+    )
+
+
+def extract_single_file_from_zip(zip_bytes: bytes, extension: str) -> Optional[bytes]:
+    import io
+    import zipfile
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for fname in zf.namelist():
+                if fname.lower().endswith(extension.lower()):
+                    return zf.read(fname)
+    except Exception:
+        pass
+    return None
+
+
+@router.get("/{ticket_id}/cfdi/pdf")
+async def download_cfdi_pdf(
+    ticket_id: uuid.UUID,
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Descarga o visualización directa del PDF del CFDI 4.0.
+    """
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        res = await session.execute(
+            select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
+        )
+        ticket = res.scalar_one_or_none()
+        if not ticket:
+            raise RecursoNoEncontradoException("El ticket no fue encontrado.")
+
+    cfdi_storage = get_cfdi_storage()
+    zip_bytes = await cfdi_storage.get_cfdi_bundle(ctx.tenant_id, ticket_id)
+    if not zip_bytes:
+        raise CfdiExpiradoException()
+
+    pdf_bytes = extract_single_file_from_zip(zip_bytes, ".pdf")
+    if not pdf_bytes:
+        raise RecursoNoEncontradoException("El archivo PDF no está disponible en este comprobante.")
+
+    filename = f"cfdi-{ticket.cfdi_uuid or ticket_id}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+        },
+    )
+
+
+@router.get("/{ticket_id}/cfdi/xml")
+async def download_cfdi_xml(
+    ticket_id: uuid.UUID,
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Descarga directa del archivo XML del CFDI 4.0.
+    """
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        res = await session.execute(
+            select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
+        )
+        ticket = res.scalar_one_or_none()
+        if not ticket:
+            raise RecursoNoEncontradoException("El ticket no fue encontrado.")
+
+    cfdi_storage = get_cfdi_storage()
+    zip_bytes = await cfdi_storage.get_cfdi_bundle(ctx.tenant_id, ticket_id)
+    if not zip_bytes:
+        raise CfdiExpiradoException()
+
+    xml_bytes = extract_single_file_from_zip(zip_bytes, ".xml")
+    if not xml_bytes:
+        raise RecursoNoEncontradoException("El archivo XML no está disponible en este comprobante.")
+
+    filename = f"cfdi-{ticket.cfdi_uuid or ticket_id}.xml"
+    return Response(
+        content=xml_bytes,
+        media_type="application/xml",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+        },
+    )
+
+
+
+@router.get("/{ticket_id}/handoff", status_code=status.HTTP_200_OK)
+async def get_ticket_handoff_info(
+    ticket_id: uuid.UUID,
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Recupera los datos del handoff activo para el ticket si se encuentra en espera de resolución humana.
+    """
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        res = await session.execute(
+            select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
+        )
+        ticket = res.scalar_one_or_none()
+        if not ticket:
+            raise RecursoNoEncontradoException("El ticket no fue encontrado.")
+
+        ev_res = await session.execute(
+            select(TicketEvent).where(
+                TicketEvent.ticket_id == ticket_id,
+                TicketEvent.tipo == "handoff",
+                TicketEvent.tenant_id == ctx.tenant_id,
+            ).order_by(TicketEvent.ts.desc()).limit(1)
+        )
+        ev = ev_res.scalar_one_or_none()
+        if not ev or not ev.meta:
+            raise RecursoNoEncontradoException("No hay sesión de handoff activa para este ticket.")
+
+        return {
+            "handoff_id": ev.meta.get("handoff_id"),
+            "token": ev.meta.get("token"),
+            "motivo": ev.meta.get("motivo"),
+            "expires_at": ev.meta.get("expires_at"),
+            "url_facturacion": ticket.url_facturacion,
+        }
+
+
 @router.delete("/{ticket_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_ticket(
     ticket_id: uuid.UUID,
@@ -347,13 +583,28 @@ async def delete_ticket(
         if not ticket:
             raise RecursoNoEncontradoException("El ticket no fue encontrado.")
 
+        storage = get_storage_service()
+
         # Borrar imagen en S3/MinIO si existe
         if ticket.image_key and not ticket.image_deleted_at:
-            storage = get_storage_service()
             try:
                 await storage.delete(ticket.image_key)
             except Exception:
                 pass
+
+        # Borrar capturas de depuración en S3 referenciadas en eventos
+        events_res = await session.execute(
+            select(TicketEvent).where(
+                TicketEvent.ticket_id == ticket_id,
+                TicketEvent.tenant_id == ctx.tenant_id,
+            )
+        )
+        for ev in events_res.scalars().all():
+            if ev.meta and isinstance(ev.meta, dict) and "screenshot_key" in ev.meta:
+                try:
+                    await storage.delete(ev.meta["screenshot_key"])
+                except Exception:
+                    pass
 
         # Borrar eventos del ticket explícitamente y el ticket
         await session.execute(

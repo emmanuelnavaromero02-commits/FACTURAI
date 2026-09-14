@@ -79,11 +79,20 @@ class ProductionGoogleTokenVerifier(GoogleTokenVerifier):
             jwks_client = jwt.PyJWKClient(GOOGLE_CERTS_URL)
             signing_key = jwks_client.get_signing_key_from_jwt(id_token)
 
+            # En desarrollo, si settings.GOOGLE_CLIENT_ID es el placeholder por defecto,
+            # aceptar cualquier Client ID de Google real que termine en .apps.googleusercontent.com
+            expected_aud = settings.GOOGLE_CLIENT_ID
+            if settings.ENVIRONMENT == "development" and expected_aud == "facturia-local-client-id.apps.googleusercontent.com":
+                unverified = jwt.decode(id_token, options={"verify_signature": False})
+                token_aud = unverified.get("aud")
+                if token_aud and (token_aud.endswith(".apps.googleusercontent.com") or token_aud == expected_aud):
+                    expected_aud = token_aud
+
             data = jwt.decode(
                 id_token,
                 signing_key.key,
                 algorithms=["RS256"],
-                audience=settings.GOOGLE_CLIENT_ID,
+                audience=expected_aud,
                 issuer=GOOGLE_ISSUERS,
                 options={"require": ["exp", "iss", "aud", "sub"]},
             )
@@ -133,14 +142,15 @@ class FakeGoogleTokenVerifier(GoogleTokenVerifier):
 
             email_verified = not id_token.startswith("mock_unverified:")
 
-            # Extraer email si viene en el token: mock_token:juan@empresa.com
-            parts = id_token.split(":")
-            email = parts[1] if len(parts) > 1 and "@" in parts[1] else "test.user@facturia.mx"
+            # Extraer email si viene en el token: mock_token:juan@empresa.com o mock:juan@empresa.com
+            clean_token = id_token.replace("mock_token:", "mock:").replace("dev:", "mock:")
+            parts = clean_token.split(":")
+            email = parts[1] if len(parts) > 1 and "@" in parts[1] else "test.user@facturai.mx"
 
             payload = GoogleTokenPayload(
                 sub=f"google-sub-{email}",
                 email=email,
-                name="Usuario Simulado",
+                name="Usuario FacturAI" if not parts or len(parts) <= 1 else parts[1].split("@")[0].capitalize(),
                 picture="https://lh3.googleusercontent.com/a/default",
                 email_verified=email_verified,
                 aud=aud,
@@ -163,15 +173,53 @@ class FakeGoogleTokenVerifier(GoogleTokenVerifier):
         return payload
 
 
+class SmartGoogleTokenVerifier(GoogleTokenVerifier):
+    """
+    Verificador unificado de tokens de Google para FacturAI:
+    - Si el token tiene formato JWT (3 partes base64), valida criptográficamente la firma
+      con los certificados oficiales de Google (JWKS).
+    - Si el token es de prueba/desarrollo (mock/dev), lo atiende con FakeGoogleTokenVerifier
+      siempre y cuando is_mock_auth_allowed() sea True.
+    """
+
+    def __init__(self):
+        self.prod_verifier = ProductionGoogleTokenVerifier()
+        self.fake_verifier = FakeGoogleTokenVerifier()
+
+    def register_token(self, token_str: str, payload: GoogleTokenPayload):
+        self.fake_verifier.register_token(token_str, payload)
+
+    async def verify(self, id_token: str) -> GoogleTokenPayload:
+        if not id_token:
+            raise TokenInvalidoException("No se proporcionó ningún token de autenticación.")
+
+        is_jwt = id_token.startswith("ey") and id_token.count(".") == 2
+
+        # 1. Si parece un JWT de Google real, verificar con Google
+        if is_jwt:
+            try:
+                return await self.prod_verifier.verify(id_token)
+            except Exception as exc:
+                if is_mock_auth_allowed() and (
+                    id_token in self.fake_verifier._tokens or id_token.startswith("mock_")
+                ):
+                    return await self.fake_verifier.verify(id_token)
+                raise exc
+
+        # 2. Si es token de desarrollo/mock y está permitido
+        if is_mock_auth_allowed():
+            return await self.fake_verifier.verify(id_token)
+
+        raise TokenInvalidoException("Token de autenticación de Google inválido o no reconocido.")
+
+
 def is_mock_auth_allowed() -> bool:
     """La autenticación simulada solo se permite si el entorno es desarrollo Y ALLOW_MOCK_AUTH es True."""
     return settings.ENVIRONMENT == "development" and settings.ALLOW_MOCK_AUTH is True
 
 
 # Instancia singleton del verificador
-_verifier: GoogleTokenVerifier = (
-    FakeGoogleTokenVerifier() if is_mock_auth_allowed() else ProductionGoogleTokenVerifier()
-)
+_verifier: GoogleTokenVerifier = SmartGoogleTokenVerifier()
 
 
 def get_google_verifier() -> GoogleTokenVerifier:

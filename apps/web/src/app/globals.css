@@ -1,0 +1,141 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg: #EFECE9;
+    --panel: #FFFFFF;
+    --panel-2: #F7F4F2;
+    --panel-3: #EFEAE7;
+    --ink: #171214;
+    --ink-2: #4A4043;
+    --muted: #7C7072;
+    --line: #E3DCD8;
+    --line-2: #CDC3BE;
+    --brand: #7A1B3D;
+    --brand-soft: #F5E3EA;
+    --on-brand: #FFFFFF;
+    --ok: #0E6A5C;
+    --ok-soft: #DFF0EC;
+    --warn: #9A5A00;
+    --warn-soft: #FBEBD4;
+    --live: #1B4FA8;
+    --live-soft: #E2EAFA;
+    --bad: #9B2226;
+    --bad-soft: #F8E3E3;
+    --sh: 0 1px 2px rgba(23,18,20,.05), 0 10px 26px -16px rgba(23,18,20,.25);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #100D10;
+      --panel: #191419;
+      --panel-2: #211B21;
+      --panel-3: #292229;
+      --ink: #F2EBEE;
+      --ink-2: #CDBFC4;
+      --muted: #978A8D;
+      --line: #2E262E;
+      --line-2: #463C44;
+      --brand: #E86D93;
+      --brand-soft: #3A1B28;
+      --on-brand: #24101A;
+      --ok: #5CC9AE;
+      --ok-soft: #0F2F2A;
+      --warn: #DFA94F;
+      --warn-soft: #33260F;
+      --live: #7FA8F5;
+      --live-soft: #152238;
+      --bad: #EF7B7E;
+      --bad-soft: #33191A;
+      --sh: 0 1px 2px rgba(0,0,0,.5), 0 12px 30px -18px rgba(0,0,0,.9);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #100D10;
+    --panel: #191419;
+    --panel-2: #211B21;
+    --panel-3: #292229;
+    --ink: #F2EBEE;
+    --ink-2: #CDBFC4;
+    --muted: #978A8D;
+    --line: #2E262E;
+    --line-2: #463C44;
+    --brand: #E86D93;
+    --brand-soft: #3A1B28;
+    --on-brand: #24101A;
+    --ok: #5CC9AE;
+    --ok-soft: #0F2F2A;
+    --warn: #DFA94F;
+    --warn-soft: #33260F;
+    --live: #7FA8F5;
+    --live-soft: #152238;
+    --bad: #EF7B7E;
+    --bad-soft: #33191A;
+    --sh: 0 1px 2px rgba(0,0,0,.5), 0 12px 30px -18px rgba(0,0,0,.9);
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-archivo), system-ui, -apple-system, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+.mono {
+  font-family: var(--font-mono), ui-monospace, Menlo, monospace;
+  font-variant-ligatures: none;
+}
+
+.lt {
+  font-size: 10px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+@keyframes spin-slow {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.animate-pulse-fast {
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+.animate-slide-in {
+  animation: slide-in 0.28s ease forwards;
+}
+
+.animate-spin-custom {
+  animation: spin-slow 0.8s linear infinite;
+}

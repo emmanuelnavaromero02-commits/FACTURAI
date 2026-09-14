@@ -1,3 +1,5 @@
+import os
+from decimal import Decimal
 from functools import lru_cache
 from typing import Optional
 from pydantic import model_validator
@@ -46,13 +48,6 @@ class Settings(BaseSettings):
     S3_BUCKET_NAME: str = "facturia-tickets-temp"
     S3_REGION: str = "us-east-1"
 
-    # SMTP / Mailpit (Regla 4: entrega de CFDI sin persistencia)
-    SMTP_HOST: str = "localhost"
-    SMTP_PORT: int = 1025
-    SMTP_USER: Optional[str] = None
-    SMTP_PASSWORD: Optional[str] = None
-    SMTP_FROM: str = "no-reply@facturia.mx"
-
     # Cifrado de credenciales (Regla 6: AES-256-GCM derivado)
     MASTER_ENCRYPTION_KEY: str = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
 
@@ -61,6 +56,62 @@ class Settings(BaseSettings):
     SESSION_COOKIE_NAME: str = "facturia_session"
     SESSION_MAX_AGE_SECONDS: int = 60 * 60 * 24 * 7  # 7 días
     SESSION_REFRESH_THRESHOLD_SECONDS: int = 60 * 60 * 24 * 2  # 2 días
+
+    # Anthropic Modelos (Regla 11: modelos explícitos sin sustitución)
+    ANTHROPIC_API_KEY: Optional[str] = None
+    ANTHROPIC_MODEL_VISION: str = "claude-opus-5"
+    ANTHROPIC_MODEL_AGENTE: str = "claude-fable-5-1"
+    ANTHROPIC_MODEL_FALLBACK: str = "claude-sonnet-5"
+
+    # Agente Genérico Web y Control de Costos (Paso B)
+    COSTO_MAXIMO_POR_TICKET_USD: Decimal = Decimal("0.50")
+    PASOS_MAXIMOS_AGENTE: int = 30
+
+    # Handoff Humano Interactivo (Paso C)
+    HANDOFF_TTL_SEGUNDOS: int = 180
+    HANDOFF_MAX_CONCURRENTES: int = 5
+
+
+# Tabla de precios por millón de tokens en USD.
+# Se deja VACÍA por defecto; lee dinámicamente de variables de entorno sin valor por defecto:
+#   ANTHROPIC_PRECIO_IN_<MODELO> y ANTHROPIC_PRECIO_OUT_<MODELO>
+# Si no están definidas, el costo es None ("costo no disponible").
+# Documentación oficial de modelos: https://platform.claude.com/docs/en/models/overview
+ANTHROPIC_TOKEN_PRICING_PER_MILLION: dict[str, dict[str, float]] = {}
+
+
+def normalize_model_name_for_env(model: str) -> str:
+    """
+    Normaliza el nombre del modelo a mayúsculas con guiones bajos para variables de entorno:
+      claude-opus-5    -> CLAUDE_OPUS_5
+      claude-fable-5-1 -> CLAUDE_FABLE_5_1
+      claude-sonnet-5  -> CLAUDE_SONNET_5
+    """
+    return model.strip().upper().replace("-", "_").replace(".", "_")
+
+
+def get_model_token_pricing(model: str) -> Optional[dict[str, float]]:
+    """
+    Obtiene los precios de tokens por millón (USD) para un modelo dado leyendo de variables de entorno:
+      ANTHROPIC_PRECIO_IN_<MODELO_NORMALIZADO>
+      ANTHROPIC_PRECIO_OUT_<MODELO_NORMALIZADO>
+    (ejemplos: ANTHROPIC_PRECIO_IN_CLAUDE_OPUS_5, ANTHROPIC_PRECIO_OUT_CLAUDE_OPUS_5).
+    Si no están definidas ambas variables, retorna None ("costo no disponible").
+    Documentación oficial: https://platform.claude.com/docs/en/models/overview
+    """
+    if model in ANTHROPIC_TOKEN_PRICING_PER_MILLION:
+        return ANTHROPIC_TOKEN_PRICING_PER_MILLION[model]
+
+    env_suffix = normalize_model_name_for_env(model)
+    in_val = os.environ.get(f"ANTHROPIC_PRECIO_IN_{env_suffix}")
+    out_val = os.environ.get(f"ANTHROPIC_PRECIO_OUT_{env_suffix}")
+
+    if in_val is not None and out_val is not None:
+        try:
+            return {"input": float(in_val), "output": float(out_val)}
+        except ValueError:
+            return None
+    return None
 
 
 @lru_cache

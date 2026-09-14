@@ -1,0 +1,1465 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Facturia API",
+    "description": "SaaS multi-tenant mexicano de facturaci\u00f3n autom\u00e1tica de tickets CFDI 4.0",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/v1/auth/google": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Login With Google",
+        "description": "Inicia sesi\u00f3n o registra al usuario con un id_token emitido por Google OAuth.\nValida firma, aud, iss, exp y email_verified.\nFija la cookie de sesi\u00f3n firmada 'facturia_session'.",
+        "operationId": "login_with_google_v1_auth_google_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GoogleAuthRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoogleAuthResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/auth/logout": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Logout",
+        "description": "Cierra la sesi\u00f3n y borra la cookie HttpOnly.",
+        "operationId": "logout_v1_auth_logout_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/me": {
+      "get": {
+        "tags": [
+          "User"
+        ],
+        "summary": "Get Me",
+        "description": "Devuelve la informaci\u00f3n del usuario actual, sus empresas asociadas\ny su rol dentro de cada una.",
+        "operationId": "get_me_v1_me_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tenants": {
+      "get": {
+        "tags": [
+          "Tenants"
+        ],
+        "summary": "List User Tenants",
+        "description": "Lista todos los tenants a los que pertenece el usuario.",
+        "operationId": "list_user_tenants_v1_tenants_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/TenantResponse"
+                  },
+                  "type": "array",
+                  "title": "Response List User Tenants V1 Tenants Get"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Tenants"
+        ],
+        "summary": "Create Tenant",
+        "description": "Crea un nuevo tenant y asigna al usuario actual como 'owner'.",
+        "operationId": "create_tenant_v1_tenants_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTenantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/team": {
+      "get": {
+        "tags": [
+          "Team"
+        ],
+        "summary": "List Team",
+        "description": "Lista a todos los miembros del equipo de la empresa activa.\nLa consulta se ejecuta estrictamente dentro de tenant_session() para cumplir con RLS.",
+        "operationId": "list_team_v1_team_get",
+        "parameters": [
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tenant-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TeamMemberResponse"
+                  },
+                  "title": "Response List Team V1 Team Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/team/invitations": {
+      "post": {
+        "tags": [
+          "Team"
+        ],
+        "summary": "Invite Team Member",
+        "description": "Invita o agrega a un miembro al equipo.\nRegla: Nadie puede asignar un rol superior al suyo.",
+        "operationId": "invite_team_member_v1_team_invitations_post",
+        "parameters": [
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tenant-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InviteMemberRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeamMemberResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/team/{user_id}": {
+      "patch": {
+        "tags": [
+          "Team"
+        ],
+        "summary": "Update Member Role",
+        "description": "Actualiza el rol de un miembro del equipo.\nReglas:\n1. Nadie puede asignar un rol superior al suyo.\n2. Nadie puede modificar a un usuario con un rol superior al suyo.\n3. Un owner no puede degradarse a s\u00ed mismo si es el \u00fanico owner.",
+        "operationId": "update_member_role_v1_team__user_id__patch",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tenant-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMemberRoleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeamMemberResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tickets": {
+      "post": {
+        "tags": [
+          "Tickets"
+        ],
+        "summary": "Upload Ticket",
+        "description": "Sube un ticket para procesamiento as\u00edncrono:\n1. Valida el tipo por magic bytes (JPEG, PNG, HEIC, WebP, PDF) y tama\u00f1o (m\u00e1x 10 MB).\n2. Sube en streaming a S3/MinIO sin cargar el archivo completo en memoria.\n3. Registra el ticket en estado 'recibido' dentro de tenant_session.\n4. Encola la tarea de extracci\u00f3n en ARQ con tenant_id expl\u00edcito y responde 202.",
+        "operationId": "upload_ticket_v1_tickets_post",
+        "parameters": [
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tenant-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_ticket_v1_tickets_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Tickets"
+        ],
+        "summary": "List Tickets",
+        "description": "Lista tickets con filtros por estado y comercio, y paginaci\u00f3n por cursor.",
+        "operationId": "list_tickets_v1_tickets_get",
+        "parameters": [
+          {
+            "name": "estado",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/TicketEstado"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Estado"
+            }
+          },
+          {
+            "name": "merchant_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Merchant Id"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tenant-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedTicketsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tickets/{ticket_id}": {
+      "get": {
+        "tags": [
+          "Tickets"
+        ],
+        "summary": "Get Ticket",
+        "description": "Consulta el detalle de un ticket espec\u00edfico.",
+        "operationId": "get_ticket_v1_tickets__ticket_id__get",
+        "parameters": [
+          {
+            "name": "ticket_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Ticket Id"
+            }
+          },
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tenant-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Tickets"
+        ],
+        "summary": "Delete Ticket",
+        "description": "Elimina un ticket del tenant:\n- Borra la imagen de S3/MinIO si no ha sido borrada a\u00fan.\n- Borra los eventos asociados y el ticket de la base de datos (con RLS activo).",
+        "operationId": "delete_ticket_v1_tickets__ticket_id__delete",
+        "parameters": [
+          {
+            "name": "ticket_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Ticket Id"
+            }
+          },
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tenant-Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tickets/{ticket_id}/stream": {
+      "get": {
+        "tags": [
+          "Tickets"
+        ],
+        "summary": "Stream Ticket Events",
+        "description": "Server-Sent Events (SSE) de los ticket_events (Trampa 2 evitada):\n- NO mantiene transacciones abiertas: cada ciclo abre su propia tenant_session() corta.\n- Emite keep-alive ': keep-alive\\n\\n' cada 15 segundos.\n- Cierra el stream autom\u00e1ticamente al alcanzar un estado final.",
+        "operationId": "stream_ticket_events_v1_tickets__ticket_id__stream_get",
+        "parameters": [
+          {
+            "name": "ticket_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Ticket Id"
+            }
+          },
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tenant-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tickets/{ticket_id}/retry": {
+      "post": {
+        "tags": [
+          "Tickets"
+        ],
+        "summary": "Retry Ticket",
+        "description": "Reintenta el proceso de facturaci\u00f3n de un ticket previamente RECHAZADO:\n- Solo permitido si el estado actual es 'rechazado'.\n- L\u00edmite estricto de m\u00e1ximo 3 intentos.\n- Transiciona a 'encolado' y encola de nuevo en ARQ.",
+        "operationId": "retry_ticket_v1_tickets__ticket_id__retry_post",
+        "parameters": [
+          {
+            "name": "ticket_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Ticket Id"
+            }
+          },
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tenant-Id"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tickets/{ticket_id}/cfdi": {
+      "get": {
+        "tags": [
+          "Tickets"
+        ],
+        "summary": "Download Cfdi Bundle",
+        "description": "Descarga ef\u00edmera del CFDI 4.0 (ZIP con PDF y XML):\n- Solo disponible si el portal entreg\u00f3 archivos directos (entrega='descarga').\n- Recupera el archivo de Redis descifrado con la llave del tenant.\n- M\u00e1ximo 5 descargas dentro de los 30 minutos; al expirar o superar el l\u00edmite devuelve 404 cfdi_expirado.",
+        "operationId": "download_cfdi_bundle_v1_tickets__ticket_id__cfdi_get",
+        "parameters": [
+          {
+            "name": "ticket_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Ticket Id"
+            }
+          },
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tenant-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Health Check",
+        "description": "Endpoint de salud del sistema.\nVerifica la conectividad con PostgreSQL usando el rol de aplicaci\u00f3n.",
+        "operationId": "health_check_v1_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Body_upload_ticket_v1_tickets_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File"
+          },
+          "merchant_slug": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Merchant Slug"
+          },
+          "fiscal_profile_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fiscal Profile Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_upload_ticket_v1_tickets_post"
+      },
+      "CreateTenantRequest": {
+        "properties": {
+          "nombre": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 2,
+            "title": "Nombre"
+          },
+          "slug": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 2
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slug"
+          }
+        },
+        "type": "object",
+        "required": [
+          "nombre"
+        ],
+        "title": "CreateTenantRequest"
+      },
+      "GoogleAuthRequest": {
+        "properties": {
+          "id_token": {
+            "type": "string",
+            "title": "Id Token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id_token"
+        ],
+        "title": "GoogleAuthRequest"
+      },
+      "GoogleAuthResponse": {
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "title": "User Id"
+          },
+          "email": {
+            "type": "string",
+            "title": "Email"
+          },
+          "nombre": {
+            "type": "string",
+            "title": "Nombre"
+          },
+          "avatar_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Url"
+          },
+          "created_tenant_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created Tenant Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "user_id",
+          "email",
+          "nombre"
+        ],
+        "title": "GoogleAuthResponse"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "InviteMemberRequest": {
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email",
+            "title": "Email"
+          },
+          "nombre": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nombre"
+          },
+          "rol": {
+            "$ref": "#/components/schemas/MembershipRole"
+          }
+        },
+        "type": "object",
+        "required": [
+          "email",
+          "rol"
+        ],
+        "title": "InviteMemberRequest"
+      },
+      "MeResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "email": {
+            "type": "string",
+            "title": "Email"
+          },
+          "nombre": {
+            "type": "string",
+            "title": "Nombre"
+          },
+          "avatar_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Url"
+          },
+          "tenants": {
+            "items": {
+              "$ref": "#/components/schemas/UserTenantResponse"
+            },
+            "type": "array",
+            "title": "Tenants"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "email",
+          "nombre",
+          "tenants"
+        ],
+        "title": "MeResponse"
+      },
+      "MembershipRole": {
+        "type": "string",
+        "enum": [
+          "owner",
+          "admin",
+          "uploader",
+          "viewer"
+        ],
+        "title": "MembershipRole"
+      },
+      "PaginatedTicketsResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TicketResponse"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "PaginatedTicketsResponse"
+      },
+      "TeamMemberResponse": {
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "title": "User Id"
+          },
+          "nombre": {
+            "type": "string",
+            "title": "Nombre"
+          },
+          "email": {
+            "type": "string",
+            "title": "Email"
+          },
+          "rol": {
+            "type": "string",
+            "title": "Rol"
+          },
+          "avatar_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "user_id",
+          "nombre",
+          "email",
+          "rol"
+        ],
+        "title": "TeamMemberResponse"
+      },
+      "TenantResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "nombre": {
+            "type": "string",
+            "title": "Nombre"
+          },
+          "slug": {
+            "type": "string",
+            "title": "Slug"
+          },
+          "plan": {
+            "type": "string",
+            "title": "Plan"
+          },
+          "rol": {
+            "type": "string",
+            "title": "Rol"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "nombre",
+          "slug",
+          "plan",
+          "rol"
+        ],
+        "title": "TenantResponse"
+      },
+      "TicketEstado": {
+        "type": "string",
+        "enum": [
+          "recibido",
+          "extrayendo",
+          "extraido",
+          "encolado",
+          "facturando",
+          "espera_humano",
+          "facturado",
+          "rechazado",
+          "cancelado"
+        ],
+        "title": "TicketEstado"
+      },
+      "TicketResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "tenant_id": {
+            "type": "string",
+            "title": "Tenant Id"
+          },
+          "estado": {
+            "type": "string",
+            "title": "Estado"
+          },
+          "intentos": {
+            "type": "integer",
+            "title": "Intentos",
+            "default": 0
+          },
+          "folio": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folio"
+          },
+          "web_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Web Id"
+          },
+          "fecha_ticket": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fecha Ticket"
+          },
+          "hora_ticket": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hora Ticket"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          },
+          "subtotal": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subtotal"
+          },
+          "iva": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Iva"
+          },
+          "sucursal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sucursal"
+          },
+          "caja": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Caja"
+          },
+          "rfc_emisor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rfc Emisor"
+          },
+          "confianza": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confianza"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "error_msg": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Msg"
+          },
+          "image_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Image Key"
+          },
+          "cfdi_uuid": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cfdi Uuid"
+          },
+          "correo_capturado_en_portal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correo Capturado En Portal"
+          },
+          "cfdi_disponible_hasta": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cfdi Disponible Hasta"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "tenant_id",
+          "estado",
+          "created_at"
+        ],
+        "title": "TicketResponse"
+      },
+      "UpdateMemberRoleRequest": {
+        "properties": {
+          "rol": {
+            "$ref": "#/components/schemas/MembershipRole"
+          }
+        },
+        "type": "object",
+        "required": [
+          "rol"
+        ],
+        "title": "UpdateMemberRoleRequest"
+      },
+      "UserTenantResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "nombre": {
+            "type": "string",
+            "title": "Nombre"
+          },
+          "slug": {
+            "type": "string",
+            "title": "Slug"
+          },
+          "plan": {
+            "type": "string",
+            "title": "Plan"
+          },
+          "rol": {
+            "type": "string",
+            "title": "Rol"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "nombre",
+          "slug",
+          "plan",
+          "rol"
+        ],
+        "title": "UserTenantResponse"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}
