@@ -292,6 +292,30 @@ async def list_tickets(
         res = await session.execute(query)
         tickets = res.scalars().all()
 
+        # Auto-clasificación defensiva si algún ticket histórico carece de categoría
+        updated_any = False
+        for t in tickets:
+            if not t.categoria_gasto or not t.estatus_deducibilidad:
+                from ..services.fiscal_classifier import analyze_fiscal_classification
+                ext = t.extracted or {}
+                com_name = ext.get("comercio") or t.sucursal or ""
+                conceptos = " ".join([str(v) for v in ext.values() if v])
+                f_res = analyze_fiscal_classification(
+                    comercio=com_name,
+                    rfc_emisor=t.rfc_emisor,
+                    total=t.total,
+                    subtotal=t.subtotal,
+                    iva=t.iva,
+                    forma_pago_raw=ext.get("forma_pago") or "04",
+                    conceptos_text=conceptos,
+                )
+                t.categoria_gasto = f_res["categoria"]
+                t.desglose_impuestos = f_res["desglose_impuestos"]
+                t.estatus_deducibilidad = f_res["estatus_deducibilidad"]
+                updated_any = True
+        if updated_any:
+            await session.commit()
+
     items = [TicketResponse.from_model(t) for t in tickets[:limit]]
     next_cursor = None
     if len(tickets) > limit:
@@ -311,6 +335,25 @@ async def get_ticket(
             select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
         )
         ticket = res.scalar_one_or_none()
+
+        if ticket and (not ticket.categoria_gasto or not ticket.estatus_deducibilidad):
+            from ..services.fiscal_classifier import analyze_fiscal_classification
+            ext = ticket.extracted or {}
+            com_name = ext.get("comercio") or ticket.sucursal or ""
+            conceptos = " ".join([str(v) for v in ext.values() if v])
+            f_res = analyze_fiscal_classification(
+                comercio=com_name,
+                rfc_emisor=ticket.rfc_emisor,
+                total=ticket.total,
+                subtotal=ticket.subtotal,
+                iva=ticket.iva,
+                forma_pago_raw=ext.get("forma_pago") or "04",
+                conceptos_text=conceptos,
+            )
+            ticket.categoria_gasto = f_res["categoria"]
+            ticket.desglose_impuestos = f_res["desglose_impuestos"]
+            ticket.estatus_deducibilidad = f_res["estatus_deducibilidad"]
+            await session.commit()
 
     if not ticket:
         raise RecursoNoEncontradoException("El ticket no fue encontrado o no tienes permiso para verlo.")

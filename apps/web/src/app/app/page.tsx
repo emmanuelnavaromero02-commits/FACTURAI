@@ -40,14 +40,14 @@ import {
 } from "lucide-react";
 
 const CATEGORIAS = [
-  { id: "todos", label: "Todas las categorías", icon: Layers },
-  { id: "combustible", label: "Gasolina", icon: Fuel },
-  { id: "hospedaje", label: "Hoteles", icon: Hotel },
-  { id: "restaurante", label: "Restaurantes", icon: Utensils },
-  { id: "supermercado", label: "Supermercados", icon: ShoppingCart },
-  { id: "casetas_peaje", label: "Casetas / Peaje", icon: Navigation },
-  { id: "vuelos_transporte", label: "Vuelos / Viajes", icon: Plane },
-  { id: "servicios_generales", label: "Servicios", icon: Briefcase },
+  { id: "todos", label: "Todas las categorías", icon: Layers, satRule: "Vista general de comprobantes" },
+  { id: "restaurante", label: "Restaurantes y Alimentos", icon: Utensils, satRule: "Art. 28 Fracc. XX LISR: 8.5% deducible local / 100% en viáticos" },
+  { id: "combustible", label: "Gasolina y Combustibles", icon: Fuel, satRule: "Art. 27 Fracc. III LISR: Efectivo es 0% deducible. Requiere tarjeta/banco" },
+  { id: "hospedaje", label: "Hoteles y Hospedaje", icon: Hotel, satRule: "100% deducible en viáticos de trabajo. Incluye ISH local" },
+  { id: "supermercado", label: "Supermercados y Despensa", icon: ShoppingCart, satRule: "Separación automática de Tasa 0% (alimentos) e IVA 16%" },
+  { id: "casetas_peaje", label: "Casetas y Peajes", icon: Navigation, satRule: "100% deducible para viáticos carreteros (CAPUFE / TAG)" },
+  { id: "vuelos_transporte", label: "Vuelos y Transporte", icon: Plane, satRule: "100% deducible en transporte de trabajo. Desglose de TUA e IVA" },
+  { id: "servicios_generales", label: "Servicios Generales", icon: Briefcase, satRule: "100% deducible gastos de operación con CFDI" },
 ];
 
 function getCategoryInfo(cat?: string | null) {
@@ -110,6 +110,7 @@ export default function TicketsPage() {
   const [loading, setLoading] = useState(true);
   const [filterState, setFilterState] = useState<string>("todos");
   const [categoriaFilter, setCategoriaFilter] = useState<string>("todos");
+  const [viewMode, setViewMode] = useState<"categorias" | "tabla">("categorias");
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [uploadModalTab, setUploadModalTab] = useState<"foto" | "cfdi">("foto");
   const [selectedTicketForHandoff, setSelectedTicketForHandoff] =
@@ -226,16 +227,188 @@ export default function TicketsPage() {
     }
   };
 
+  // Agrupación automática por categorías para que NO estén todos juntos
+  const ticketsPorCategoria = CATEGORIAS.filter((c) => c.id !== "todos").map((cat) => {
+    const catTickets = filteredTickets.filter(
+      (t) => (t.categoria_gasto || "otros") === cat.id
+    );
+    const totalMonto = catTickets.reduce(
+      (acc, t) => acc + (parseFloat(t.total || "0") || 0),
+      0
+    );
+    const catInfo = getCategoryInfo(cat.id);
+    return {
+      ...cat,
+      color: catInfo.color,
+      tickets: catTickets,
+      totalMonto,
+    };
+  });
+
+  const categoriasConGastos = ticketsPorCategoria.filter((c) => c.tickets.length > 0);
+  const categoriasVacias = ticketsPorCategoria.filter((c) => c.tickets.length === 0);
+
+  const renderTicketRow = (t: TicketResponse, hideCategoryBadge: boolean = false) => {
+    const imageEliminada = !t.image_key || t.estado === "facturado";
+    const catInfo = getCategoryInfo(t.categoria_gasto);
+    const CatIcon = catInfo.icon;
+
+    return (
+      <tr
+        key={t.id}
+        className="transition-colors hover:bg-panel-2 cursor-pointer group"
+        onClick={() => setSelectedTicketDetail(t)}
+      >
+        <td className="px-4 py-3">
+          <b className="block text-sm font-semibold text-ink group-hover:text-brand transition-colors">
+            {t.sucursal || t.rfc_emisor || "Comercio"}
+          </b>
+          <span className="text-[11px] text-muted">
+            {t.rfc_emisor || "RFC en proceso"}
+          </span>
+        </td>
+
+        {!hideCategoryBadge && (
+          <td className="px-4 py-3">
+            <span className={`inline-flex items-center gap-1.5 rounded-lg border px-2 py-0.5 text-[11px] font-semibold ${catInfo.color}`}>
+              <CatIcon className="h-3 w-3 shrink-0" />
+              <span>{catInfo.label}</span>
+            </span>
+          </td>
+        )}
+
+        <td className="mono px-4 py-3 text-xs text-ink">
+          {t.folio || "—"}
+        </td>
+
+        <td className="mono px-4 py-3 text-xs">
+          <div className="font-bold text-ink">{formatCurrency(t.total)}</div>
+          {t.desglose_impuestos && (
+            <div className="text-[10px] text-muted flex flex-wrap gap-1">
+              {(t.desglose_impuestos.iva_16 ?? 0) > 0 && <span>IVA 16%</span>}
+              {(t.desglose_impuestos.base_0 ?? 0) > 0 && <span>0%</span>}
+              {((t.desglose_impuestos.ieps ?? 0) > 0 || (t.desglose_impuestos.ish_local ?? 0) > 0) && (
+                <span>IEPS/ISH</span>
+              )}
+            </div>
+          )}
+        </td>
+
+        <td className="px-4 py-3">
+          {getDeducibilidadBadge(t.estatus_deducibilidad)}
+        </td>
+
+        <td className="px-4 py-3">
+          <StatusBadge
+            estado={t.estado}
+            errorCode={t.error_code}
+            errorMsg={t.error_msg}
+          />
+          {t.estado === "rechazado" && t.error_msg && (
+            <p
+              className="mt-1 max-w-[180px] truncate text-[10px] text-bad/90"
+              title={t.error_msg}
+            >
+              {t.error_msg}
+            </p>
+          )}
+        </td>
+
+        <td className="px-4 py-3">
+          <span
+            className={`inline-flex items-center gap-1 text-[11px] font-medium ${
+              imageEliminada ? "text-ok" : "text-muted"
+            }`}
+          >
+            {imageEliminada ? "✓ eliminada" : "en proceso"}
+          </span>
+        </td>
+
+        <td className="px-4 py-3 text-[11px] text-muted">
+          {formatDate(t.fecha_ticket || t.created_at)}
+        </td>
+
+        <td
+          className="px-4 py-3 text-right"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="flex items-center justify-end gap-1.5">
+            {t.estado === "extraido" && (
+              <button
+                type="button"
+                onClick={() => handleFacturar(t.id)}
+                title="Iniciar facturación automática"
+                className="flex items-center gap-1.5 rounded-lg bg-brand px-2.5 py-1 text-[11px] font-bold text-on-brand shadow-sm transition-all hover:brightness-105 active:scale-95"
+              >
+                <Play className="h-3 w-3 fill-current" />
+                <span>Facturar</span>
+              </button>
+            )}
+
+            {t.estado === "espera_humano" && (
+              <button
+                type="button"
+                onClick={() => setSelectedTicketForHandoff(t)}
+                title="Tomar control en vivo para resolver captcha"
+                className="flex items-center gap-1 rounded-lg bg-amber-500 px-2 py-1 text-[11px] font-bold text-white shadow-sm hover:brightness-105 active:scale-95"
+              >
+                <span>Resolver</span>
+              </button>
+            )}
+
+            {t.estado === "facturado" && (
+              <CfdiDownloadButton
+                ticketId={t.id}
+                disponibleHasta={t.cfdi_disponible_hasta}
+                tenantId={tenantId}
+                compact={true}
+              />
+            )}
+
+            <button
+              type="button"
+              onClick={() => setSelectedTicketDetail(t)}
+              title="Ver detalle del ticket"
+              className="flex h-7 w-7 items-center justify-center rounded-lg border border-line-2 bg-panel text-muted hover:text-ink transition"
+            >
+              <Eye className="h-3.5 w-3.5" />
+            </button>
+
+            {(t.estado === "rechazado" || t.estado === "cancelado") && (
+              <button
+                type="button"
+                onClick={() => handleRetry(t.id)}
+                title="Reintentar facturación"
+                className="flex h-7 w-7 items-center justify-center rounded-lg border border-line-2 bg-panel text-muted hover:text-brand"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() => handleDelete(t.id)}
+              title="Eliminar ticket"
+              className="flex h-7 w-7 items-center justify-center rounded-lg text-muted hover:text-bad"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </td>
+      </tr>
+    );
+  };
+
   return (
     <div className="flex flex-col gap-6">
       {/* Encabezado */}
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-ink">Tickets</h1>
+          <h1 className="text-2xl font-bold tracking-tight text-ink">Tickets y Facturas</h1>
           <p className="mt-0.5 text-xs text-muted">
             {pendientesHumano > 0
               ? `${pendientesHumano} esperando algo tuyo`
-              : "Todo en orden · Cola sincronizada"}
+              : "Todo en orden · Gastos divididos automáticamente por categoría SAT"}
           </p>
         </div>
 
@@ -271,15 +444,15 @@ export default function TicketsPage() {
         <div className="rounded-xl border border-line bg-panel p-3.5 shadow-sm">
           <p className="lt">Este mes</p>
           <div className="mono mt-1 text-2xl font-bold text-ink">{totalMes}</div>
-          <p className="mt-0.5 text-[11px] text-muted">tickets procesados</p>
+          <p className="mt-0.5 text-[11px] text-muted">comprobantes procesados</p>
         </div>
 
         <div className="rounded-xl border border-line bg-panel p-3.5 shadow-sm">
-          <p className="lt">Automático</p>
+          <p className="lt">Clasificación</p>
           <div className="mono mt-1 text-2xl font-bold text-brand">
-            {porcentajeAutomatico}%
+            100%
           </div>
-          <p className="mt-0.5 text-[11px] text-muted">sin tocar nada</p>
+          <p className="mt-0.5 text-[11px] text-muted">automática por SAT</p>
         </div>
 
         <div className="rounded-xl border border-line bg-panel p-3.5 shadow-sm">
@@ -299,11 +472,75 @@ export default function TicketsPage() {
         </div>
       </div>
 
-      {/* Tarjeta de Cola de Facturación con Filtros */}
+      {/* Franja de Resumen de División Automática y Selector de Vista */}
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-line bg-panel p-3.5 shadow-sm">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="flex items-center gap-1.5 text-xs font-bold text-ink mr-1">
+            <Layers className="h-4 w-4 text-brand" />
+            <span>División de gastos:</span>
+          </span>
+          {categoriasConGastos.map((cat) => {
+            const CatIcon = cat.icon;
+            return (
+              <div
+                key={cat.id}
+                className="flex items-center gap-1.5 rounded-lg border border-line-2 bg-panel-2 px-2.5 py-1 text-xs"
+              >
+                <CatIcon className="h-3.5 w-3.5 text-brand" />
+                <span className="font-semibold text-ink">{cat.label}:</span>
+                <span className="mono font-bold text-ink">{cat.tickets.length}</span>
+                <span className="text-muted text-[11px]">({formatCurrency(cat.totalMonto)})</span>
+              </div>
+            );
+          })}
+          {categoriasConGastos.length === 0 && (
+            <span className="text-muted text-xs">Sin comprobantes cargados en el mes.</span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium text-muted hidden sm:inline">Modo de visualización:</span>
+          <div className="flex rounded-xl border border-line-2 bg-panel-2 p-1 text-xs">
+            <button
+              type="button"
+              onClick={() => setViewMode("categorias")}
+              className={`flex items-center gap-1.5 rounded-lg px-3 py-1 font-semibold transition ${
+                viewMode === "categorias"
+                  ? "bg-panel text-ink shadow-sm"
+                  : "text-muted hover:text-ink"
+              }`}
+            >
+              <Layers className="h-3.5 w-3.5 text-brand" />
+              <span>Separado por categoría</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode("tabla")}
+              className={`flex items-center gap-1.5 rounded-lg px-3 py-1 font-semibold transition ${
+                viewMode === "tabla"
+                  ? "bg-panel text-ink shadow-sm"
+                  : "text-muted hover:text-ink"
+              }`}
+            >
+              <Receipt className="h-3.5 w-3.5 text-muted" />
+              <span>Tabla corrida</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Barra de Filtros de Estado y Categoría */}
       <div className="overflow-hidden rounded-2xl border border-line bg-panel shadow-prototipo">
         {/* Filtros de Estado */}
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
-          <h2 className="text-sm font-bold text-ink">Cola de facturación</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-sm font-bold text-ink">
+              {viewMode === "categorias" ? "Gastos separados por categoría" : "Cola unificada"}
+            </h2>
+            <span className="text-xs text-muted">
+              ({filteredTickets.length} {filteredTickets.length === 1 ? "comprobante" : "comprobantes"})
+            </span>
+          </div>
 
           <div className="flex flex-wrap gap-1.5">
             <button
@@ -315,7 +552,7 @@ export default function TicketsPage() {
                   : "border border-line-2 bg-panel-2 text-ink-2 hover:bg-line/20"
               }`}
             >
-              Todos
+              Todos los estados
             </button>
             <button
               type="button"
@@ -353,9 +590,9 @@ export default function TicketsPage() {
           </div>
         </div>
 
-        {/* Barra de Categorías Fiscales Automáticas (División sin hacer nada) */}
+        {/* Barra de Categorías Fiscales */}
         <div className="flex items-center gap-1.5 overflow-x-auto border-b border-line bg-panel-2/30 px-4 py-2 text-xs">
-          <span className="text-[11px] font-semibold text-muted mr-1 hidden sm:inline shrink-0">Categoría:</span>
+          <span className="text-[11px] font-semibold text-muted mr-1 hidden sm:inline shrink-0">Filtrar:</span>
           {CATEGORIAS.map((cat) => {
             const Icon = cat.icon;
             const isSelected = categoriaFilter === cat.id;
@@ -377,218 +614,174 @@ export default function TicketsPage() {
           })}
         </div>
 
-        {/* Tabla de Tickets */}
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead>
-              <tr className="border-b border-line bg-panel-2/50 text-[10px] font-semibold uppercase tracking-wider text-muted">
-                <th className="px-4 py-2.5">Comercio</th>
-                <th className="px-4 py-2.5">Categoría</th>
-                <th className="px-4 py-2.5">Folio</th>
-                <th className="px-4 py-2.5">Monto</th>
-                <th className="px-4 py-2.5">Deducibilidad SAT</th>
-                <th className="px-4 py-2.5">Estado</th>
-                <th className="px-4 py-2.5">Imagen</th>
-                <th className="px-4 py-2.5">Fecha</th>
-                <th className="px-4 py-2.5 text-right">Acción</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-line">
-              {filteredTickets.map((t) => {
-                const imageEliminada = !t.image_key || t.estado === "facturado";
-                const catInfo = getCategoryInfo(t.categoria_gasto);
-                const CatIcon = catInfo.icon;
-                return (
-                  <tr
-                    key={t.id}
-                    className="transition-colors hover:bg-panel-2 cursor-pointer group"
-                    onClick={() => setSelectedTicketDetail(t)}
-                  >
-                    <td className="px-4 py-3">
-                      <b className="block text-sm font-semibold text-ink group-hover:text-brand transition-colors">
-                        {t.sucursal || t.rfc_emisor || "Comercio"}
-                      </b>
-                      <span className="text-[11px] text-muted">
-                        {t.rfc_emisor || "RFC en proceso"}
-                      </span>
-                    </td>
-
-                    <td className="px-4 py-3">
-                      <span className={`inline-flex items-center gap-1.5 rounded-lg border px-2 py-0.5 text-[11px] font-semibold ${catInfo.color}`}>
-                        <CatIcon className="h-3 w-3 shrink-0" />
-                        <span>{catInfo.label}</span>
-                      </span>
-                    </td>
-
-                    <td className="mono px-4 py-3 text-xs text-ink">
-                      {t.folio || "—"}
-                    </td>
-
-                    <td className="mono px-4 py-3 text-xs">
-                      <div className="font-bold text-ink">{formatCurrency(t.total)}</div>
-                      {t.desglose_impuestos && (
-                        <div className="text-[10px] text-muted flex flex-wrap gap-1">
-                          {(t.desglose_impuestos.iva_16 ?? 0) > 0 && <span>IVA 16%</span>}
-                          {(t.desglose_impuestos.base_0 ?? 0) > 0 && <span>0%</span>}
-                          {((t.desglose_impuestos.ieps ?? 0) > 0 || (t.desglose_impuestos.ish_local ?? 0) > 0) && (
-                            <span>IEPS/ISH</span>
-                          )}
+        {/* CONTENIDO PRINCIPAL: VISTA DE CATEGORÍAS SEPARADAS (DEFAULT) */}
+        {viewMode === "categorias" ? (
+          <div className="p-4 space-y-6">
+            {categoriasConGastos.map((cat) => {
+              const CatIcon = cat.icon;
+              return (
+                <div
+                  key={cat.id}
+                  className="overflow-hidden rounded-2xl border border-line bg-panel shadow-sm"
+                >
+                  {/* Cabecera de Categoría Separada */}
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line bg-panel-2/40 px-5 py-3.5">
+                    <div className="flex items-center gap-3">
+                      <div className={`flex h-9 w-9 items-center justify-center rounded-xl border ${cat.color}`}>
+                        <CatIcon className="h-4 w-4" />
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <h3 className="text-sm font-bold text-ink">{cat.label}</h3>
+                          <span className="rounded-full bg-brand/10 text-brand border border-brand/20 px-2 py-0.5 text-[10px] font-bold">
+                            {cat.tickets.length} {cat.tickets.length === 1 ? "comprobante" : "comprobantes"}
+                          </span>
                         </div>
-                      )}
-                    </td>
+                        <p className="text-[11px] text-muted">{cat.satRule}</p>
+                      </div>
+                    </div>
 
-                    <td className="px-4 py-3">
-                      {getDeducibilidadBadge(t.estatus_deducibilidad)}
-                    </td>
+                    <div className="flex items-center gap-3">
+                      <div className="text-right">
+                        <span className="text-[10px] uppercase font-semibold text-muted block">Subtotal categoría</span>
+                        <span className="mono text-sm font-bold text-ink">{formatCurrency(cat.totalMonto)}</span>
+                      </div>
+                    </div>
+                  </div>
 
-                    <td className="px-4 py-3">
-                      <StatusBadge
-                        estado={t.estado}
-                        errorCode={t.error_code}
-                        errorMsg={t.error_msg}
-                      />
-                      {t.estado === "rechazado" && t.error_msg && (
-                        <p
-                          className="mt-1 max-w-[180px] truncate text-[10px] text-bad/90"
-                          title={t.error_msg}
-                        >
-                          {t.error_msg}
-                        </p>
-                      )}
-                    </td>
+                  {/* Tabla Exclusiva de esta Categoría */}
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs">
+                      <thead>
+                        <tr className="border-b border-line bg-panel-2/20 text-[10px] font-semibold uppercase tracking-wider text-muted">
+                          <th className="px-4 py-2.5">Comercio</th>
+                          <th className="px-4 py-2.5">Folio</th>
+                          <th className="px-4 py-2.5">Monto / Impuestos</th>
+                          <th className="px-4 py-2.5">Deducibilidad SAT</th>
+                          <th className="px-4 py-2.5">Estado</th>
+                          <th className="px-4 py-2.5">Imagen</th>
+                          <th className="px-4 py-2.5">Fecha</th>
+                          <th className="px-4 py-2.5 text-right">Acción</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-line">
+                        {cat.tickets.map((t) => renderTicketRow(t, true))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })}
 
-                    <td className="px-4 py-3">
-                      <span
-                        className={`inline-flex items-center gap-1 text-[11px] font-medium ${
-                          imageEliminada ? "text-ok" : "text-muted"
-                        }`}
+            {/* Categorías sin tickets para transparencia del sistema */}
+            {categoriasVacias.length > 0 && categoriaFilter === "todos" && (
+              <div className="rounded-2xl border border-line/60 bg-panel/40 p-4">
+                <h4 className="text-xs font-bold uppercase tracking-wider text-muted mb-3 flex items-center gap-1.5">
+                  <Layers className="h-3.5 w-3.5" />
+                  <span>Otras categorías listas para recibir comprobantes (0 gastos):</span>
+                </h4>
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2.5">
+                  {categoriasVacias.map((cat) => {
+                    const CatIcon = cat.icon;
+                    return (
+                      <div
+                        key={cat.id}
+                        className="flex items-center gap-2.5 rounded-xl border border-line-2/70 bg-panel p-2.5 text-xs text-muted hover:border-brand/40 transition cursor-pointer"
+                        onClick={() => {
+                          setUploadModalTab("cfdi");
+                          setShowUploadModal(true);
+                        }}
                       >
-                        {imageEliminada ? "✓ eliminada" : "en proceso"}
-                      </span>
-                    </td>
+                        <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-panel-2 text-muted">
+                          <CatIcon className="h-3.5 w-3.5" />
+                        </div>
+                        <div className="flex-1 truncate">
+                          <span className="font-semibold text-ink-2 block truncate">{cat.label}</span>
+                          <span className="text-[10px] text-muted">$0.00 · Clic para subir</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
-                    <td className="px-4 py-3 text-[11px] text-muted">
-                      {formatDate(t.fecha_ticket || t.created_at)}
-                    </td>
-
-                    <td
-                      className="px-4 py-3 text-right"
-                      onClick={(e) => e.stopPropagation()}
+            {/* Estado Vacío */}
+            {!loading && filteredTickets.length === 0 && (
+              <div className="py-12 text-center">
+                <div className="mx-auto flex max-w-xs flex-col items-center gap-2 text-muted">
+                  <Receipt className="h-8 w-8 stroke-[1.5] text-line-2" />
+                  <b className="text-sm font-semibold text-ink">
+                    No hay tickets registrados
+                  </b>
+                  <p className="text-xs">
+                    Presiona &ldquo;Subir ticket&rdquo; o &ldquo;Subir CFDI&rdquo; para procesar tu primer comprobante.
+                  </p>
+                  <div className="mt-2 flex items-center justify-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setUploadModalTab("foto");
+                        setShowUploadModal(true);
+                      }}
+                      className="rounded-xl bg-brand px-3 py-1.5 text-xs font-bold text-on-brand shadow hover:brightness-105"
                     >
-                      <div className="flex items-center justify-end gap-1.5">
-                        {/* Botón Facturar si está extraído */}
-                        {t.estado === "extraido" && (
-                          <button
-                            type="button"
-                            onClick={() => handleFacturar(t.id)}
-                            title="Iniciar facturación automática"
-                            className="flex items-center gap-1.5 rounded-lg bg-brand px-2.5 py-1 text-[11px] font-bold text-on-brand shadow-sm transition-all hover:brightness-105 active:scale-95"
-                          >
-                            <Play className="h-3 w-3 fill-current" />
-                            <span>Facturar</span>
-                          </button>
-                        )}
+                      ＋ Subir ticket
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setUploadModalTab("cfdi");
+                        setShowUploadModal(true);
+                      }}
+                      className="rounded-xl border border-line-2 bg-panel px-3 py-1.5 text-xs font-semibold text-ink hover:bg-panel-2"
+                    >
+                      📄 Subir CFDI
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          /* TABLA CORRIDA UNIFICADA */
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="border-b border-line bg-panel-2/50 text-[10px] font-semibold uppercase tracking-wider text-muted">
+                  <th className="px-4 py-2.5">Comercio</th>
+                  <th className="px-4 py-2.5">Categoría</th>
+                  <th className="px-4 py-2.5">Folio</th>
+                  <th className="px-4 py-2.5">Monto</th>
+                  <th className="px-4 py-2.5">Deducibilidad SAT</th>
+                  <th className="px-4 py-2.5">Estado</th>
+                  <th className="px-4 py-2.5">Imagen</th>
+                  <th className="px-4 py-2.5">Fecha</th>
+                  <th className="px-4 py-2.5 text-right">Acción</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-line">
+                {filteredTickets.map((t) => renderTicketRow(t, false))}
 
-                        {/* Botón Handoff si requiere intervención */}
-                        {t.estado === "espera_humano" && (
-                          <button
-                            type="button"
-                            onClick={() => setSelectedTicketForHandoff(t)}
-                            title="Tomar control en vivo para resolver captcha"
-                            className="flex items-center gap-1 rounded-lg bg-amber-500 px-2 py-1 text-[11px] font-bold text-white shadow-sm hover:brightness-105 active:scale-95"
-                          >
-                            <span>Resolver</span>
-                          </button>
-                        )}
-
-                        {/* Botones de descarga si ya está facturado */}
-                        {t.estado === "facturado" && (
-                          <CfdiDownloadButton
-                            ticketId={t.id}
-                            disponibleHasta={t.cfdi_disponible_hasta}
-                            tenantId={tenantId}
-                            compact={true}
-                          />
-                        )}
-
-                        {/* Botón de ver detalle */}
-                        <button
-                          type="button"
-                          onClick={() => setSelectedTicketDetail(t)}
-                          title="Ver detalle del ticket"
-                          className="flex h-7 w-7 items-center justify-center rounded-lg border border-line-2 bg-panel text-muted hover:text-ink transition"
-                        >
-                          <Eye className="h-3.5 w-3.5" />
-                        </button>
-
-                        {/* Botón de reintento si falló */}
-                        {(t.estado === "rechazado" || t.estado === "cancelado") && (
-                          <button
-                            type="button"
-                            onClick={() => handleRetry(t.id)}
-                            title="Reintentar facturación"
-                            className="flex h-7 w-7 items-center justify-center rounded-lg border border-line-2 bg-panel text-muted hover:text-brand"
-                          >
-                            <RefreshCw className="h-3.5 w-3.5" />
-                          </button>
-                        )}
-
-                        {/* Botón de eliminar */}
-                        <button
-                          type="button"
-                          onClick={() => handleDelete(t.id)}
-                          title="Eliminar ticket"
-                          className="flex h-7 w-7 items-center justify-center rounded-lg text-muted hover:text-bad"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
+                {!loading && filteredTickets.length === 0 && (
+                  <tr>
+                    <td colSpan={9} className="py-12 text-center">
+                      <div className="mx-auto flex max-w-xs flex-col items-center gap-2 text-muted">
+                        <Receipt className="h-8 w-8 stroke-[1.5] text-line-2" />
+                        <b className="text-sm font-semibold text-ink">
+                          No hay tickets registrados
+                        </b>
+                        <p className="text-xs">
+                          Presiona &ldquo;Subir ticket&rdquo; o &ldquo;Subir CFDI&rdquo; para procesar tu primer comprobante.
+                        </p>
                       </div>
                     </td>
                   </tr>
-                );
-              })}
-
-              {/* Estado Vacío */}
-              {!loading && filteredTickets.length === 0 && (
-                <tr>
-                  <td colSpan={9} className="py-12 text-center">
-                    <div className="mx-auto flex max-w-xs flex-col items-center gap-2 text-muted">
-                      <Receipt className="h-8 w-8 stroke-[1.5] text-line-2" />
-                      <b className="text-sm font-semibold text-ink">
-                        No hay tickets registrados
-                      </b>
-                      <p className="text-xs">
-                        Presiona &ldquo;Subir ticket&rdquo; o &ldquo;Subir CFDI&rdquo; para procesar tu primer comprobante.
-                      </p>
-                      <div className="mt-2 flex items-center justify-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setUploadModalTab("foto");
-                            setShowUploadModal(true);
-                          }}
-                          className="rounded-xl bg-brand px-3 py-1.5 text-xs font-bold text-on-brand shadow hover:brightness-105"
-                        >
-                          ＋ Subir ticket
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setUploadModalTab("cfdi");
-                            setShowUploadModal(true);
-                          }}
-                          className="rounded-xl border border-line-2 bg-panel px-3 py-1.5 text-xs font-semibold text-ink hover:bg-panel-2"
-                        >
-                          📄 Subir CFDI
-                        </button>
-                      </div>
-                    </div>
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* MODAL: SUBIR TICKET O CFDI */}

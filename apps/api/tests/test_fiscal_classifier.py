@@ -28,6 +28,8 @@ def test_classify_expense_by_text_and_rfc():
     # 3. Restaurantes
     assert classify_expense_by_text_and_rfc(comercio="Domino's Pizza Alsea") == "restaurante"
     assert classify_expense_by_text_and_rfc(comercio="Starbucks Coffee") == "restaurante"
+    assert classify_expense_by_text_and_rfc(comercio="KFC (Premium Restaurant Brands SDE RL DE CV)") == "restaurante"
+    assert classify_expense_by_text_and_rfc(comercio="RESTAURANTES TOKS, S.A. DE C.V.") == "restaurante"
     assert classify_expense_by_text_and_rfc(claves_prod_serv=["90101500"]) == "restaurante"
 
     # 4. Supermercado
@@ -41,6 +43,11 @@ def test_classify_expense_by_text_and_rfc():
     # 6. Vuelos / Transporte
     assert classify_expense_by_text_and_rfc(comercio="Aeroméxico Vuelo AM102") == "vuelos_transporte"
     assert classify_expense_by_text_and_rfc(comercio="Uber Technologies") == "vuelos_transporte"
+    assert classify_expense_by_text_and_rfc(comercio="Autobuses de Oriente ADO") == "vuelos_transporte"
+
+    # 7. Servicios Generales y Entretenimiento (evitando que 'operadora' detone 'ado')
+    assert classify_expense_by_text_and_rfc(comercio="Cinemex (Operadora de Cinemas SA de CV)") == "servicios_generales"
+    assert classify_expense_by_text_and_rfc(comercio="CFE Suministrador de Servicios Basicos") == "servicios_generales"
 
 
 def test_sat_deducibility_rules():

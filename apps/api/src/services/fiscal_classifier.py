@@ -49,37 +49,53 @@ SAT_CLAVES_CATEGORIA = {
     ],
 }
 
-# Palabras clave y RFCs para detección por nombre o texto
-KEYWORD_PATTERNS = {
-    "combustible": [
-        "gasolina", "combustible", "magna", "premium", "diesel", "pemex", "oxxo gas",
-        "petro seven", "g500", "hidrosina", "bp", "shell", "mobil", "repsol", "total gas",
-        "gasolinera", "estacion de servicio", "litros", "despachador"
-    ],
-    "hospedaje": [
-        "hotel", "motel", "posada", "inn", "suites", "resort", "fiesta americana",
-        "city express", "holiday inn", "marriott", "hilton", "habitacion", "hospedaje",
-        "check in", "check out", "posadas", "airbnb", "estancia"
-    ],
-    "restaurante": [
-        "restaurante", "cafeteria", "bistro", "taqueria", "pizzeria", "domino", "starbucks",
-        "vips", "toks", "sanborns", "chilis", "italiannis", "burger king", "mcdonald",
-        "alimentos", "consumo", "mesa", "propina", "mesero", "comida", "comedor", "bar"
-    ],
-    "supermercado": [
-        "walmart", "bodega aurrera", "soriana", "chedraui", "superama", "la comer",
-        "heb", "costco", "sam's", "sams club", "tiendas 3b", "oxxo", "7-eleven", "supermercado",
-        "abarrotes", "despensa", "farmacia guadalajara", "farmacias del ahorro"
-    ],
-    "casetas_peaje": [
-        "capufe", "peaje", "caseta", "autopista", "via corta", "pinfra", "ideal", "rco",
-        "viapass", "pase", "iave", "televia", "tramo carretero"
-    ],
-    "vuelos_transporte": [
-        "aeromexico", "volaris", "vivaaerobus", "aerolinea", "vuelo", "avion", "embarque",
-        "tua", "uber", "didi", "cabify", "taxi", "ado", "primera plus", "etn", "autobus"
-    ],
-}
+import re
+
+# Patrones regex con límites de palabra (\b) para evitar falsos positivos
+REGEX_CATEGORIAS = [
+    (
+        "combustible",
+        [
+            r"\b(gasolina|combustible|combustibles|magna|diesel|pemex|oxxo\s*gas|petro\s*seven|g500|hidrosina|gasolinera|estacion\s+de\s+servicio|despachador|litros)\b",
+        ],
+    ),
+    (
+        "casetas_peaje",
+        [
+            r"\b(capufe|peaje|caseta|casetas|autopista|autopistas|via\s+corta|pinfra|ideal|rco|viapass|pase|iave|televia|tramo\s+carretero|carreteras)\b",
+        ],
+    ),
+    (
+        "hospedaje",
+        [
+            r"\b(hotel|hoteles|motel|moteles|posada|posadas|inn|suites|resort|fiesta\s+americana|city\s+express|holiday\s+inn|marriott|hilton|habitacion|hospedaje|check\s+in|check\s+out|airbnb|estancia|huesped)\b",
+        ],
+    ),
+    (
+        "restaurante",
+        [
+            r"\b(restaurante|restaurantes|restaurant|cafeteria|bistro|taqueria|tacos|pizzeria|pizza|domino\'?s?|starbucks|vips|toks|sanborns|chilis|italiannis|burger\s*king|mcdonald\'?s?|kfc|kentucky|pollo|alimentos|consumo|mesa|propina|mesero|comida|comedor|bar|panificacion|gastronomica|pasteleria|wings|sushi|subway|mariscos|helados|nutrisa|carl\'?s?\s*jr)\b",
+        ],
+    ),
+    (
+        "vuelos_transporte",
+        [
+            r"\b(aeromexico|volaris|vivaaerobus|aerolinea|aerolineas|vuelo|vuelos|avion|embarque|tua|uber|didi|cabify|taxi|taxis|\bado\b|primera\s+plus|etn|autobus|autobuses|boleto\s+de\s+autobus|terminal\s+de\s+autobuses)\b",
+        ],
+    ),
+    (
+        "supermercado",
+        [
+            r"\b(walmart|bodega\s+aurrera|aurrera|soriana|chedraui|superama|la\s+comer|heb|costco|sam\'?s|tiendas\s+3b|oxxo|7-eleven|supermercado|abarrotes|despensa|farmacia\s+guadalajara|farmacias\s+del\s+ahorro|farmacia\s+san\s+pablo|benavides)\b",
+        ],
+    ),
+    (
+        "servicios_generales",
+        [
+            r"\b(cfe|telmex|telcel|at&t|izzi|totalplay|office\s+depot|officemax|cinemex|cinepolis|cine|cinemas|operadora\s+de\s+cinemas|megacable|telefonica|luz|internet|software|papeleria)\b",
+        ],
+    ),
+]
 
 
 def to_decimal(val: Any) -> Decimal:
@@ -118,13 +134,15 @@ def classify_expense_by_text_and_rfc(
         (conceptos_text or "").lower(),
     ])
 
-    for cat in ("combustible", "casetas_peaje", "hospedaje", "vuelos_transporte", "restaurante", "supermercado"):
-        keywords = KEYWORD_PATTERNS.get(cat, [])
-        if any(kw in text_corpus for kw in keywords):
-            return cat
+    # Regla de combustible especial para 'premium' (evitar 'Premium Restaurant Brands')
+    if re.search(r"\bpremium\b", text_corpus):
+        if not re.search(r"\b(restaurant|restaurante|food|alimentos|panificacion|brands|cinema)\b", text_corpus):
+            return "combustible"
 
-    if any(k in text_corpus for k in ("cfe", "telmex", "telcel", "at&t", "izzi", "totalplay", "office depot", "officemax")):
-        return "servicios_generales"
+    for cat, patterns in REGEX_CATEGORIAS:
+        for pattern in patterns:
+            if re.search(pattern, text_corpus, re.IGNORECASE):
+                return cat
 
     return "otros"
 
@@ -454,6 +472,7 @@ def analyze_fiscal_classification(
     xml_bytes: Optional[bytes] = None,
     forma_pago_raw: Optional[str] = None,
     es_viatico_foraneo: bool = False,
+    conceptos_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Función integral que clasifica la factura, extrae o estima el desglose de impuestos
@@ -471,10 +490,11 @@ def analyze_fiscal_classification(
         if xml_data.get("forma_pago"):
             forma_pago = xml_data["forma_pago"]
 
+        texto_completo = " ".join(filter(None, [conceptos_text, " ".join(conceptos_resumen)]))
         categoria = classify_expense_by_text_and_rfc(
             comercio=comercio,
             rfc_emisor=rfc_emisor,
-            conceptos_text=" ".join(conceptos_resumen),
+            conceptos_text=texto_completo,
             claves_prod_serv=claves_prod_serv,
         )
 
@@ -498,7 +518,7 @@ def analyze_fiscal_classification(
         categoria = classify_expense_by_text_and_rfc(
             comercio=comercio,
             rfc_emisor=rfc_emisor,
-            conceptos_text="",
+            conceptos_text=conceptos_text or "",
             claves_prod_serv=None,
         )
         est = estimate_tax_breakdown_from_ticket(total, subtotal, iva, categoria)
