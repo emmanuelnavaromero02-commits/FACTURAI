@@ -18,6 +18,14 @@ import {
   Zap,
   Mail,
   Loader2,
+  ShieldCheck,
+  ShieldAlert,
+  Fuel,
+  Hotel,
+  Utensils,
+  ShoppingCart,
+  Navigation,
+  Plane,
 } from "lucide-react";
 import { TicketResponse } from "@/types/api";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -272,6 +280,102 @@ export function TicketDetailModal({
                   </button>
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* Inteligencia Fiscal y Desglose de Impuestos SAT */}
+          {(ticket.categoria_gasto || ticket.desglose_impuestos) && (
+            <div className="rounded-xl border border-line bg-panel-2/40 p-4">
+              <div className="flex items-center justify-between gap-2 mb-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold uppercase tracking-wider text-ink flex items-center gap-1.5">
+                    {ticket.categoria_gasto === "combustible" && <Fuel className="h-4 w-4 text-amber-500" />}
+                    {ticket.categoria_gasto === "hospedaje" && <Hotel className="h-4 w-4 text-blue-500" />}
+                    {ticket.categoria_gasto === "restaurante" && <Utensils className="h-4 w-4 text-orange-500" />}
+                    {ticket.categoria_gasto === "supermercado" && <ShoppingCart className="h-4 w-4 text-emerald-500" />}
+                    {ticket.categoria_gasto === "casetas_peaje" && <Navigation className="h-4 w-4 text-indigo-500" />}
+                    {ticket.categoria_gasto === "vuelos_transporte" && <Plane className="h-4 w-4 text-cyan-500" />}
+                    <span>
+                      {ticket.categoria_gasto === "combustible" ? "Combustible / Gasolina" :
+                       ticket.categoria_gasto === "hospedaje" ? "Hospedaje / Hotel" :
+                       ticket.categoria_gasto === "restaurante" ? "Alimentos / Restaurante" :
+                       ticket.categoria_gasto === "supermercado" ? "Supermercado / Despensa" :
+                       ticket.categoria_gasto === "casetas_peaje" ? "Casetas / Peaje" :
+                       ticket.categoria_gasto === "vuelos_transporte" ? "Transporte / Vuelos" :
+                       ticket.categoria_gasto === "servicios_generales" ? "Servicios Generales" : "Gasto General"}
+                    </span>
+                  </span>
+                </div>
+
+                {/* Semáforo Deducibilidad SAT */}
+                {ticket.estatus_deducibilidad && (
+                  <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold ${
+                    ticket.estatus_deducibilidad === "deducible_100" ? "bg-ok-soft text-ok border border-ok/30" :
+                    ticket.estatus_deducibilidad === "no_deducible" ? "bg-bad/15 text-bad border border-bad/30" :
+                    "bg-amber-500/15 text-amber-400 border border-amber-500/30"
+                  }`}>
+                    {ticket.estatus_deducibilidad === "deducible_100" ? <ShieldCheck className="h-3.5 w-3.5" /> : <ShieldAlert className="h-3.5 w-3.5" />}
+                    <span>
+                      {ticket.estatus_deducibilidad === "deducible_100" ? "100% Deducible SAT" :
+                       ticket.estatus_deducibilidad === "no_deducible" ? "No Deducible (Efectivo)" :
+                       ticket.estatus_deducibilidad === "deducible_parcial" ? "8.5% Deducible (Local)" : "Deducible Condicionado"}
+                    </span>
+                  </span>
+                )}
+              </div>
+
+              {/* Desglose de Impuestos */}
+              {ticket.desglose_impuestos && (
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-line/60 text-xs">
+                  <div className="rounded-lg bg-panel p-2.5 border border-line/50">
+                    <span className="text-[10px] text-muted block font-medium">IVA 16%</span>
+                    <span className="mono font-bold text-ink">
+                      {formatCurrency(ticket.desglose_impuestos.iva_16 ?? 0)}
+                    </span>
+                    <span className="text-[10px] text-muted block mt-0.5">
+                      Base: {formatCurrency(ticket.desglose_impuestos.base_16 ?? 0)}
+                    </span>
+                  </div>
+
+                  <div className="rounded-lg bg-panel p-2.5 border border-line/50">
+                    <span className="text-[10px] text-muted block font-medium">Tasa 0%</span>
+                    <span className="mono font-bold text-ink">
+                      {formatCurrency(ticket.desglose_impuestos.base_0 ?? 0)}
+                    </span>
+                    <span className="text-[10px] text-muted block mt-0.5">IVA: $0.00</span>
+                  </div>
+
+                  <div className="rounded-lg bg-panel p-2.5 border border-line/50">
+                    <span className="text-[10px] text-muted block font-medium">
+                      {(ticket.desglose_impuestos.ish && ticket.desglose_impuestos.ish > 0) ? "ISH (Hospedaje)" :
+                       (ticket.desglose_impuestos.ieps && ticket.desglose_impuestos.ieps > 0) ? "IEPS" : "Exento"}
+                    </span>
+                    <span className="mono font-bold text-ink">
+                      {formatCurrency(
+                        (ticket.desglose_impuestos.ish && ticket.desglose_impuestos.ish > 0)
+                          ? ticket.desglose_impuestos.ish
+                          : (ticket.desglose_impuestos.ieps && ticket.desglose_impuestos.ieps > 0)
+                          ? ticket.desglose_impuestos.ieps
+                          : (ticket.desglose_impuestos.base_exenta ?? 0)
+                      )}
+                    </span>
+                    <span className="text-[10px] text-muted block mt-0.5">
+                      {(ticket.desglose_impuestos.ish && ticket.desglose_impuestos.ish > 0) ? "Impuesto local" :
+                       (ticket.desglose_impuestos.ieps && ticket.desglose_impuestos.ieps > 0) ? "Cuota / Tasa" : "Sin IVA"}
+                    </span>
+                  </div>
+
+                  <div className="rounded-lg bg-panel p-2.5 border border-line/50">
+                    <span className="text-[10px] text-muted block font-medium">Retenciones</span>
+                    <span className="mono font-bold text-ink">
+                      {formatCurrency(
+                        ((ticket.desglose_impuestos.retencion_iva ?? 0) + (ticket.desglose_impuestos.retencion_isr ?? 0))
+                      )}
+                    </span>
+                    <span className="text-[10px] text-muted block mt-0.5">IVA / ISR</span>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 

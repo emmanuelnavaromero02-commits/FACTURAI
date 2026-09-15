@@ -7,6 +7,7 @@ import { TicketResponse } from "@/types/api";
 import { StatusBadge } from "@/components/StatusBadge";
 import { CfdiDownloadButton } from "@/components/CfdiDownloadButton";
 import { MobileCameraUpload } from "@/components/MobileCameraUpload";
+import { DirectCfdiUpload } from "@/components/DirectCfdiUpload";
 import { HandoffModal } from "@/components/HandoffModal";
 import { TicketDetailModal } from "@/components/TicketDetailModal";
 import { useRouter } from "next/navigation";
@@ -23,7 +24,84 @@ import {
   X,
   Receipt,
   Eye,
+  Camera,
+  FileCode,
+  FileText,
+  Fuel,
+  Hotel,
+  Utensils,
+  ShoppingCart,
+  Navigation,
+  Plane,
+  Briefcase,
+  Layers,
+  ShieldCheck,
+  ShieldAlert,
 } from "lucide-react";
+
+const CATEGORIAS = [
+  { id: "todos", label: "Todas las categorías", icon: Layers },
+  { id: "combustible", label: "Gasolina", icon: Fuel },
+  { id: "hospedaje", label: "Hoteles", icon: Hotel },
+  { id: "restaurante", label: "Restaurantes", icon: Utensils },
+  { id: "supermercado", label: "Supermercados", icon: ShoppingCart },
+  { id: "casetas_peaje", label: "Casetas / Peaje", icon: Navigation },
+  { id: "vuelos_transporte", label: "Vuelos / Viajes", icon: Plane },
+  { id: "servicios_generales", label: "Servicios", icon: Briefcase },
+];
+
+function getCategoryInfo(cat?: string | null) {
+  switch (cat) {
+    case "combustible":
+      return { label: "Gasolina", icon: Fuel, color: "text-amber-500 bg-amber-500/10 border-amber-500/30" };
+    case "hospedaje":
+      return { label: "Hospedaje", icon: Hotel, color: "text-blue-400 bg-blue-500/10 border-blue-500/30" };
+    case "restaurante":
+      return { label: "Restaurante", icon: Utensils, color: "text-orange-400 bg-orange-500/10 border-orange-500/30" };
+    case "supermercado":
+      return { label: "Supermercado", icon: ShoppingCart, color: "text-emerald-400 bg-emerald-500/10 border-emerald-500/30" };
+    case "casetas_peaje":
+      return { label: "Caseta", icon: Navigation, color: "text-indigo-400 bg-indigo-500/10 border-indigo-500/30" };
+    case "vuelos_transporte":
+      return { label: "Vuelo", icon: Plane, color: "text-cyan-400 bg-cyan-500/10 border-cyan-500/30" };
+    case "servicios_generales":
+      return { label: "Servicios", icon: Briefcase, color: "text-purple-400 bg-purple-500/10 border-purple-500/30" };
+    default:
+      return { label: "General", icon: Layers, color: "text-muted bg-panel-2 border-line" };
+  }
+}
+
+function getDeducibilidadBadge(estatus?: string | null) {
+  if (estatus === "deducible_100") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-ok/30 bg-ok-soft px-2 py-0.5 text-[10px] font-bold text-ok">
+        <ShieldCheck className="h-3 w-3" />
+        <span>100% Deducible</span>
+      </span>
+    );
+  }
+  if (estatus === "deducible_parcial") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/15 px-2 py-0.5 text-[10px] font-bold text-amber-400">
+        <ShieldAlert className="h-3 w-3" />
+        <span>8.5% Art. 28</span>
+      </span>
+    );
+  }
+  if (estatus === "no_deducible") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-bad/30 bg-bad/15 px-2 py-0.5 text-[10px] font-bold text-bad">
+        <ShieldAlert className="h-3 w-3" />
+        <span>0% No Deducible</span>
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full border border-line bg-panel-2 px-2 py-0.5 text-[10px] font-medium text-muted">
+      <span>Auto SAT</span>
+    </span>
+  );
+}
 
 export default function TicketsPage() {
   const router = useRouter();
@@ -31,7 +109,9 @@ export default function TicketsPage() {
   const [tickets, setTickets] = useState<TicketResponse[]>([]);
   const [loading, setLoading] = useState(true);
   const [filterState, setFilterState] = useState<string>("todos");
+  const [categoriaFilter, setCategoriaFilter] = useState<string>("todos");
   const [showUploadModal, setShowUploadModal] = useState(false);
+  const [uploadModalTab, setUploadModalTab] = useState<"foto" | "cfdi">("foto");
   const [selectedTicketForHandoff, setSelectedTicketForHandoff] =
     useState<TicketResponse | null>(null);
   const [selectedTicketDetail, setSelectedTicketDetail] =
@@ -43,7 +123,11 @@ export default function TicketsPage() {
     if (!tenantId) return;
     setLoading(true);
     try {
-      const resp = await getTickets(tenantId);
+      const resp = await getTickets(
+        tenantId,
+        filterState === "todos" ? undefined : filterState,
+        categoriaFilter === "todos" ? undefined : categoriaFilter
+      );
       setTickets(resp.items || []);
     } catch (err) {
       console.error("Error al cargar tickets:", err);
@@ -54,7 +138,7 @@ export default function TicketsPage() {
 
   useEffect(() => {
     loadTickets();
-  }, [tenantId]);
+  }, [tenantId, filterState, categoriaFilter]);
 
   // Sondeo en segundo plano (4s si hay tickets en proceso/espera, 15s si todo está estático)
   useEffect(() => {
@@ -155,14 +239,31 @@ export default function TicketsPage() {
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => setShowUploadModal(true)}
-          className="flex items-center gap-2 rounded-xl bg-brand px-4 py-2.5 text-xs font-bold text-on-brand shadow-sm transition-all hover:brightness-105 active:scale-95"
-        >
-          <Plus className="h-4 w-4 stroke-[2.5]" />
-          <span>Subir ticket</span>
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              setUploadModalTab("cfdi");
+              setShowUploadModal(true);
+            }}
+            className="flex items-center gap-1.5 rounded-xl border border-line-2 bg-panel px-3.5 py-2.5 text-xs font-semibold text-ink shadow-sm hover:bg-panel-2 active:scale-95 transition"
+          >
+            <FileCode className="h-4 w-4 text-blue-400" />
+            <span>Subir CFDI (XML)</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setUploadModalTab("foto");
+              setShowUploadModal(true);
+            }}
+            className="flex items-center gap-2 rounded-xl bg-brand px-4 py-2.5 text-xs font-bold text-on-brand shadow-sm transition-all hover:brightness-105 active:scale-95"
+          >
+            <Plus className="h-4 w-4 stroke-[2.5]" />
+            <span>Subir ticket</span>
+          </button>
+        </div>
       </div>
 
       {/* Grid de 4 Indicadores (KPIs) - docs/prototipo.html:299-304 */}
@@ -200,6 +301,7 @@ export default function TicketsPage() {
 
       {/* Tarjeta de Cola de Facturación con Filtros */}
       <div className="overflow-hidden rounded-2xl border border-line bg-panel shadow-prototipo">
+        {/* Filtros de Estado */}
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
           <h2 className="text-sm font-bold text-ink">Cola de facturación</h2>
 
@@ -251,14 +353,40 @@ export default function TicketsPage() {
           </div>
         </div>
 
+        {/* Barra de Categorías Fiscales Automáticas (División sin hacer nada) */}
+        <div className="flex items-center gap-1.5 overflow-x-auto border-b border-line bg-panel-2/30 px-4 py-2 text-xs">
+          <span className="text-[11px] font-semibold text-muted mr-1 hidden sm:inline shrink-0">Categoría:</span>
+          {CATEGORIAS.map((cat) => {
+            const Icon = cat.icon;
+            const isSelected = categoriaFilter === cat.id;
+            return (
+              <button
+                key={cat.id}
+                type="button"
+                onClick={() => setCategoriaFilter(cat.id)}
+                className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium whitespace-nowrap transition-all ${
+                  isSelected
+                    ? "bg-brand text-on-brand font-bold shadow-xs"
+                    : "bg-panel text-ink-2 hover:bg-line/20 border border-line-2/60"
+                }`}
+              >
+                <Icon className={`h-3.5 w-3.5 ${isSelected ? "text-on-brand" : "text-muted"}`} />
+                <span>{cat.label}</span>
+              </button>
+            );
+          })}
+        </div>
+
         {/* Tabla de Tickets */}
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">
             <thead>
               <tr className="border-b border-line bg-panel-2/50 text-[10px] font-semibold uppercase tracking-wider text-muted">
                 <th className="px-4 py-2.5">Comercio</th>
+                <th className="px-4 py-2.5">Categoría</th>
                 <th className="px-4 py-2.5">Folio</th>
                 <th className="px-4 py-2.5">Monto</th>
+                <th className="px-4 py-2.5">Deducibilidad SAT</th>
                 <th className="px-4 py-2.5">Estado</th>
                 <th className="px-4 py-2.5">Imagen</th>
                 <th className="px-4 py-2.5">Fecha</th>
@@ -268,6 +396,8 @@ export default function TicketsPage() {
             <tbody className="divide-y divide-line">
               {filteredTickets.map((t) => {
                 const imageEliminada = !t.image_key || t.estado === "facturado";
+                const catInfo = getCategoryInfo(t.categoria_gasto);
+                const CatIcon = catInfo.icon;
                 return (
                   <tr
                     key={t.id}
@@ -283,12 +413,32 @@ export default function TicketsPage() {
                       </span>
                     </td>
 
+                    <td className="px-4 py-3">
+                      <span className={`inline-flex items-center gap-1.5 rounded-lg border px-2 py-0.5 text-[11px] font-semibold ${catInfo.color}`}>
+                        <CatIcon className="h-3 w-3 shrink-0" />
+                        <span>{catInfo.label}</span>
+                      </span>
+                    </td>
+
                     <td className="mono px-4 py-3 text-xs text-ink">
                       {t.folio || "—"}
                     </td>
 
-                    <td className="mono px-4 py-3 text-xs font-bold text-ink">
-                      {formatCurrency(t.total)}
+                    <td className="mono px-4 py-3 text-xs">
+                      <div className="font-bold text-ink">{formatCurrency(t.total)}</div>
+                      {t.desglose_impuestos && (
+                        <div className="text-[10px] text-muted flex flex-wrap gap-1">
+                          {(t.desglose_impuestos.iva_16 ?? 0) > 0 && <span>IVA 16%</span>}
+                          {(t.desglose_impuestos.base_0 ?? 0) > 0 && <span>0%</span>}
+                          {((t.desglose_impuestos.ieps ?? 0) > 0 || (t.desglose_impuestos.ish_local ?? 0) > 0) && (
+                            <span>IEPS/ISH</span>
+                          )}
+                        </div>
+                      )}
+                    </td>
+
+                    <td className="px-4 py-3">
+                      {getDeducibilidadBadge(t.estatus_deducibilidad)}
                     </td>
 
                     <td className="px-4 py-3">
@@ -401,23 +551,37 @@ export default function TicketsPage() {
               {/* Estado Vacío */}
               {!loading && filteredTickets.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="py-12 text-center">
+                  <td colSpan={9} className="py-12 text-center">
                     <div className="mx-auto flex max-w-xs flex-col items-center gap-2 text-muted">
                       <Receipt className="h-8 w-8 stroke-[1.5] text-line-2" />
                       <b className="text-sm font-semibold text-ink">
                         No hay tickets registrados
                       </b>
                       <p className="text-xs">
-                        Presiona &ldquo;Subir ticket&rdquo; para fotografiar tu
-                        primer comprobante en la tienda.
+                        Presiona &ldquo;Subir ticket&rdquo; o &ldquo;Subir CFDI&rdquo; para procesar tu primer comprobante.
                       </p>
-                      <button
-                        type="button"
-                        onClick={() => setShowUploadModal(true)}
-                        className="mt-2 rounded-xl bg-brand px-4 py-2 text-xs font-bold text-on-brand shadow hover:brightness-105"
-                      >
-                        ＋ Subir mi primer ticket
-                      </button>
+                      <div className="mt-2 flex items-center justify-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setUploadModalTab("foto");
+                            setShowUploadModal(true);
+                          }}
+                          className="rounded-xl bg-brand px-3 py-1.5 text-xs font-bold text-on-brand shadow hover:brightness-105"
+                        >
+                          ＋ Subir ticket
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setUploadModalTab("cfdi");
+                            setShowUploadModal(true);
+                          }}
+                          className="rounded-xl border border-line-2 bg-panel px-3 py-1.5 text-xs font-semibold text-ink hover:bg-panel-2"
+                        >
+                          📄 Subir CFDI
+                        </button>
+                      </div>
                     </div>
                   </td>
                 </tr>
@@ -427,15 +591,15 @@ export default function TicketsPage() {
         </div>
       </div>
 
-      {/* MODAL: SUBIR TICKET CON CÁMARA */}
+      {/* MODAL: SUBIR TICKET O CFDI */}
       {showUploadModal && tenantId && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-md rounded-2xl border border-line bg-panel p-5 shadow-2xl">
+          <div className="w-full max-w-lg rounded-2xl border border-line bg-panel p-5 shadow-2xl">
             <div className="mb-4 flex items-start justify-between">
               <div>
-                <h3 className="text-base font-bold text-ink">Subir ticket</h3>
+                <h3 className="text-base font-bold text-ink">Ingresar comprobante fiscal</h3>
                 <p className="text-xs text-muted">
-                  Una foto legible basta. El agente hace el resto.
+                  Fotografía un ticket de compra o sube una factura CFDI XML directa
                 </p>
               </div>
               <button
@@ -447,13 +611,51 @@ export default function TicketsPage() {
               </button>
             </div>
 
-            <MobileCameraUpload
-              tenantId={tenantId}
-              onSuccess={() => {
-                loadTickets();
-              }}
-              onClose={() => setShowUploadModal(false)}
-            />
+            {/* Selector de Pestañas Foto vs CFDI */}
+            <div className="mb-5 flex rounded-xl border border-line-2 bg-panel-2 p-1 text-xs">
+              <button
+                type="button"
+                onClick={() => setUploadModalTab("foto")}
+                className={`flex flex-1 items-center justify-center gap-2 rounded-lg py-2 font-semibold transition ${
+                  uploadModalTab === "foto"
+                    ? "bg-panel text-ink shadow-sm"
+                    : "text-muted hover:text-ink"
+                }`}
+              >
+                <Camera className="h-3.5 w-3.5 text-brand" />
+                <span>Foto de Ticket (OCR + Facturación)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setUploadModalTab("cfdi")}
+                className={`flex flex-1 items-center justify-center gap-2 rounded-lg py-2 font-semibold transition ${
+                  uploadModalTab === "cfdi"
+                    ? "bg-panel text-ink shadow-sm"
+                    : "text-muted hover:text-ink"
+                }`}
+              >
+                <FileCode className="h-3.5 w-3.5 text-blue-400" />
+                <span>Subir CFDI (XML / PDF)</span>
+              </button>
+            </div>
+
+            {uploadModalTab === "foto" ? (
+              <MobileCameraUpload
+                tenantId={tenantId}
+                onSuccess={() => {
+                  loadTickets();
+                }}
+                onClose={() => setShowUploadModal(false)}
+              />
+            ) : (
+              <DirectCfdiUpload
+                tenantId={tenantId}
+                onSuccess={() => {
+                  loadTickets();
+                }}
+                onClose={() => setShowUploadModal(false)}
+              />
+            )}
           </div>
         </div>
       )}

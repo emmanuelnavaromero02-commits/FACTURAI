@@ -334,6 +334,11 @@ class Ticket(Base):
     pasos_agente: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     duracion_segundos: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 2), nullable=True)
 
+    # Inteligencia y Clasificación Fiscal SAT
+    categoria_gasto: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    desglose_impuestos: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+    estatus_deducibilidad: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

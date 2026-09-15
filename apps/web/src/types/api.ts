@@ -103,6 +103,21 @@ export interface TicketResponse {
   costo_total_usd?: string | null;
   pasos_agente?: number | null;
   duracion_segundos?: number | null;
+  categoria_gasto?: string | null;
+  desglose_impuestos?: {
+    base_16?: number;
+    iva_16?: number;
+    base_0?: number;
+    iva_0?: number;
+    base_exenta?: number;
+    ieps?: number;
+    ish?: number;
+    tua?: number;
+    retencion_iva?: number;
+    retencion_isr?: number;
+    fuente?: string;
+  } | null;
+  estatus_deducibilidad?: string | null;
   created_at: string;
 }
 

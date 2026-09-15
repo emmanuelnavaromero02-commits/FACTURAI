@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, File, Form, Header, Query, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, select
@@ -22,6 +22,7 @@ from ..errors import (
 )
 from ..models import FiscalProfile, Merchant, Ticket, TicketEstado, TicketEvent
 from ..services.cfdi_storage import get_cfdi_storage
+from ..services.fiscal_classifier import analyze_fiscal_classification, parse_cfdi_tax_breakdown
 from ..services.queue import enqueue_ticket_extraction, enqueue_ticket_facturacion
 from ..services.upload import process_and_stream_upload
 from ..state_machine import FINAL_STATES, transition
@@ -58,6 +59,9 @@ class TicketResponse(BaseModel):
     tokens_output_total: Optional[int] = None
     pasos_agente: Optional[int] = None
     duracion_segundos: Optional[Decimal] = None
+    categoria_gasto: Optional[str] = None
+    desglose_impuestos: Optional[Dict[str, Any]] = None
+    estatus_deducibilidad: Optional[str] = None
     created_at: str
 
     @classmethod
@@ -90,6 +94,9 @@ class TicketResponse(BaseModel):
             tokens_output_total=t.tokens_output_total,
             pasos_agente=t.pasos_agente,
             duracion_segundos=t.duracion_segundos,
+            categoria_gasto=t.categoria_gasto,
+            desglose_impuestos=t.desglose_impuestos,
+            estatus_deducibilidad=t.estatus_deducibilidad,
             created_at=t.created_at.isoformat(),
         )
 
@@ -156,22 +163,126 @@ async def upload_ticket(
     return TicketResponse.from_model(ticket)
 
 
+@router.post("/upload-cfdi", response_model=TicketResponse, status_code=status.HTTP_201_CREATED)
+async def upload_cfdi(
+    xml_file: UploadFile = File(...),
+    pdf_file: Optional[UploadFile] = File(None),
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Carga directa de un comprobante fiscal CFDI emitido (XML y opcionalmente PDF).
+    Extrae, analiza el desglose de impuestos (Tasa 16%, 0%, Exento, IEPS, ISH)
+    y evalúa la deducibilidad SAT al instante sin pasar por colas ni OCR.
+    """
+    from datetime import timedelta
+    import xml.etree.ElementTree as ET
+
+    xml_bytes = await xml_file.read()
+    pdf_bytes = await pdf_file.read() if pdf_file else None
+
+    # Parsear desglose y metadatos
+    cfdi_data = parse_cfdi_tax_breakdown(xml_bytes)
+
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception:
+        raise HTTPException(status_code=400, detail="El archivo proporcionado no es un XML de CFDI válido.")
+
+    emisor_elem = None
+    timbre_elem = None
+    folio_val = root.attrib.get("Folio")
+    serie_val = root.attrib.get("Serie")
+
+    for elem in root.iter():
+        tag = elem.tag.split("}")[-1]
+        if tag == "Emisor":
+            emisor_elem = elem
+        elif tag == "TimbreFiscalDigital":
+            timbre_elem = elem
+
+    rfc_emisor = emisor_elem.attrib.get("Rfc") if emisor_elem is not None else None
+    nombre_emisor = emisor_elem.attrib.get("Nombre") if emisor_elem is not None else None
+    cfdi_uuid = timbre_elem.attrib.get("UUID") if timbre_elem is not None else str(uuid.uuid4())
+
+    fiscal_res = analyze_fiscal_classification(
+        comercio=nombre_emisor,
+        rfc_emisor=rfc_emisor,
+        total=cfdi_data["total"],
+        subtotal=cfdi_data["subtotal"],
+        iva=cfdi_data["iva_16"],
+        xml_bytes=xml_bytes,
+    )
+
+    ticket_id = uuid.uuid4()
+    now_dt = datetime.now(timezone.utc)
+
+    # Guardar en almacenamiento cifrado de CFDI
+    cfdi_storage = get_cfdi_storage()
+    await cfdi_storage.save_cfdi_bundle(
+        tenant_id=ctx.tenant_id,
+        ticket_id=ticket_id,
+        cfdi_uuid=cfdi_uuid,
+        pdf_bytes=pdf_bytes,
+        xml_bytes=xml_bytes,
+        ttl_seconds=1800,
+    )
+
+    full_folio = f"{serie_val} {folio_val}".strip() if (serie_val and folio_val) else (folio_val or serie_val)
+
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        ticket = Ticket(
+            id=ticket_id,
+            tenant_id=ctx.tenant_id,
+            created_by=ctx.user.id,
+            estado=TicketEstado.FACTURADO,
+            folio=full_folio,
+            rfc_emisor=rfc_emisor,
+            sucursal=nombre_emisor,
+            total=cfdi_data["total"],
+            subtotal=cfdi_data["subtotal"],
+            iva=cfdi_data["iva_16"],
+            cfdi_uuid=cfdi_uuid,
+            cfdi_disponible_hasta=now_dt + timedelta(minutes=30),
+            categoria_gasto=fiscal_res["categoria"],
+            desglose_impuestos=fiscal_res["desglose_impuestos"],
+            estatus_deducibilidad=fiscal_res["estatus_deducibilidad"],
+            facturado_at=now_dt,
+        )
+        session.add(ticket)
+        await session.flush()
+
+        event = TicketEvent(
+            tenant_id=ctx.tenant_id,
+            ticket_id=ticket_id,
+            tipo="cfdi_cargado_directamente",
+            mensaje=f"CFDI recibido y clasificado como '{fiscal_res['categoria']}'. Deducibilidad: {fiscal_res['estatus_deducibilidad']}.",
+            meta={"cfdi_uuid": cfdi_uuid, "categoria": fiscal_res["categoria"]},
+        )
+        session.add(event)
+        await session.commit()
+
+    return TicketResponse.from_model(ticket)
+
+
 @router.get("", response_model=PaginatedTicketsResponse)
 async def list_tickets(
     estado: Optional[TicketEstado] = None,
+    categoria: Optional[str] = None,
     merchant_id: Optional[uuid.UUID] = None,
     cursor: Optional[datetime] = None,
     limit: int = Query(20, ge=1, le=100),
     ctx: TenantContext = Depends(get_tenant_context),
 ):
     """
-    Lista tickets con filtros por estado y comercio, y paginación por cursor.
+    Lista tickets con filtros por estado, categoría fiscal y comercio, y paginación por cursor.
     """
     async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
         query = select(Ticket).where(Ticket.tenant_id == ctx.tenant_id)
 
         if estado:
             query = query.where(Ticket.estado == estado)
+        if categoria:
+            query = query.where(Ticket.categoria_gasto == categoria)
         if merchant_id:
             query = query.where(Ticket.merchant_id == merchant_id)
         if cursor:

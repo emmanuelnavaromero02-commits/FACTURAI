@@ -141,10 +141,14 @@ export async function createTenant(nombre: string, slug?: string): Promise<Tenan
 
 export async function getTickets(
   tenantId: string,
-  estado?: string
+  estado?: string,
+  categoria?: string
 ): Promise<PaginatedTicketsResponse> {
-  const query = estado ? `?estado=${encodeURIComponent(estado)}` : "";
-  return fetchWithAuth<PaginatedTicketsResponse>(`/v1/tickets${query}`, {}, tenantId);
+  const params = new URLSearchParams();
+  if (estado) params.set("estado", estado);
+  if (categoria && categoria !== "todos") params.set("categoria", categoria);
+  const qStr = params.toString() ? `?${params.toString()}` : "";
+  return fetchWithAuth<PaginatedTicketsResponse>(`/v1/tickets${qStr}`, {}, tenantId);
 }
 
 export async function getTicket(tenantId: string, ticketId: string): Promise<TicketResponse> {
@@ -164,6 +168,27 @@ export async function uploadTicket(
 
   return fetchWithAuth<TicketResponse>(
     "/v1/tickets",
+    {
+      method: "POST",
+      body: formData,
+    },
+    tenantId
+  );
+}
+
+export async function uploadCfdiDirect(
+  tenantId: string,
+  xmlFile: File,
+  pdfFile?: File
+): Promise<TicketResponse> {
+  const formData = new FormData();
+  formData.append("xml_file", xmlFile);
+  if (pdfFile) {
+    formData.append("pdf_file", pdfFile);
+  }
+
+  return fetchWithAuth<TicketResponse>(
+    "/v1/tickets/upload-cfdi",
     {
       method: "POST",
       body: formData,

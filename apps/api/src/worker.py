@@ -21,6 +21,7 @@ from .models import (
 )
 from .security import decrypt_credentials
 from .services.cfdi_storage import get_cfdi_storage
+from .services.fiscal_classifier import analyze_fiscal_classification
 from .state_machine import transition
 from .storage import get_storage_service
 from .vision.extractor import enhance_receipt_image, extract_qr_code, get_vision_extractor
@@ -290,6 +291,21 @@ async def process_ticket_extraction(
         ticket.confianza = Decimal(str(round(extracted.confianza, 2)))
         ticket.extracted = extracted.model_dump()
         ticket.url_facturacion = billing_url
+
+        # Clasificación fiscal automática y desglose preliminar
+        try:
+            fiscal_res = analyze_fiscal_classification(
+                comercio=extracted.comercio or extracted.sucursal,
+                rfc_emisor=extracted.rfc_emisor,
+                total=total_norm,
+                subtotal=subtotal_norm,
+                iva=iva_norm,
+            )
+            ticket.categoria_gasto = fiscal_res["categoria"]
+            ticket.desglose_impuestos = fiscal_res["desglose_impuestos"]
+            ticket.estatus_deducibilidad = fiscal_res["estatus_deducibilidad"]
+        except Exception as f_err:
+            logger.debug("No se pudo clasificar fiscalmente el ticket en extracción: %s", f_err)
 
         auto_enqueue = False
         if matched_merchant is not None or billing_url:
@@ -706,6 +722,24 @@ async def process_ticket_facturacion(
                             ttl_seconds=1800,  # 30 minutos
                         )
                         t.cfdi_disponible_hasta = datetime.now(timezone.utc) + timedelta(minutes=30)
+
+                        # Consolidar clasificación fiscal y desglose exacto de impuestos con el XML timbrado
+                        if result.xml:
+                            try:
+                                cfdi_fiscal = analyze_fiscal_classification(
+                                    comercio=t.sucursal,
+                                    rfc_emisor=t.rfc_emisor,
+                                    total=t.total,
+                                    subtotal=t.subtotal,
+                                    iva=t.iva,
+                                    xml_bytes=result.xml,
+                                )
+                                t.categoria_gasto = cfdi_fiscal["categoria"]
+                                t.desglose_impuestos = cfdi_fiscal["desglose_impuestos"]
+                                t.estatus_deducibilidad = cfdi_fiscal["estatus_deducibilidad"]
+                            except Exception as c_err:
+                                logger.debug("Error actualizando clasificación con XML: %s", c_err)
+
                         event_descarga = TicketEvent(
                             tenant_id=tenant_id,
                             ticket_id=ticket_id,
