@@ -319,22 +319,26 @@ async def retry_ticket(
         if not ticket:
             raise RecursoNoEncontradoException("El ticket no fue encontrado.")
 
-        if ticket.estado != TicketEstado.RECHAZADO:
+        if ticket.estado not in (TicketEstado.RECHAZADO, TicketEstado.ESPERA_HUMANO):
             raise ReintentoInvalidoException(
-                f"Solo se pueden reintentar tickets en estado 'rechazado'. Estado actual: '{ticket.estado.value}'."
+                f"Solo se pueden reintentar tickets en estado 'rechazado' o 'espera_humano'. Estado actual: '{ticket.estado.value}'."
             )
 
         es_error_datos = ticket.error_code in ("perfil_incompleto", "datos_no_coinciden")
-        if not es_error_datos and ticket.intentos >= 3:
+        if ticket.estado == TicketEstado.RECHAZADO and not es_error_datos and ticket.intentos >= 3:
             raise MaximoIntentosExcedidoException(
                 f"El ticket ha alcanzado el límite máximo de 3 intentos (intentos actuales: {ticket.intentos})."
             )
+
+        intento_previo = ticket.intentos
+        if ticket.estado == TicketEstado.ESPERA_HUMANO:
+            ticket.intentos = 0
 
         await transition(
             session,
             ticket,
             TicketEstado.ENCOLADO,
-            f"Reintento manual solicitado por usuario (intento previo {ticket.intentos}/3).",
+            f"Reintento manual solicitado por usuario (intento previo {intento_previo}/3).",
             tipo="reintento",
         )
         ticket.error_code = None

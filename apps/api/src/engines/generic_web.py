@@ -34,6 +34,7 @@ from .stealth_utils import (
     DEFAULT_STEALTH_EXTRA_HEADERS,
 )
 from ..services.portal_searcher import search_candidate_portal_urls, verify_portal_matches_ticket
+from ..vision.url_sanitizer import sanitize_and_classify_billing_url
 
 logger = logging.getLogger(__name__)
 
@@ -63,14 +64,17 @@ class GenericWebEngine(FacturacionEngine):
         merchant_url = None
         if ctx.merchant and ctx.merchant.config and isinstance(ctx.merchant.config, dict):
             merchant_url = ctx.merchant.config.get("url_facturacion")
-        url = merchant_url or ticket.url_facturacion
-        if not url:
+        raw_url = merchant_url or ticket.url_facturacion
+        if not raw_url:
             return EngineResult(
                 ok=False,
                 error_code="sin_url_facturacion",
                 mensaje="El ticket no cuenta con una URL de facturación válida.",
                 reintentable=False,
             )
+        url = sanitize_and_classify_billing_url(raw_url) or raw_url
+        if hasattr(ticket, "url_facturacion") and ticket.url_facturacion != url:
+            ticket.url_facturacion = url
 
         # 1. Configuración de precios y advertencia si no están definidos
         model_name = settings.ANTHROPIC_MODEL_AGENTE
@@ -207,13 +211,22 @@ class GenericWebEngine(FacturacionEngine):
                 # Navegar al portal inicial con tolerancia a CDNs lentos o páginas pesadas
                 portal_valido = False
                 try:
-                    try:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=12000)
-                        await page.wait_for_timeout(1000)
-                    except Exception:
-                        # Fallback con 'commit' para portales pesados o con CDNs externos que no disparan domcontentloaded a tiempo
-                        await page.goto(url, wait_until="commit", timeout=15000)
-                        await page.wait_for_timeout(3000)
+                    is_alsea_portal = "alsea.interfactura.com" in url.lower() or "alsea.com.mx" in url.lower()
+                    if is_alsea_portal:
+                        # Alsea SPA requiere commit y esperar a que Angular retire el loader .app-loading
+                        await page.goto(url, wait_until="commit", timeout=20000)
+                        try:
+                            await page.wait_for_selector(".app-loading", state="detached", timeout=25000)
+                        except Exception:
+                            await page.wait_for_timeout(4000)
+                    else:
+                        try:
+                            await page.goto(url, wait_until="domcontentloaded", timeout=12000)
+                            await page.wait_for_timeout(1000)
+                        except Exception:
+                            # Fallback con 'commit' para portales pesados o con CDNs externos que no disparan domcontentloaded a tiempo
+                            await page.goto(url, wait_until="commit", timeout=15000)
+                            await page.wait_for_timeout(3000)
 
                     # Si el portal ya disparó un diálogo de error terminal (ej. alert("El ticket ya se encuentra facturado."))
                     if detected_terminal_error:
@@ -246,13 +259,18 @@ class GenericWebEngine(FacturacionEngine):
                             ("cheesecake", "img[src*='logo_cheesecake']"),
                         ]
                         for brand_key, brand_sel in brand_selectors:
-                            if brand_key in comercio_str:
+                            if brand_key in comercio_str or (brand_key == "domino" and ticket.rfc_emisor == "OPP010927SA5"):
                                 brand_loc = page.locator(brand_sel).first
-                                if await brand_loc.count() > 0 and await brand_loc.is_visible():
-                                    logger.info("Portal Alsea detectado: seleccionando marca %s (%s)...", brand_key, brand_sel)
-                                    await brand_loc.click(timeout=6000)
-                                    await page.wait_for_timeout(3000)
-                                    break
+                                try:
+                                    if await brand_loc.count() > 0:
+                                        logger.info("Portal Alsea detectado: seleccionando marca %s (%s)...", brand_key, brand_sel)
+                                        await brand_loc.click(timeout=6000)
+                                        # Esperar a que los inputs específicos de la marca aparezcan
+                                        await page.locator("input#ticket, input#rfc, input#tienda").first.wait_for(state="visible", timeout=8000)
+                                        await page.wait_for_timeout(1000)
+                                        break
+                                except Exception as brand_err:
+                                    logger.warning("No se pudo autoseleccionar marca %s en Alsea: %s", brand_key, brand_err)
                         portal_valido = True
                     elif is_local_test:
                         portal_valido = True
@@ -392,7 +410,14 @@ class GenericWebEngine(FacturacionEngine):
                         )
 
                     # Captura de pantalla ligera (JPEG quality 75, ventana deslizante)
-                    screenshot_bytes = await current_page.screenshot(type="jpeg", quality=75)
+                    try:
+                        screenshot_bytes = await current_page.screenshot(
+                            type="jpeg", quality=75, timeout=7000, animations="disabled"
+                        )
+                    except Exception:
+                        screenshot_bytes = await current_page.screenshot(
+                            type="jpeg", quality=60, timeout=5000
+                        )
                     screenshot_b64 = base64.b64encode(screenshot_bytes).decode("ascii")
 
                     # Consultar al cerebro del agente
@@ -728,7 +753,12 @@ class GenericWebEngine(FacturacionEngine):
         NUNCA como binario dentro de ticket_events).
         """
         try:
-            shot_bytes = await page.screenshot(type="jpeg", quality=70)
+            try:
+                shot_bytes = await page.screenshot(
+                    type="jpeg", quality=70, timeout=7000, animations="disabled"
+                )
+            except Exception:
+                shot_bytes = await page.screenshot(type="jpeg", quality=60, timeout=5000)
             key = f"debug/{ctx.ticket.tenant_id}/{ctx.ticket.id}.jpg"
             await storage.upload_bytes(
                 key=key,

@@ -280,6 +280,16 @@ def generate_ticket_candidate_variants(ticket: Ticket, perfil: FiscalProfile) ->
             add_fecha(d.strftime("%d-%m-%Y"))
             add_fecha(d.strftime("%d%m%Y"))
             add_fecha(d.strftime("%Y/%m/%d"))
+    else:
+        # Fallback con fecha de creación del ticket o fecha actual para portales con fecha obligatoria
+        ref_date = getattr(ticket, "created_at", None)
+        if ref_date and hasattr(ref_date, "date"):
+            d = ref_date.date()
+        else:
+            d = date.today()
+        add_fecha(d.strftime("%d/%m/%Y"))
+        add_fecha(d.strftime("%Y-%m-%d"))
+        add_fecha(d.strftime("%d-%m-%Y"))
 
     # 4. Candidatos de Razón Social
     razones_sociales: List[str] = []
@@ -314,6 +324,16 @@ def generate_ticket_candidate_variants(ticket: Ticket, perfil: FiscalProfile) ->
     # 6. Variantes de Dirección Fiscal
     direccion_candidatos = generate_fiscal_address_variants(perfil)
 
+    # 7. Candidatos de Tienda / Sucursal Numérica (ej. Alsea / Domino's / Walmart)
+    tienda_candidatos: List[str] = []
+    if ticket.sucursal:
+        m = re.search(r"(?:tienda|sucursal|tienda\s*no\.?)\s*[:#\-]?\s*(\d+)", ticket.sucursal, re.IGNORECASE)
+        if m and m.group(1) not in tienda_candidatos:
+            tienda_candidatos.append(m.group(1))
+        for num in re.findall(r"\b\d{4,6}\b", ticket.sucursal):
+            if num not in tienda_candidatos:
+                tienda_candidatos.append(num)
+
     return {
         "folios": folios_candidatos,
         "totales": totales_candidatos,
@@ -322,6 +342,8 @@ def generate_ticket_candidate_variants(ticket: Ticket, perfil: FiscalProfile) ->
         "usos_cfdi": usos_cfdi,
         "direccion": direccion_candidatos,
         "sucursal": ticket.sucursal,
+        "tienda": tienda_candidatos[0] if tienda_candidatos else None,
+        "tiendas": tienda_candidatos,
         "caja": ticket.caja,
         "hora": ticket.hora_ticket.strftime("%H:%M") if ticket.hora_ticket else None,
     }

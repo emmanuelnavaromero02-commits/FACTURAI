@@ -641,6 +641,30 @@ async def test_8_retry_and_delete_endpoints(setup_phase4_scenario: Dict[str, Any
         assert body_c["estado"] == "encolado"
         assert body_c["error_code"] is None
 
+        # Caso C2: Reintentar un ticket en ESPERA_HUMANO (éxito 202 y reseteo de intentos a 0)
+        t_espera_id = uuid.uuid4()
+        async with tenant_session(t_id) as session:
+            session.add(
+                Ticket(
+                    id=t_espera_id,
+                    tenant_id=t_id,
+                    created_by=u_id,
+                    estado=TicketEstado.ESPERA_HUMANO,
+                    intentos=3,
+                    error_code="agente_atorado",
+                )
+            )
+            await session.flush()
+
+        res_c2 = await client.post(
+            f"/v1/tickets/{t_espera_id}/retry",
+            headers={"X-Tenant-Id": str(t_id)},
+        )
+        assert res_c2.status_code == 202
+        body_c2 = res_c2.json()
+        assert body_c2["estado"] == "encolado"
+        assert body_c2["intentos"] == 0
+
         # Caso D: DELETE /v1/tickets/{id}
         res_d = await client.delete(
             f"/v1/tickets/{t_ok_id}",
