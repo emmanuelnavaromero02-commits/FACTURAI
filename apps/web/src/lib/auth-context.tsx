@@ -51,7 +51,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // Seguro de vida: garantiza que el spinner nunca quede congelado indefinidamente
     const safetyTimer = setTimeout(() => {
       setLoading(false);
-    }, 3000);
+    }, 1200);
     return () => clearTimeout(safetyTimer);
   }, []);
 
