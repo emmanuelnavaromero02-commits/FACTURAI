@@ -321,13 +321,19 @@ async def process_ticket_extraction(
             auto_enqueue = fp_check.scalar_one_or_none() is not None
 
         # Si no se identificó comercio del catálogo ni URL explícita en el ticket,
-        # deducir autónomamente el portal oficial del comercio en internet
-        if matched_merchant is None and not billing_url:
+        # o si la URL es un hub genérico / ticket de gasolinera que requiere estación específica:
+        is_hub = bool(billing_url and any(hub in billing_url.lower() for hub in ("g500network.com", "efectifactura.com")))
+        is_gas = False
+        if extracted and extracted.otros:
+            is_gas = any(any(w in str(getattr(x, "etiqueta", "") if hasattr(x, "etiqueta") else x.get("etiqueta", "")).lower() for w in ("cre", "estacion", "dispensario", "combustible")) for x in extracted.otros)
+
+        if matched_merchant is None and (not billing_url or is_hub or is_gas):
             from .services.portal_searcher import deduce_portal_for_ticket
             deduced_portal = await deduce_portal_for_ticket(
                 comercio=extracted.comercio or extracted.sucursal,
                 rfc_emisor=extracted.rfc_emisor,
                 sucursal=extracted.sucursal,
+                current_url=billing_url,
                 extracted_data=extracted.model_dump(),
             )
             if deduced_portal:
@@ -588,24 +594,30 @@ async def process_ticket_facturacion(
                     await transition(session, t, TicketEstado.RECHAZADO, "Comercio no encontrado en el catálogo.")
                 return
         else:
-            if not url_facturacion:
-                # Intentar deducir portal en internet de forma autónoma antes de cualquier decisión
+            is_hub = bool(url_facturacion and any(hub in url_facturacion.lower() for hub in ("g500network.com", "efectifactura.com")))
+            is_gas = False
+            if extracted_data and extracted_data.get("otros"):
+                is_gas = any(any(w in str(x.get("etiqueta", "")).lower() for w in ("cre", "estacion", "dispensario", "combustible")) for x in extracted_data["otros"])
+
+            if not url_facturacion or is_hub or is_gas:
+                # Intentar deducir o refinar portal en internet de forma autónoma antes de cualquier decisión
                 from .services.portal_searcher import deduce_portal_for_ticket
                 deduced_portal = await deduce_portal_for_ticket(
                     comercio=extracted_data.get("comercio") if extracted_data else None,
                     rfc_emisor=rfc_emisor or (extracted_data.get("rfc_emisor") if extracted_data else None),
                     sucursal=sucursal,
+                    current_url=url_facturacion,
                     extracted_data=extracted_data,
                 )
-                if deduced_portal:
+                if deduced_portal and deduced_portal != url_facturacion:
                     url_facturacion = deduced_portal
                     async with tenant_session(tenant_id) as session:
                         t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
                         t = t_res.scalar_one()
                         t.url_facturacion = deduced_portal
                         await session.commit()
-                    logger.info("Portal deducido en facturación para ticket %s: %s", ticket_id, deduced_portal)
-                else:
+                    logger.info("Portal refinado/deducido en facturación para ticket %s: %s", ticket_id, deduced_portal)
+                elif not url_facturacion:
                     # NUNCA RECHAZAR NI BORRAR IMAGEN: pasar a ESPERA_HUMANO
                     async with tenant_session(tenant_id) as session:
                         t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
@@ -895,6 +907,32 @@ async def process_ticket_facturacion(
                 return
 
             backoffs = [30, 300, 1800]
+            if result.error_code in ("agente_error", "portal_invalido"):
+                from .services.portal_searcher import search_candidate_portal_urls
+                candidates = await search_candidate_portal_urls(
+                    comercio=extracted_data.get("comercio") if extracted_data else None,
+                    rfc_emisor=rfc_emisor or (extracted_data.get("rfc_emisor") if extracted_data else None),
+                    sucursal=sucursal,
+                    extracted_data=extracted_data,
+                )
+                alt_cands = [c for c in candidates if c != url_facturacion]
+                if alt_cands:
+                    next_url = alt_cands[0]
+                    async with tenant_session(tenant_id) as session:
+                        t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                        t = t_res.scalar_one()
+                        t.url_facturacion = next_url
+                        await transition(
+                            session,
+                            t,
+                            TicketEstado.ENCOLADO,
+                            f"Fallo en portal actual ({result.error_code}). Reintentando de forma autónoma con portal alternativo: {next_url}",
+                            meta={"url_anterior": url_facturacion, "url_nueva": next_url, "intento": t.intentos},
+                        )
+                    from .services.queue import enqueue_ticket_facturacion
+                    await enqueue_ticket_facturacion(tenant_id, ticket_id, defer_seconds=5)
+                    return
+
             if result.reintentable and (intentos < 3 or result.error_code == "handoff_tope_concurrencia"):
                 backoff = 10 if result.error_code == "handoff_tope_concurrencia" else backoffs[min(intentos - 1, len(backoffs) - 1)]
                 async with tenant_session(tenant_id) as session:
@@ -919,6 +957,27 @@ async def process_ticket_facturacion(
                 from .services.queue import enqueue_ticket_facturacion
                 await enqueue_ticket_facturacion(tenant_id, ticket_id, defer_seconds=backoff)
             else:
+                if result.error_code in ("agente_error", "portal_invalido", "sin_url_facturacion", "portal_requerido"):
+                    async with tenant_session(tenant_id) as session:
+                        t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                        t = t_res.scalar_one()
+                        t.error_code = result.error_code
+                        t.error_msg = result.mensaje
+                        t.costo_total_usd = result.costo_usd
+                        t.tokens_input_total = result.tokens_input
+                        t.tokens_output_total = result.tokens_output
+                        t.pasos_agente = result.pasos
+                        t.duracion_segundos = result.duracion_segundos
+                        # NUNCA borrar imagen para que el usuario pueda aportar el link o verificar
+                        await transition(
+                            session,
+                            t,
+                            TicketEstado.ESPERA_HUMANO,
+                            f"El portal de facturación no permitió completar el proceso automáticamente ({result.mensaje or result.error_code}). Comprobante preservado en espera de link o asistencia.",
+                            meta={"error_code": result.error_code, "intentos": intentos},
+                        )
+                    return
+
                 async with tenant_session(tenant_id) as session:
                     t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
                     t = t_res.scalar_one()

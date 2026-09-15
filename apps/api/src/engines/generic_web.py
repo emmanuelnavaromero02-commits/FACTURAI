@@ -71,6 +71,21 @@ class GenericWebEngine(FacturacionEngine):
         if merchant_config:
             merchant_url = merchant_config.get("url_facturacion")
         raw_url = merchant_url or ticket.url_facturacion
+
+        # Si la URL es un hub genérico de red o ticket de gasolinera, refinar al portal exacto de la estación
+        is_hub = bool(raw_url and any(h in raw_url.lower() for h in ("g500network.com", "efectifactura.com")))
+        if is_hub or (ticket.extracted and any(any(w in str(x.get("etiqueta", "")).lower() for w in ("cre", "estacion", "dispensario", "combustible")) for x in ticket.extracted.get("otros", []))):
+            from ..services.portal_searcher import deduce_portal_for_ticket
+            refined_url = await deduce_portal_for_ticket(
+                comercio=ticket.extracted.get("comercio") if ticket.extracted else None,
+                rfc_emisor=ticket.rfc_emisor,
+                sucursal=ticket.sucursal,
+                current_url=raw_url,
+                extracted_data=ticket.extracted,
+            )
+            if refined_url:
+                raw_url = refined_url
+
         if not raw_url:
             return EngineResult(
                 ok=False,
@@ -316,6 +331,7 @@ class GenericWebEngine(FacturacionEngine):
                         rfc_emisor=ticket.rfc_emisor,
                         sucursal=ticket.sucursal,
                         current_url=url,
+                        extracted_data=ticket.extracted,
                     )
                     for cand_url in candidatos:
                         if cand_url == url:

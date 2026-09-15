@@ -48,6 +48,202 @@ def clean_search_term(text: Optional[str]) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+def extract_gas_station_identifiers(
+    comercio: Optional[str] = None,
+    sucursal: Optional[str] = None,
+    extracted_data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Extrae identificadores específicos de estaciones de servicio de combustible:
+    - Permiso CRE (ej. PL/1434/EXP/ES/2015 o PL/1434)
+    - Número de estación (ej. E04959, 04959, 4959)
+    - Detección booleana de si es un comprobante de gasolina/combustible.
+    """
+    ext = extracted_data or {}
+    permiso_cre = None
+    cre_short = None
+    num_estacion = None
+    estacion_digits = None
+    is_gas_station = False
+
+    # 1. Buscar en campos secundarios ('otros')
+    otros = ext.get("otros") or []
+    for item in otros:
+        k = ""
+        v = ""
+        if isinstance(item, dict):
+            k = str(item.get("etiqueta", "")).lower()
+            v = str(item.get("valor", "")).strip()
+        elif hasattr(item, "etiqueta") and hasattr(item, "valor"):
+            k = str(getattr(item, "etiqueta", "")).lower()
+            v = str(getattr(item, "valor", "")).strip()
+
+        if any(w in k for w in ("cre", "permiso", "comision reguladora")):
+            permiso_cre = v
+        elif any(w in k for w in ("estacion", "estación", "est.", "no. e.", "no e", "clave pemex")):
+            num_estacion = v
+        elif any(w in k for w in ("producto", "combustible", "gasolina", "litro", "lts", "magna", "premium", "diesel")):
+            is_gas_station = True
+
+    # 2. Buscar en comercio, sucursal y texto general mediante regex si faltó
+    full_text = f"{comercio or ''} {sucursal or ''} {ext.get('comercio', '')} {ext.get('sucursal', '')}"
+    if not permiso_cre:
+        m_cre = re.search(r"\b(PL/\d+(?:/EXP/ES(?:/\d{4})?)?)\b", full_text, re.IGNORECASE)
+        if m_cre:
+            permiso_cre = m_cre.group(1).upper()
+
+    if not num_estacion:
+        m_est = re.search(r"\b([Ee]\s*0*(\d{4,5}))\b", full_text)
+        if m_est:
+            num_estacion = m_est.group(1).replace(" ", "").upper()
+
+    # 3. Normalizar formato CRE y dígitos de estación
+    if permiso_cre:
+        permiso_cre = permiso_cre.upper()
+        is_gas_station = True
+        m_short = re.search(r"(PL/\d+)", permiso_cre)
+        if m_short:
+            cre_short = m_short.group(1)
+
+    if num_estacion:
+        num_estacion = num_estacion.upper()
+        is_gas_station = True
+        m_digits = re.search(r"(\d{4,5})", num_estacion)
+        if m_digits:
+            estacion_digits = m_digits.group(1)
+
+    text_lower = full_text.lower()
+    if any(k in text_lower for k in ("gasolin", "combustible", "servicio", "estacion", "g500", "pemex", "oxxogas", "oxxo gas", "hidrosina", "petro-7", "petro 7")):
+        is_gas_station = True
+
+    return {
+        "permiso_cre": permiso_cre,
+        "cre_short": cre_short,
+        "num_estacion": num_estacion,
+        "estacion_digits": estacion_digits,
+        "is_gas_station": is_gas_station,
+    }
+
+
+async def resolve_g500_station_portal(
+    permiso_cre: Optional[str] = None,
+    cre_short: Optional[str] = None,
+    num_estacion: Optional[str] = None,
+    estacion_digits: Optional[str] = None,
+    sucursal: Optional[str] = None,
+    comercio: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Consulta el resolvedor oficial central de estaciones de la red G500:
+    POST https://g500network.com/wp-admin/admin-ajax.php
+    con action=get_stations&term={...}&opt={1|2}
+    Retorna la URL directa del portal de la estación (ej. facturagas Azure o Efectifactura específico).
+    """
+    terms_to_try = []
+    if cre_short:
+        terms_to_try.append((cre_short, "1"))
+    if permiso_cre and permiso_cre != cre_short:
+        terms_to_try.append((permiso_cre, "1"))
+    if estacion_digits:
+        terms_to_try.append((estacion_digits, "1"))
+        terms_to_try.append((estacion_digits, "2"))
+    if num_estacion and num_estacion != estacion_digits:
+        terms_to_try.append((num_estacion, "1"))
+        terms_to_try.append((num_estacion, "2"))
+
+    clean_suc = clean_search_term(sucursal)
+    if clean_suc and len(clean_suc) >= 3:
+        terms_to_try.append((clean_suc, "2"))
+
+    endpoint = "https://g500network.com/wp-admin/admin-ajax.php"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    }
+
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+        for term, opt in terms_to_try:
+            try:
+                resp = await client.post(
+                    endpoint,
+                    data={"action": "get_stations", "term": term, "opt": opt},
+                    headers=headers,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        for item in data:
+                            bill_url = item.get("bill")
+                            if bill_url and bill_url.strip():
+                                sanitized = sanitize_and_classify_billing_url(bill_url.strip())
+                                if sanitized:
+                                    logger.info(
+                                        "Estación G500 resuelta con éxito (term=%s, opt=%s): %s -> %s",
+                                        term,
+                                        opt,
+                                        item.get("esn"),
+                                        sanitized,
+                                    )
+                                    return sanitized
+            except Exception as exc:
+                logger.debug("Error consultando endpoint G500 con term=%s: %s", term, exc)
+
+    return None
+
+
+async def resolve_gas_station_portal(
+    comercio: Optional[str] = None,
+    rfc_emisor: Optional[str] = None,
+    sucursal: Optional[str] = None,
+    current_url: Optional[str] = None,
+    extracted_data: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """
+    Resuelve el portal oficial de facturación para estaciones de servicio de gasolina.
+    Identifica redes (G500, OXXO Gas, Hidrosina, Pemex, Petro-7, etc.) y consulta
+    sus APIs de catálogo de estaciones o enrutadores directos.
+    """
+    ident = extract_gas_station_identifiers(comercio, sucursal, extracted_data)
+    text_combined = f"{comercio or ''} {sucursal or ''} {current_url or ''} {rfc_emisor or ''}".lower()
+
+    # Red G500
+    is_g500 = any(k in text_combined for k in ("g500", "g-500", "g 500", "servicio fento", "fento")) or (
+        current_url and "g500" in current_url.lower()
+    )
+    if is_g500 or (ident["is_gas_station"] and (ident["permiso_cre"] or ident["estacion_digits"])):
+        g500_portal = await resolve_g500_station_portal(
+            permiso_cre=ident["permiso_cre"],
+            cre_short=ident["cre_short"],
+            num_estacion=ident["num_estacion"],
+            estacion_digits=ident["estacion_digits"],
+            sucursal=sucursal,
+            comercio=comercio,
+        )
+        if g500_portal:
+            return g500_portal
+
+    # OXXO Gas
+    if any(k in text_combined for k in ("oxxogas", "oxxo gas")):
+        return "https://facturacion.oxxogas.com"
+
+    # Hidrosina
+    if "hidrosina" in text_combined:
+        return "https://facturacion.hidrosina.com.mx"
+
+    # Petro-7
+    if any(k in text_combined for k in ("petro-7", "petro 7", "petroseven")):
+        return "https://facturacion.petro-7.com.mx"
+
+    # Pemex
+    if any(k in text_combined for k in ("pemex", "franquicia pemex")):
+        return "https://facturacion.pemex.com"
+
+    return None
+
+
 # Catálogo extendido de cadenas comerciales, franquicias, gasolineras, farmacias y casetas en México
 KNOWN_CHAINS_MAP = [
     # Alsea (Domino's, Starbucks, Burger King, Vips, Italianni's, Chili's, P.F. Chang's, Cheesecake Factory, El Portón)
@@ -454,11 +650,13 @@ async def search_candidate_portal_urls(
     rfc_emisor: Optional[str] = None,
     sucursal: Optional[str] = None,
     current_url: Optional[str] = None,
+    extracted_data: Optional[Dict[str, Any]] = None,
     include_synthetic: bool = False,
 ) -> List[str]:
     """
     Busca en internet candidatos de URLs de portales de facturación para el comercio/RFC.
     Combina:
+    0. Resolvedor inteligente de estaciones de gasolina (G500, Oxxo Gas, Hidrosina, Pemex, etc.).
     1. Catálogo exhaustivo de marcas y cadenas mexicanas.
     2. Coincidencia estricta por RFC emisor.
     3. Variantes de dominio institucional.
@@ -468,7 +666,7 @@ async def search_candidate_portal_urls(
     candidates: List[str] = []
     seen = set()
 
-    def add_cand(u: Optional[str]):
+    def add_cand(u: Optional[str], prepend: bool = False):
         if not u:
             return
         sanitized = sanitize_and_classify_billing_url(u)
@@ -480,10 +678,24 @@ async def search_candidate_portal_urls(
             if any(exc in domain for exc in EXCLUDED_DOMAINS):
                 return
             if sanitized not in seen:
-                candidates.append(sanitized)
+                if prepend:
+                    candidates.insert(0, sanitized)
+                else:
+                    candidates.append(sanitized)
                 seen.add(sanitized)
         except Exception:
             pass
+
+    # 0. Resolución especializada de estaciones de gasolina y franquicias con identificadores
+    gas_portal = await resolve_gas_station_portal(
+        comercio=comercio,
+        rfc_emisor=rfc_emisor,
+        sucursal=sucursal,
+        current_url=current_url,
+        extracted_data=extracted_data,
+    )
+    if gas_portal:
+        add_cand(gas_portal, prepend=True)
 
     term_clean = clean_search_term(comercio) or clean_search_term(sucursal) or ""
     term_lower = term_clean.lower()
@@ -580,21 +792,40 @@ async def deduce_portal_for_ticket(
     Deduce de forma inteligente y autónoma el portal oficial de facturación
     del comercio para un ticket dado. Retorna la mejor URL candidata o None.
     """
-    # Si ya tiene una URL explícita válida, usarla
-    if current_url:
-        sanitized = sanitize_and_classify_billing_url(current_url)
-        if sanitized:
-            return sanitized
-
     ext = extracted_data or {}
     nom = comercio or ext.get("comercio") or sucursal or ext.get("sucursal")
     rfc = rfc_emisor or ext.get("rfc_emisor")
 
+    # 1. Si current_url es un hub genérico de red (ej. g500network.com, efectifactura sin estación)
+    # o si tenemos identificadores de estación de gasolina, resolver estación específica primero:
+    is_hub = current_url and any(hub in current_url.lower() for hub in ("g500network.com", "efectifactura.com"))
+    gas_ident = extract_gas_station_identifiers(comercio=nom, sucursal=sucursal, extracted_data=ext)
+
+    if is_hub or gas_ident["is_gas_station"]:
+        gas_portal = await resolve_gas_station_portal(
+            comercio=nom,
+            rfc_emisor=rfc,
+            sucursal=sucursal,
+            current_url=current_url,
+            extracted_data=ext,
+        )
+        if gas_portal:
+            logger.info("Portal de estación de combustible deducido y refinado: %s", gas_portal)
+            return gas_portal
+
+    # 2. Si ya tiene una URL explícita válida y no es un hub genérico, usarla
+    if current_url and not is_hub:
+        sanitized = sanitize_and_classify_billing_url(current_url)
+        if sanitized:
+            return sanitized
+
+    # 3. Búsqueda y deducción autónoma multi-fuente
     candidates = await search_candidate_portal_urls(
         comercio=nom,
         rfc_emisor=rfc,
         sucursal=sucursal,
         current_url=current_url,
+        extracted_data=ext,
     )
 
     if candidates:

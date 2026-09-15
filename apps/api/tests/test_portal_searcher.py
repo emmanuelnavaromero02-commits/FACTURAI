@@ -152,3 +152,73 @@ async def test_update_ticket_portal_and_deduce_endpoints():
         assert patched_ticket["url_facturacion"] == custom_url
         assert patched_ticket["error_code"] is None
 
+
+@pytest.mark.asyncio
+async def test_extract_gas_station_identifiers():
+    from src.services.portal_searcher import extract_gas_station_identifiers
+
+    # Extraído desde campos 'otros'
+    ext_data = {
+        "otros": [
+            {"etiqueta": "permiso_cre", "valor": "PL/1434/EXP/ES/2015"},
+            {"etiqueta": "num_estacion", "valor": "E04959"},
+            {"etiqueta": "producto", "valor": "GPREMIUM 62.9480 Lts."},
+        ]
+    }
+    ident = extract_gas_station_identifiers(
+        comercio="G500 - SERVICIO FENTO",
+        sucursal="FENTO",
+        extracted_data=ext_data,
+    )
+    assert ident["is_gas_station"] is True
+    assert ident["permiso_cre"] == "PL/1434/EXP/ES/2015"
+    assert ident["cre_short"] == "PL/1434"
+    assert ident["num_estacion"] == "E04959"
+    assert ident["estacion_digits"] == "04959"
+
+
+@pytest.mark.asyncio
+async def test_deduce_portal_for_ticket_gas_station_g500():
+    from src.services.portal_searcher import deduce_portal_for_ticket
+
+    ext = {
+        "comercio": "G500 - SERVICIO FENTO",
+        "sucursal": "FENTO",
+        "rfc_emisor": "SFE960528D79",
+        "url_facturacion": "g500network.com/facturacion",
+        "otros": [
+            {"etiqueta": "permiso_cre", "valor": "PL/1434/EXP/ES/2015"},
+            {"etiqueta": "num_estacion", "valor": "E04959"},
+        ],
+    }
+    resolved = await deduce_portal_for_ticket(
+        comercio=ext["comercio"],
+        rfc_emisor=ext["rfc_emisor"],
+        sucursal=ext["sucursal"],
+        current_url=ext["url_facturacion"],
+        extracted_data=ext,
+    )
+    assert resolved is not None
+    # Debe refinar la URL genérica g500network.com/facturacion al portal exacto de la estación
+    assert "g500facturagas.azurewebsites.net" in resolved or "PL/1434" in resolved
+
+
+@pytest.mark.asyncio
+async def test_deduce_portal_for_other_gas_stations():
+    from src.services.portal_searcher import deduce_portal_for_ticket
+
+    # Oxxo Gas
+    oxxo_gas = await deduce_portal_for_ticket(
+        comercio="OXXO GAS SERVICIOS",
+        sucursal="ESTACION 1024",
+    )
+    assert oxxo_gas and "oxxogas" in oxxo_gas.lower()
+
+    # Hidrosina
+    hidrosina = await deduce_portal_for_ticket(
+        comercio="HIDROSINA PLUS",
+        sucursal="ESTACION CENTRO",
+    )
+    assert hidrosina and "hidrosina" in hidrosina.lower()
+
+
