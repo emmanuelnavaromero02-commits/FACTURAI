@@ -320,17 +320,42 @@ async def process_ticket_extraction(
             )
             auto_enqueue = fp_check.scalar_one_or_none() is not None
 
+        # Si no se identificó comercio del catálogo ni URL explícita en el ticket,
+        # deducir autónomamente el portal oficial del comercio en internet
+        if matched_merchant is None and not billing_url:
+            from .services.portal_searcher import deduce_portal_for_ticket
+            deduced_portal = await deduce_portal_for_ticket(
+                comercio=extracted.comercio or extracted.sucursal,
+                rfc_emisor=extracted.rfc_emisor,
+                sucursal=extracted.sucursal,
+                extracted_data=extracted.model_dump(),
+            )
+            if deduced_portal:
+                billing_url = deduced_portal
+                ticket.url_facturacion = deduced_portal
+                logger.info("Portal deducido automáticamente por IA en extracción: %s", deduced_portal)
+                # Si ahora tenemos portal deducido y hay perfil fiscal, habilitar auto_enqueue
+                if not auto_enqueue:
+                    fp_check = await session.execute(
+                        select(FiscalProfile.id).where(
+                            FiscalProfile.tenant_id == tenant_id,
+                            FiscalProfile.es_principal == True,
+                        )
+                    )
+                    auto_enqueue = fp_check.scalar_one_or_none() is not None
+
         if matched_merchant is None:
             if billing_url:
-                # No hay comercio específico pero sí URL de facturación: listo para generico-web
+                # Listo para motor genérico web (con URL impresa o deducida)
                 ticket.merchant_id = None
+                ticket.url_facturacion = billing_url
                 ticket.error_code = None
                 ticket.error_msg = None
                 await transition(
                     session,
                     ticket,
                     TicketEstado.EXTRAIDO,
-                    f"Datos extraídos correctamente. URL de facturación detectada para motor genérico web.",
+                    f"Datos extraídos correctamente. Portal de facturación identificado para motor genérico web.",
                     meta={"url_facturacion": billing_url, "motor": "generico-web"},
                 )
                 if auto_enqueue:
@@ -342,17 +367,17 @@ async def process_ticket_extraction(
                         tipo="encolado",
                     )
             else:
-                # Comercio desconocido y sin URL: queda en espera de que el usuario lo elija
+                # Comercio sin URL: NO RECHAZAR, queda en EXTRAIDO esperando link o búsqueda asistida
                 ticket.error_code = "comercio_desconocido"
                 ticket.error_msg = (
-                    "No pudimos identificar la cadena o portal del ticket automáticamente. "
-                    "Por favor selecciona el comercio en la lista para continuar."
+                    "No detectamos la URL del portal en el comprobante ni en internet. "
+                    "Puedes ingresar el link del portal para que el agente facture."
                 )
                 await transition(
                     session,
                     ticket,
                     TicketEstado.EXTRAIDO,
-                    "Datos extraídos; comercio no identificado, esperando selección manual.",
+                    "Datos extraídos; comercio/portal no identificado, esperando URL o selección.",
                     meta={"error_code": "comercio_desconocido"},
                 )
         else:
@@ -407,7 +432,7 @@ async def process_ticket_facturacion(
             text(
                 "UPDATE tickets SET estado = 'facturando', intentos = intentos + 1 "
                 "WHERE id = :t_id AND tenant_id = :tenant_id AND estado = 'encolado' "
-                "RETURNING id, merchant_id, fiscal_profile_id, folio, web_id, total, image_key, intentos, url_facturacion"
+                "RETURNING id, merchant_id, fiscal_profile_id, folio, web_id, total, image_key, intentos, url_facturacion, extracted, sucursal, rfc_emisor"
             ),
             {"t_id": ticket_id, "tenant_id": tenant_id},
         )
@@ -422,6 +447,9 @@ async def process_ticket_facturacion(
         image_key = row.image_key
         intentos = row.intentos
         url_facturacion = row.url_facturacion
+        extracted_data = row.extracted or {}
+        sucursal = row.sucursal
+        rfc_emisor = row.rfc_emisor
 
         event = TicketEvent(
             tenant_id=tenant_id,
@@ -478,13 +506,10 @@ async def process_ticket_facturacion(
                     dup_query = dup_query.where(Ticket.merchant_id.is_(None))
                 dup_res = await session.execute(dup_query)
                 if dup_res.first():
-                    logger.info("Ticket %s ya cuenta con factura previa. Rechazando como duplicado.", ticket_id)
-                    t_res = await session.execute(
-                        select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == tenant_id)
-                    )
+                    t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
                     t = t_res.scalar_one()
                     t.error_code = "duplicado"
-                    t.error_msg = f"El folio {folio} ya fue facturado previamente para este comercio."
+                    t.error_msg = f"El ticket con folio '{folio}' ya fue facturado previamente."
                     if t.image_key and not t.image_deleted_at:
                         try:
                             await storage.delete(t.image_key)
@@ -495,8 +520,8 @@ async def process_ticket_facturacion(
                         session,
                         t,
                         TicketEstado.RECHAZADO,
-                        f"Facturación rechazada: el folio {folio} ya fue facturado previamente.",
-                        meta={"error_code": "duplicado"},
+                        f"Factura omitida por idempotencia: folio '{folio}' ya facturado.",
+                        meta={"folio": folio},
                     )
                     return
 
@@ -564,19 +589,41 @@ async def process_ticket_facturacion(
                 return
         else:
             if not url_facturacion:
-                async with tenant_session(tenant_id) as session:
-                    t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
-                    t = t_res.scalar_one()
-                    t.error_code = "comercio_desconocido"
-                    t.error_msg = "El ticket no tiene asignado ningún comercio del catálogo ni URL de facturación."
-                    if t.image_key and not t.image_deleted_at:
-                        try:
-                            await storage.delete(t.image_key)
-                            t.image_deleted_at = datetime.now(timezone.utc)
-                        except Exception:
-                            pass
-                    await transition(session, t, TicketEstado.RECHAZADO, "Comercio no asignado y sin URL de facturación.")
-                return
+                # Intentar deducir portal en internet de forma autónoma antes de cualquier decisión
+                from .services.portal_searcher import deduce_portal_for_ticket
+                deduced_portal = await deduce_portal_for_ticket(
+                    comercio=extracted_data.get("comercio") if extracted_data else None,
+                    rfc_emisor=rfc_emisor or (extracted_data.get("rfc_emisor") if extracted_data else None),
+                    sucursal=sucursal,
+                    extracted_data=extracted_data,
+                )
+                if deduced_portal:
+                    url_facturacion = deduced_portal
+                    async with tenant_session(tenant_id) as session:
+                        t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                        t = t_res.scalar_one()
+                        t.url_facturacion = deduced_portal
+                        await session.commit()
+                    logger.info("Portal deducido en facturación para ticket %s: %s", ticket_id, deduced_portal)
+                else:
+                    # NUNCA RECHAZAR NI BORRAR IMAGEN: pasar a ESPERA_HUMANO
+                    async with tenant_session(tenant_id) as session:
+                        t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                        t = t_res.scalar_one()
+                        t.intentos = max(0, t.intentos - 1)  # No gasta intentos
+                        t.error_code = "portal_requerido"
+                        t.error_msg = (
+                            "No pudimos deducir el portal de facturación en internet para este comercio. "
+                            "Por favor ingresa la URL del portal para que el agente facture."
+                        )
+                        await transition(
+                            session,
+                            t,
+                            TicketEstado.ESPERA_HUMANO,
+                            "Esperando URL del portal de facturación.",
+                            meta={"motivo": "esperando_url_portal"},
+                        )
+                    return
 
         # Validación previa de entrega por emisor (Corrección B):
         # Si el comercio entrega por emisor y no hay email configurado, el motor NO se ejecuta

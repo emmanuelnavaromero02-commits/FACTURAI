@@ -37,6 +37,7 @@ import {
   Layers,
   ShieldCheck,
   ShieldAlert,
+  Globe,
 } from "lucide-react";
 
 const CATEGORIAS = [
@@ -366,7 +367,18 @@ export default function TicketsPage() {
               </button>
             )}
 
-            {t.estado === "espera_humano" && (
+            {t.estado === "espera_humano" &&
+            (t.error_code === "esperando_url_portal" || t.error_code === "portal_requerido") ? (
+              <button
+                type="button"
+                onClick={() => setSelectedTicketDetail(t)}
+                title="Indicar o investigar portal de facturación con IA"
+                className="flex items-center gap-1 rounded-lg bg-brand px-2 py-1 text-[11px] font-bold text-on-brand shadow-sm hover:brightness-105 active:scale-95"
+              >
+                <Globe className="h-3 w-3" />
+                <span>Indicar portal</span>
+              </button>
+            ) : t.estado === "espera_humano" ? (
               <button
                 type="button"
                 onClick={() => setSelectedTicketForHandoff(t)}
@@ -375,7 +387,7 @@ export default function TicketsPage() {
               >
                 <span>Resolver</span>
               </button>
-            )}
+            ) : null}
 
             {t.estado === "facturado" && (
               <CfdiDownloadButton
@@ -905,6 +917,12 @@ export default function TicketsPage() {
           onOpenHandoff={(t) => {
             setSelectedTicketDetail(null);
             setSelectedTicketForHandoff(t);
+          }}
+          onTicketUpdated={(updatedTicket) => {
+            setSelectedTicketDetail(updatedTicket);
+            setTickets((prev) =>
+              prev.map((item) => (item.id === updatedTicket.id ? updatedTicket : item))
+            );
           }}
         />
       )}

@@ -227,6 +227,44 @@ export async function deleteTicket(tenantId: string, ticketId: string): Promise<
   );
 }
 
+export async function updateTicketPortal(
+  tenantId: string,
+  ticketId: string,
+  urlFacturacion: string,
+  facturarAhora: boolean = true
+): Promise<TicketResponse> {
+  return fetchWithAuth<TicketResponse>(
+    `/v1/tickets/${ticketId}/portal`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url_facturacion: urlFacturacion,
+        facturar_ahora: facturarAhora,
+      }),
+    },
+    tenantId
+  );
+}
+
+export async function deduceTicketPortal(
+  tenantId: string,
+  ticketId: string
+): Promise<{
+  ticket_id: string;
+  candidates: string[];
+  deduced_url: string | null;
+  url_facturacion_actual: string | null;
+}> {
+  return fetchWithAuth(
+    `/v1/tickets/${ticketId}/deduce-portal`,
+    {
+      method: "POST",
+    },
+    tenantId
+  );
+}
+
 export function getCfdiDownloadUrl(ticketId: string, tenantId?: string): string {
   const query = tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : "";
   return `${API_BASE_URL}/v1/tickets/${ticketId}/cfdi${query}`;

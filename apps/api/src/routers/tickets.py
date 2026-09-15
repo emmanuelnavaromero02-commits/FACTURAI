@@ -587,6 +587,102 @@ async def facturar_ticket(
     return response_data
 
 
+class UpdatePortalRequest(BaseModel):
+    url_facturacion: str
+    facturar_ahora: bool = True
+
+
+@router.patch("/{ticket_id}/portal", response_model=TicketResponse)
+async def update_ticket_portal(
+    ticket_id: uuid.UUID,
+    payload: UpdatePortalRequest,
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Actualiza la URL del portal de facturación del ticket y opcionalmente inicia la facturación.
+    Permite rescatar tickets sin URL detectada en el comprobante impreso.
+    """
+    url_clean = payload.url_facturacion.strip()
+    if not url_clean.startswith("http://") and not url_clean.startswith("https://"):
+        url_clean = "https://" + url_clean
+
+    should_enqueue = False
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        res = await session.execute(
+            select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
+        )
+        ticket = res.scalar_one_or_none()
+        if not ticket:
+            raise RecursoNoEncontradoException(f"Ticket {ticket_id} no encontrado.")
+
+        ticket.url_facturacion = url_clean
+        ticket.error_code = None
+        ticket.error_msg = None
+
+        if payload.facturar_ahora:
+            if ticket.estado in (TicketEstado.EXTRAIDO, TicketEstado.ESPERA_HUMANO, TicketEstado.RECHAZADO):
+                await transition(
+                    session,
+                    ticket,
+                    TicketEstado.ENCOLADO,
+                    f"URL de portal actualizada ({url_clean}). Facturación encolada.",
+                    tipo="encolado",
+                    meta={"url_facturacion": url_clean},
+                )
+                should_enqueue = True
+        await session.commit()
+        resp = TicketResponse.from_model(ticket)
+
+    if should_enqueue:
+        await enqueue_ticket_facturacion(ctx.tenant_id, ticket_id)
+
+    return resp
+
+
+@router.post("/{ticket_id}/deduce-portal")
+async def deduce_ticket_portal_endpoint(
+    ticket_id: uuid.UUID,
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Investiga y deduce de forma autónoma con IA los portales de facturación candidatos en internet.
+    """
+    from ..services.portal_searcher import search_candidate_portal_urls
+
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        res = await session.execute(
+            select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
+        )
+        ticket = res.scalar_one_or_none()
+        if not ticket:
+            raise RecursoNoEncontradoException(f"Ticket {ticket_id} no encontrado.")
+
+        ext = ticket.extracted or {}
+        com_name = ext.get("comercio") or ticket.sucursal or ""
+        rfc = ticket.rfc_emisor or ext.get("rfc_emisor") or ""
+        candidates = await search_candidate_portal_urls(
+            comercio=com_name,
+            rfc_emisor=rfc,
+            sucursal=ticket.sucursal,
+            current_url=ticket.url_facturacion,
+            include_synthetic=True,
+        )
+
+        deduced = candidates[0] if candidates else None
+        if deduced and not ticket.url_facturacion:
+            ticket.url_facturacion = deduced
+            ticket.error_code = None
+            ticket.error_msg = None
+            await session.commit()
+
+        return {
+            "ticket_id": str(ticket_id),
+            "candidates": candidates,
+            "deduced_url": deduced,
+            "url_facturacion_actual": ticket.url_facturacion,
+        }
+
+
 @router.get("/{ticket_id}/cfdi")
 async def download_cfdi_bundle(
     ticket_id: uuid.UUID,
