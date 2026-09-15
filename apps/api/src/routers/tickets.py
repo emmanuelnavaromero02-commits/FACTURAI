@@ -2,13 +2,15 @@ import asyncio
 import json
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, File, Form, Header, Query, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, select
+
+from ..auth import sign_session_token
 
 from ..db import tenant_session
 from ..deps import TenantContext, get_tenant_context
@@ -556,12 +558,26 @@ async def get_ticket_handoff_info(
         if not ev or not ev.meta:
             raise RecursoNoEncontradoException("No hay sesión de handoff activa para este ticket.")
 
+        expires_str = ev.meta.get("expires_at")
+        is_expired = False
+        if expires_str:
+            try:
+                exp_dt = datetime.fromisoformat(expires_str)
+                if exp_dt <= datetime.now(timezone.utc):
+                    is_expired = True
+            except Exception:
+                pass
+
+        session_token = sign_session_token(ctx.user.id, ctx.user.email)
+
         return {
             "handoff_id": ev.meta.get("handoff_id"),
             "token": ev.meta.get("token"),
+            "session_token": session_token,
             "motivo": ev.meta.get("motivo"),
             "expires_at": ev.meta.get("expires_at"),
             "url_facturacion": ticket.url_facturacion,
+            "is_expired": is_expired or ticket.estado != TicketEstado.ESPERA_HUMANO,
         }
 
 

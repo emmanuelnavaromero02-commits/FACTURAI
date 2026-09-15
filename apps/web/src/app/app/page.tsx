@@ -56,6 +56,26 @@ export default function TicketsPage() {
     loadTickets();
   }, [tenantId]);
 
+  // Sondeo en segundo plano (4s si hay tickets en proceso/espera, 15s si todo está estático)
+  useEffect(() => {
+    if (!tenantId) return;
+
+    const tieneActivos = tickets.some((t) =>
+      ["recibido", "extrayendo", "encolado", "facturando", "espera_humano"].includes(
+        t.estado
+      )
+    );
+    const intervalMs = tieneActivos ? 4000 : 15000;
+
+    const timer = setInterval(() => {
+      getTickets(tenantId)
+        .then((resp) => setTickets(resp.items || []))
+        .catch((err) => console.debug("Error en sondeo de tickets:", err));
+    }, intervalMs);
+
+    return () => clearInterval(timer);
+  }, [tenantId, tickets]);
+
   // Filtrado en memoria
   const filteredTickets = tickets.filter((t) => {
     if (filterState === "todos") return true;
@@ -443,8 +463,15 @@ export default function TicketsPage() {
         <HandoffModal
           tenantId={tenantId}
           ticketId={selectedTicketForHandoff.id}
-          onClose={() => setSelectedTicketForHandoff(null)}
+          onClose={() => {
+            setSelectedTicketForHandoff(null);
+            loadTickets();
+          }}
           onSuccess={() => {
+            setSelectedTicketForHandoff(null);
+            loadTickets();
+          }}
+          onRetry={() => {
             setSelectedTicketForHandoff(null);
             loadTickets();
           }}

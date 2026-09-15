@@ -4,15 +4,17 @@ import React, { useEffect, useRef, useState } from "react";
 import {
   getTicketHandoffInfo,
   getHandoffWsUrl,
+  retryTicket,
   HandoffInfoResponse,
 } from "@/lib/api";
-import { AlertTriangle, Check, Loader2, Send, X } from "lucide-react";
+import { AlertTriangle, Check, Loader2, RefreshCw, Send, X } from "lucide-react";
 
 interface HandoffModalProps {
   tenantId: string;
   ticketId: string;
   onClose: () => void;
   onSuccess: () => void;
+  onRetry?: () => void;
 }
 
 export function HandoffModal({
@@ -20,6 +22,7 @@ export function HandoffModal({
   ticketId,
   onClose,
   onSuccess,
+  onRetry,
 }: HandoffModalProps) {
   const [handoffInfo, setHandoffInfo] = useState<HandoffInfoResponse | null>(
     null
@@ -34,6 +37,7 @@ export function HandoffModal({
   const [timeLeft, setTimeLeft] = useState<number>(180);
   const [isSubmittingDone, setIsSubmittingDone] = useState(false);
   const [customText, setCustomText] = useState("");
+  const [retrying, setRetrying] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
@@ -50,6 +54,16 @@ export function HandoffModal({
         const info = await getTicketHandoffInfo(tenantId, ticketId);
         if (!isMounted) return;
         setHandoffInfo(info);
+
+        // Si el backend reporta que ya expiró
+        if (info.is_expired) {
+          setErrorMsg(
+            "Esta sesión de intervención ya finalizó o expiró. El ticket volvió a la cola de reintentos."
+          );
+          setWsStatus("disconnected");
+          setTimeLeft(0);
+          return;
+        }
 
         // Calcular tiempo restante inicial
         if (info.expires_at) {
@@ -82,8 +96,13 @@ export function HandoffModal({
   // 2. Conectar al WebSocket una vez que tenemos la sesión de handoff
   useEffect(() => {
     if (!handoffInfo) return;
+    if (handoffInfo.is_expired) return;
 
-    const wsUrl = getHandoffWsUrl(handoffInfo.handoff_id, handoffInfo.token);
+    const wsUrl = getHandoffWsUrl(
+      handoffInfo.handoff_id,
+      handoffInfo.token,
+      handoffInfo.session_token
+    );
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
@@ -216,6 +235,20 @@ export function HandoffModal({
     setCustomText("");
   };
 
+  // Reintentar ticket y cerrar modal
+  const handleRetryTicket = async () => {
+    setRetrying(true);
+    try {
+      await retryTicket(tenantId, ticketId);
+      if (onRetry) onRetry();
+      onClose();
+    } catch (err: unknown) {
+      setErrorMsg((err as Error).message || "No se pudo reintentar el ticket.");
+    } finally {
+      setRetrying(false);
+    }
+  };
+
   // Botón "Lo hago después" / Cancelar
   const handleCancel = () => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -324,20 +357,37 @@ export function HandoffModal({
                   onTouchStart={handleImageTouch}
                   draggable={false}
                 />
+              ) : wsStatus === "disconnected" || wsStatus === "error" || handoffInfo?.is_expired ? (
+                <div className="flex flex-col items-center gap-3 p-6 text-center max-w-md">
+                  <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-warn-soft text-warn">
+                    <AlertTriangle className="h-6 w-6" />
+                  </div>
+                  <div>
+                    <h4 className="text-sm font-bold text-ink">Sesión no disponible o finalizada</h4>
+                    <p className="mt-1 text-xs text-muted">
+                      {errorMsg || "El navegador remoto liberó la sesión por límite de tiempo o el ticket volvió a la cola de reintentos."}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleRetryTicket}
+                    disabled={retrying}
+                    className="mt-2 flex items-center gap-2 rounded-xl bg-brand px-4 py-2 text-xs font-bold text-on-brand shadow hover:brightness-105 transition active:scale-95 disabled:opacity-50"
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 ${retrying ? "animate-spin" : ""}`} />
+                    <span>Reintentar facturación para abrir navegador</span>
+                  </button>
+                </div>
               ) : (
                 <div className="flex flex-col items-center gap-2 p-6 text-center text-muted">
                   <Loader2 className="h-8 w-8 animate-spin-custom text-brand" />
                   <p className="text-xs font-medium">
                     {loadingInfo
                       ? "Cargando sesión..."
-                      : wsStatus === "disconnected" || wsStatus === "error"
-                      ? "Sesión no conectada o finalizada"
-                      : "Esperando señal del navegador..."}
+                      : "Esperando señal del navegador remoto..."}
                   </p>
                   <p className="text-[11px]">
-                    {wsStatus === "disconnected" || wsStatus === "error"
-                      ? "El navegador remoto no está transmitiendo en este momento o el ticket volvió a la cola."
-                      : "El portal remoto está cargando. Haz clic en la pantalla en cuanto aparezca el desafío."}
+                    El portal remoto está cargando. En cuanto aparezca el desafío o formulario, podrás interactuar directamente haciendo clic en la pantalla.
                   </p>
                 </div>
               )}
@@ -396,29 +446,41 @@ export function HandoffModal({
             onClick={handleCancel}
             className="rounded-xl border border-line-2 bg-panel px-4 py-2 text-xs font-semibold text-ink-2 transition-colors hover:bg-line/20"
           >
-            Lo hago después
+            {wsStatus === "disconnected" || wsStatus === "error" || handoffInfo?.is_expired ? "Cerrar" : "Lo hago después"}
           </button>
 
-          <button
-            type="button"
-            onClick={handleDone}
-            disabled={
-              wsStatus !== "connected" || isSubmittingDone || timeLeft <= 0
-            }
-            className="flex items-center gap-1.5 rounded-xl bg-brand px-4 py-2 text-xs font-bold text-on-brand shadow-sm transition-all hover:brightness-105 active:scale-95 disabled:opacity-50"
-          >
-            {isSubmittingDone ? (
-              <>
-                <Loader2 className="h-3.5 w-3.5 animate-spin-custom" />
-                <span>Reanudando agente...</span>
-              </>
-            ) : (
-              <>
-                <Check className="h-3.5 w-3.5 stroke-[2.5]" />
-                <span>Listo, continuar</span>
-              </>
-            )}
-          </button>
+          {wsStatus === "disconnected" || wsStatus === "error" || handoffInfo?.is_expired ? (
+            <button
+              type="button"
+              onClick={handleRetryTicket}
+              disabled={retrying}
+              className="flex items-center gap-1.5 rounded-xl bg-brand px-4 py-2 text-xs font-bold text-on-brand shadow-sm transition-all hover:brightness-105 active:scale-95 disabled:opacity-50"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${retrying ? "animate-spin" : ""}`} />
+              <span>Reintentar facturación</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleDone}
+              disabled={
+                wsStatus !== "connected" || isSubmittingDone || timeLeft <= 0
+              }
+              className="flex items-center gap-1.5 rounded-xl bg-brand px-4 py-2 text-xs font-bold text-on-brand shadow-sm transition-all hover:brightness-105 active:scale-95 disabled:opacity-50"
+            >
+              {isSubmittingDone ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin-custom" />
+                  <span>Reanudando agente...</span>
+                </>
+              ) : (
+                <>
+                  <Check className="h-3.5 w-3.5 stroke-[2.5]" />
+                  <span>Listo, continuar</span>
+                </>
+              )}
+            </button>
+          )}
         </div>
       </div>
     </div>
