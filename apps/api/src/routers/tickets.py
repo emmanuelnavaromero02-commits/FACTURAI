@@ -62,6 +62,9 @@ class TicketResponse(BaseModel):
     categoria_gasto: Optional[str] = None
     desglose_impuestos: Optional[Dict[str, Any]] = None
     estatus_deducibilidad: Optional[str] = None
+    score_riesgo_fiscal: Optional[int] = None
+    auditoria_aritmetica: Optional[Dict[str, Any]] = None
+    hash_integridad: Optional[str] = None
     created_at: str
 
     @classmethod
@@ -97,6 +100,9 @@ class TicketResponse(BaseModel):
             categoria_gasto=t.categoria_gasto,
             desglose_impuestos=t.desglose_impuestos,
             estatus_deducibilidad=t.estatus_deducibilidad,
+            score_riesgo_fiscal=t.score_riesgo_fiscal,
+            auditoria_aritmetica=t.auditoria_aritmetica,
+            hash_integridad=t.hash_integridad,
             created_at=t.created_at.isoformat(),
         )
 
@@ -246,6 +252,9 @@ async def upload_cfdi(
             categoria_gasto=fiscal_res["categoria"],
             desglose_impuestos=fiscal_res["desglose_impuestos"],
             estatus_deducibilidad=fiscal_res["estatus_deducibilidad"],
+            score_riesgo_fiscal=fiscal_res.get("score_riesgo_fiscal"),
+            auditoria_aritmetica=fiscal_res.get("auditoria_aritmetica"),
+            hash_integridad=fiscal_res.get("hash_integridad"),
             facturado_at=now_dt,
         )
         session.add(ticket)
@@ -292,10 +301,10 @@ async def list_tickets(
         res = await session.execute(query)
         tickets = res.scalars().all()
 
-        # Auto-clasificación defensiva si algún ticket histórico carece de categoría
+        # Auto-clasificación defensiva si algún ticket histórico carece de categoría o auditoría
         updated_any = False
         for t in tickets:
-            if not t.categoria_gasto or not t.estatus_deducibilidad:
+            if not t.categoria_gasto or not t.estatus_deducibilidad or t.score_riesgo_fiscal is None:
                 from ..services.fiscal_classifier import analyze_fiscal_classification
                 ext = t.extracted or {}
                 com_name = ext.get("comercio") or t.sucursal or ""
@@ -308,10 +317,15 @@ async def list_tickets(
                     iva=t.iva,
                     forma_pago_raw=ext.get("forma_pago") or "04",
                     conceptos_text=conceptos,
+                    fecha_ticket=str(t.fecha_ticket) if t.fecha_ticket else None,
+                    folio=t.folio,
                 )
                 t.categoria_gasto = f_res["categoria"]
                 t.desglose_impuestos = f_res["desglose_impuestos"]
                 t.estatus_deducibilidad = f_res["estatus_deducibilidad"]
+                t.score_riesgo_fiscal = f_res.get("score_riesgo_fiscal")
+                t.auditoria_aritmetica = f_res.get("auditoria_aritmetica")
+                t.hash_integridad = f_res.get("hash_integridad")
                 updated_any = True
         if updated_any:
             await session.commit()
@@ -336,7 +350,7 @@ async def get_ticket(
         )
         ticket = res.scalar_one_or_none()
 
-        if ticket and (not ticket.categoria_gasto or not ticket.estatus_deducibilidad):
+        if ticket and (not ticket.categoria_gasto or not ticket.estatus_deducibilidad or ticket.score_riesgo_fiscal is None):
             from ..services.fiscal_classifier import analyze_fiscal_classification
             ext = ticket.extracted or {}
             com_name = ext.get("comercio") or ticket.sucursal or ""
@@ -349,10 +363,15 @@ async def get_ticket(
                 iva=ticket.iva,
                 forma_pago_raw=ext.get("forma_pago") or "04",
                 conceptos_text=conceptos,
+                fecha_ticket=str(ticket.fecha_ticket) if ticket.fecha_ticket else None,
+                folio=ticket.folio,
             )
             ticket.categoria_gasto = f_res["categoria"]
             ticket.desglose_impuestos = f_res["desglose_impuestos"]
             ticket.estatus_deducibilidad = f_res["estatus_deducibilidad"]
+            ticket.score_riesgo_fiscal = f_res.get("score_riesgo_fiscal")
+            ticket.auditoria_aritmetica = f_res.get("auditoria_aritmetica")
+            ticket.hash_integridad = f_res.get("hash_integridad")
             await session.commit()
 
     if not ticket:

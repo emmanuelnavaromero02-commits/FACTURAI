@@ -101,7 +101,7 @@ export function DirectCfdiUpload({
     setErrorMsg(null);
 
     try {
-      const ticket = await uploadCfdiDirect(tenantId, xmlFile, pdfFile);
+      const ticket = await uploadCfdiDirect(tenantId, xmlFile, pdfFile || undefined);
       setResultTicket(ticket);
       if (onSuccess) {
         onSuccess(ticket);
@@ -322,7 +322,7 @@ export function DirectCfdiUpload({
               <div className="rounded-lg bg-panel p-2.5 border border-line">
                 <span className="text-[10px] text-muted block">IEPS / ISH</span>
                 <span className="mono font-bold text-ink">
-                  {formatCurrency((resultTicket.desglose_impuestos.ieps ?? 0) + (resultTicket.desglose_impuestos.ish_local ?? 0))}
+                  {formatCurrency((resultTicket.desglose_impuestos.ieps ?? 0) + (resultTicket.desglose_impuestos.ish ?? 0))}
                 </span>
               </div>
               <div className="rounded-lg bg-panel p-2.5 border border-line">

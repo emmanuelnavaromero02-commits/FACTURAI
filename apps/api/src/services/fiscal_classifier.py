@@ -4,6 +4,10 @@ import re
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional
 
+from .math_sat_auditor import audit_sat_anexo_20_arithmetic
+from .fiscal_risk_engine import evaluate_fiscal_risk_score, calculate_integrity_hash
+from .ocr_fuzzy_corrector import validate_sat_rfc, correct_noisy_ocr_rfc
+
 logger = logging.getLogger(__name__)
 
 # Espacios de nombres estándar de CFDI 3.3 y 4.0 del SAT
@@ -473,27 +477,48 @@ def analyze_fiscal_classification(
     forma_pago_raw: Optional[str] = None,
     es_viatico_foraneo: bool = False,
     conceptos_text: Optional[str] = None,
+    rfc_receptor: Optional[str] = None,
+    fecha_ticket: Optional[str] = None,
+    folio: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Función integral que clasifica la factura, extrae o estima el desglose de impuestos
-    (Tasa 16%, 0%, Exento, IEPS, ISH, TUA, Retenciones) y evalúa el estatus de deducibilidad SAT.
+    Función integral que:
+    1. Clasifica la factura por categoría contable/fiscal.
+    2. Extrae o calcula el desglose de impuestos (Tasa 16%, 0%, Exento, IEPS, ISH, TUA, Retenciones).
+    3. Evalúa el estatus de deducibilidad SAT (LISR Art. 27 y 28).
+    4. Ejecuta la auditoría matemática rigurosa del Anexo 20 SAT (CFDI 4.0 / 3.3).
+    5. Evalúa el score de riesgo fiscal y prevención de EFOS/EDOS (Art. 69-B CFF).
+    6. Genera el hash criptográfico SHA-256 de integridad para prevención de doble timbrado.
     """
     claves_prod_serv = []
     forma_pago = forma_pago_raw
     conceptos_resumen = []
+    num_conceptos = 1
 
-    # 1. Si hay XML, hacer análisis formal con precisión SAT
+    # 1. Corrección probabilística y validación de RFC si viene de OCR
+    rfc_trabajo = rfc_emisor
+    rfc_info = None
+    if rfc_emisor:
+        rfc_val = validate_sat_rfc(rfc_emisor)
+        if not rfc_val["es_valido"]:
+            rfc_corr, conf = correct_noisy_ocr_rfc(rfc_emisor)
+            if rfc_corr and conf >= 0.80:
+                rfc_trabajo = rfc_corr
+        rfc_info = validate_sat_rfc(rfc_trabajo or "")
+
+    # 2. Si hay XML, hacer análisis formal con precisión SAT
     if xml_bytes:
         xml_data = parse_cfdi_tax_breakdown(xml_bytes)
         claves_prod_serv = xml_data.get("claves_prod_serv", [])
         conceptos_resumen = xml_data.get("conceptos_resumen", [])
+        num_conceptos = max(1, len(conceptos_resumen))
         if xml_data.get("forma_pago"):
             forma_pago = xml_data["forma_pago"]
 
         texto_completo = " ".join(filter(None, [conceptos_text, " ".join(conceptos_resumen)]))
         categoria = classify_expense_by_text_and_rfc(
             comercio=comercio,
-            rfc_emisor=rfc_emisor,
+            rfc_emisor=rfc_trabajo,
             conceptos_text=texto_completo,
             claves_prod_serv=claves_prod_serv,
         )
@@ -512,12 +537,14 @@ def analyze_fiscal_classification(
             "fuente": "cfdi_xml",
         }
         tot_eval = xml_data["total"] or total
+        subt_eval = xml_data["subtotal"] or subtotal
+        descuento_eval = xml_data.get("descuento", Decimal("0.00"))
 
     else:
-        # 2. Estimación a partir de ticket impreso / visión
+        # 3. Estimación a partir de ticket impreso / visión
         categoria = classify_expense_by_text_and_rfc(
             comercio=comercio,
-            rfc_emisor=rfc_emisor,
+            rfc_emisor=rfc_trabajo,
             conceptos_text=conceptos_text or "",
             claves_prod_serv=None,
         )
@@ -536,12 +563,51 @@ def analyze_fiscal_classification(
             "fuente": "estimacion_ticket",
         }
         tot_eval = total
+        subt_eval = subtotal or (total - iva if total and iva else total)
+        descuento_eval = Decimal("0.00")
 
+    # 4. Evaluación de Deducibilidad LISR
     deducibilidad = evaluate_sat_deducibility(
         categoria=categoria,
         forma_pago=forma_pago,
         total=tot_eval,
         es_viatico_foraneo=es_viatico_foraneo,
+    )
+
+    # 5. Auditoría Matemática Anexo 20
+    auditoria_matematica = audit_sat_anexo_20_arithmetic(
+        total=tot_eval,
+        subtotal=subt_eval,
+        descuento=descuento_eval,
+        iva_16=Decimal(str(tax_breakdown["iva_16"])),
+        ieps=Decimal(str(tax_breakdown["ieps"])),
+        ish=Decimal(str(tax_breakdown["ish"])),
+        retencion_iva=Decimal(str(tax_breakdown["retencion_iva"])),
+        retencion_isr=Decimal(str(tax_breakdown["retencion_isr"])),
+        base_16=Decimal(str(tax_breakdown["base_16"])),
+        base_0=Decimal(str(tax_breakdown["base_0"])),
+        base_exenta=Decimal(str(tax_breakdown["base_exenta"])),
+        num_conceptos=num_conceptos,
+    )
+
+    # 6. Evaluación de Riesgo Fiscal Art. 69-B CFF (Score 0-100)
+    riesgo_eval = evaluate_fiscal_risk_score(
+        rfc_emisor=rfc_trabajo,
+        total=tot_eval,
+        categoria_gasto=categoria,
+        forma_pago=forma_pago,
+        es_valido_anexo_20=auditoria_matematica["es_valido_anexo_20"],
+        score_matematico=auditoria_matematica["score_matematico"],
+        es_viatico_foraneo=es_viatico_foraneo,
+    )
+
+    # 7. Hash Criptográfico de Integridad SHA-256
+    hash_int = calculate_integrity_hash(
+        rfc_emisor=rfc_trabajo,
+        rfc_receptor=rfc_receptor,
+        total=tot_eval,
+        fecha=fecha_ticket,
+        folio=folio,
     )
 
     return {
@@ -553,4 +619,10 @@ def analyze_fiscal_classification(
         "color_deducibilidad": deducibilidad["color"],
         "forma_pago": forma_pago,
         "claves_prod_serv": claves_prod_serv,
+        "auditoria_aritmetica": auditoria_matematica,
+        "score_riesgo_fiscal": riesgo_eval["score_riesgo"],
+        "evaluacion_riesgo": riesgo_eval,
+        "hash_integridad": hash_int,
+        "rfc_emisor_corregido": rfc_trabajo,
+        "rfc_valido": rfc_info["es_valido"] if rfc_info else True,
     }

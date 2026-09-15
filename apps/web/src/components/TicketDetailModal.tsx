@@ -26,6 +26,8 @@ import {
   ShoppingCart,
   Navigation,
   Plane,
+  Fingerprint,
+  Scale,
 } from "lucide-react";
 import { TicketResponse } from "@/types/api";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -50,6 +52,7 @@ export function TicketDetailModal({
   onOpenHandoff,
 }: TicketDetailModalProps) {
   const [copiedUuid, setCopiedUuid] = useState(false);
+  const [copiedHash, setCopiedHash] = useState(false);
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -379,6 +382,108 @@ export function TicketDetailModal({
             </div>
           )}
 
+          {/* Auditoría Matemática SAT Anexo 20 y Blindaje Fiscal Art. 69-B */}
+          {(ticket.auditoria_aritmetica || ticket.score_riesgo_fiscal !== undefined) && (
+            <div className="rounded-2xl border border-line-2 bg-panel-2/40 p-4">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <ShieldCheck className="h-4 w-4 text-brand" />
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-ink">
+                    Auditoría Matemática SAT & Blindaje Fiscal
+                  </h4>
+                </div>
+                {ticket.auditoria_aritmetica?.es_valido_anexo_20 && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-ok/10 px-2.5 py-0.5 text-[10px] font-bold text-ok">
+                    <Check className="h-3 w-3" />
+                    Sello Anexo 20 SAT Válido
+                  </span>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {/* Score Matemático Anexo 20 */}
+                <div className="rounded-xl border border-line bg-panel p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] text-muted font-medium">Consistencia Aritmética</span>
+                    <span className="mono text-xs font-bold text-ink">
+                      {ticket.auditoria_aritmetica?.score_matematico ?? 100} / 100
+                    </span>
+                  </div>
+                  <div className="mt-2 text-xs space-y-1">
+                    <div className="flex justify-between text-muted">
+                      <span>Total declarado:</span>
+                      <span className="mono font-semibold text-ink">
+                        {formatCurrency(ticket.auditoria_aritmetica?.total_declarado ?? ticket.total ?? 0)}
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-muted">
+                      <span>Total calculado:</span>
+                      <span className="mono font-semibold text-ink">
+                        {formatCurrency(ticket.auditoria_aritmetica?.total_calculado ?? ticket.total ?? 0)}
+                      </span>
+                    </div>
+                    {ticket.auditoria_aritmetica?.tasa_efectiva_iva !== undefined && ticket.auditoria_aritmetica?.tasa_efectiva_iva !== null && (
+                      <div className="flex justify-between text-muted">
+                        <span>Tasa efectiva IVA:</span>
+                        <span className="mono font-semibold text-ink">
+                          {(ticket.auditoria_aritmetica.tasa_efectiva_iva * 100).toFixed(2)}%
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Score de Riesgo Fiscal Art. 69-B */}
+                <div className="rounded-xl border border-line bg-panel p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] text-muted font-medium">Score de Riesgo Fiscal SAT</span>
+                    <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                      (ticket.score_riesgo_fiscal ?? 0) <= 25
+                        ? "bg-ok/10 text-ok"
+                        : (ticket.score_riesgo_fiscal ?? 0) <= 65
+                        ? "bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                        : "bg-bad/10 text-bad"
+                    }`}>
+                      {(ticket.score_riesgo_fiscal ?? 0) <= 25 ? "Riesgo Bajo" : (ticket.score_riesgo_fiscal ?? 0) <= 65 ? "Riesgo Medio" : "Riesgo Alto"} ({ticket.score_riesgo_fiscal ?? 0}/100)
+                    </span>
+                  </div>
+                  <p className="mt-2 text-xs text-muted leading-relaxed">
+                    {(ticket.score_riesgo_fiscal ?? 0) <= 25
+                      ? "Sin antecedentes en listas negras Art. 69-B CFF ni inconsistencias de deducibilidad."
+                      : (ticket.score_riesgo_fiscal ?? 0) <= 65
+                      ? "Requiere comprobante de pago electrónico o documentación de respaldo para el SAT."
+                      : "Alerta crítica de fiscalización. Riesgo de no deducibilidad o auditoría SAT."}
+                  </p>
+                </div>
+              </div>
+
+              {/* Hash Criptográfico de Integridad SHA-256 */}
+              {ticket.hash_integridad && (
+                <div className="mt-3 flex items-center justify-between rounded-xl border border-line bg-panel p-2.5 text-xs">
+                  <div className="flex items-center gap-2 overflow-hidden">
+                    <Fingerprint className="h-3.5 w-3.5 shrink-0 text-muted" />
+                    <span className="text-[11px] text-muted shrink-0">Hash SHA-256:</span>
+                    <span className="mono text-[10px] text-ink truncate" title={ticket.hash_integridad}>
+                      {ticket.hash_integridad}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(ticket.hash_integridad || "");
+                      setCopiedHash(true);
+                      setTimeout(() => setCopiedHash(false), 2000);
+                    }}
+                    className="ml-2 flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-medium text-muted hover:bg-panel-2 hover:text-ink transition shrink-0"
+                  >
+                    {copiedHash ? <Check className="h-3 w-3 text-ok" /> : <Copy className="h-3 w-3" />}
+                    <span>{copiedHash ? "Copiado" : "Copiar"}</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Datos Fiscales y Montos */}
           <div>
             <h4 className="text-xs font-semibold uppercase tracking-wider text-muted mb-3">
@@ -414,7 +519,7 @@ export function TicketDetailModal({
               </div>
 
               <div className="rounded-xl border border-line bg-panel p-3">
-                <span className="text-[11px] text-muted">Sucursal / Tienda</span>
+                <span className="text-[11px] text-muted">Establecimiento / Emisor</span>
                 <p className="text-xs font-semibold text-ink mt-1 truncate" title={ticket.sucursal || ""}>
                   {ticket.sucursal || "—"}
                 </p>
@@ -459,7 +564,7 @@ export function TicketDetailModal({
           {/* Métricas y Auditoría */}
           <div>
             <h4 className="text-xs font-semibold uppercase tracking-wider text-muted mb-2">
-              Información de Procesamiento y Privacidad
+              Bóveda Fiscal Cifrada y Auditoría
             </h4>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 text-xs">
               <div className="rounded-xl border border-line bg-panel p-2.5">
@@ -477,7 +582,7 @@ export function TicketDetailModal({
                 </p>
               </div>
               <div className="rounded-xl border border-line bg-panel p-2.5">
-                <span className="text-[10px] text-muted">Imagen Original</span>
+                <span className="text-[10px] text-muted">Imagen Temporal</span>
                 <p className="font-semibold text-ok">
                   {!ticket.image_key || isFacturado ? "✓ Eliminada" : "En proceso"}
                 </p>

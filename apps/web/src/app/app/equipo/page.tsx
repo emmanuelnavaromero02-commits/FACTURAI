@@ -166,11 +166,11 @@ export default function EquipoPage() {
         </div>
       </div>
 
-      {/* Nota de Aislamiento Multi-tenant (docs/prototipo.html:331-333) */}
+      {/* Nota de Blindaje y Seguridad por Empresa */}
       <div>
-        <p className="lt mb-2">Aislamiento de Seguridad</p>
+        <p className="lt mb-2">Blindaje de Seguridad y Privacidad</p>
         <div className="rounded-xl border border-line bg-panel-2 p-4 text-xs leading-relaxed text-ink-2">
-          Cada cuenta es un <b>tenant</b> independiente: sus tickets, sus RFC y sus credenciales de portal viven en su propio espacio y ninguna consulta puede cruzar de una a otra (reforzado con Row-Level Security en PostgreSQL). Un usuario invitado a dos empresas cambia entre ellas con el selector de arriba a la izquierda.
+          Cada razón social cuenta con una <b>bóveda fiscal cifrada independiente</b>: sus comprobantes, constancias del SAT, RFC y credenciales de portales están estrictamente aislados con seguridad de grado bancario (Row-Level Security reforzado en base de datos). Ninguna consulta o registro puede cruzarse entre diferentes empresas. Si participas en varias razones sociales, puedes alternar entre ellas en el selector superior.
         </div>
       </div>
 
@@ -228,7 +228,7 @@ export default function EquipoPage() {
                   <option value="uploader">Sube tickets (Subir fotos y ver tickets propios)</option>
                   <option value="viewer">Solo lectura (Ver reportes y facturas)</option>
                   <option value="admin">Administrador (Gestionar equipo y datos fiscales)</option>
-                  <option value="owner">Owner (Control total del tenant)</option>
+                  <option value="owner">Owner / Titular (Control total de la empresa)</option>
                 </select>
               </label>
 

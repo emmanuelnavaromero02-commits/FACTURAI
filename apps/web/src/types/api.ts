@@ -118,6 +118,18 @@ export interface TicketResponse {
     fuente?: string;
   } | null;
   estatus_deducibilidad?: string | null;
+  score_riesgo_fiscal?: number | null;
+  auditoria_aritmetica?: {
+    es_valido_anexo_20: boolean;
+    score_matematico: number;
+    total_calculado: number;
+    total_declarado: number;
+    discrepancia: number;
+    tolerancia_permitida: number;
+    tasa_efectiva_iva?: number | null;
+    alertas?: string[];
+  } | null;
+  hash_integridad?: string | null;
   created_at: string;
 }
 

@@ -304,6 +304,9 @@ async def process_ticket_extraction(
             ticket.categoria_gasto = fiscal_res["categoria"]
             ticket.desglose_impuestos = fiscal_res["desglose_impuestos"]
             ticket.estatus_deducibilidad = fiscal_res["estatus_deducibilidad"]
+            ticket.score_riesgo_fiscal = fiscal_res.get("score_riesgo_fiscal")
+            ticket.auditoria_aritmetica = fiscal_res.get("auditoria_aritmetica")
+            ticket.hash_integridad = fiscal_res.get("hash_integridad")
         except Exception as f_err:
             logger.debug("No se pudo clasificar fiscalmente el ticket en extracción: %s", f_err)
 
@@ -737,6 +740,9 @@ async def process_ticket_facturacion(
                                 t.categoria_gasto = cfdi_fiscal["categoria"]
                                 t.desglose_impuestos = cfdi_fiscal["desglose_impuestos"]
                                 t.estatus_deducibilidad = cfdi_fiscal["estatus_deducibilidad"]
+                                t.score_riesgo_fiscal = cfdi_fiscal.get("score_riesgo_fiscal")
+                                t.auditoria_aritmetica = cfdi_fiscal.get("auditoria_aritmetica")
+                                t.hash_integridad = cfdi_fiscal.get("hash_integridad")
                             except Exception as c_err:
                                 logger.debug("Error actualizando clasificación con XML: %s", c_err)
 

@@ -287,7 +287,7 @@ export default function TicketsPage() {
             <div className="text-[10px] text-muted flex flex-wrap gap-1">
               {(t.desglose_impuestos.iva_16 ?? 0) > 0 && <span>IVA 16%</span>}
               {(t.desglose_impuestos.base_0 ?? 0) > 0 && <span>0%</span>}
-              {((t.desglose_impuestos.ieps ?? 0) > 0 || (t.desglose_impuestos.ish_local ?? 0) > 0) && (
+              {((t.desglose_impuestos.ieps ?? 0) > 0 || (t.desglose_impuestos.ish ?? 0) > 0) && (
                 <span>IEPS/ISH</span>
               )}
             </div>
@@ -295,7 +295,28 @@ export default function TicketsPage() {
         </td>
 
         <td className="px-4 py-3">
-          {getDeducibilidadBadge(t.estatus_deducibilidad)}
+          <div className="flex flex-col gap-1 items-start">
+            {getDeducibilidadBadge(t.estatus_deducibilidad)}
+            <div className="flex items-center gap-1.5 mt-0.5">
+              {t.auditoria_aritmetica?.es_valido_anexo_20 && (
+                <span className="inline-flex items-center gap-0.5 text-[10px] font-medium text-ok" title={`Score matemático Anexo 20: ${t.auditoria_aritmetica.score_matematico}/100`}>
+                  <ShieldCheck className="h-2.5 w-2.5" />
+                  <span>Anexo 20</span>
+                </span>
+              )}
+              {t.score_riesgo_fiscal !== undefined && t.score_riesgo_fiscal !== null && (
+                <span className={`inline-flex items-center px-1.5 py-0.2 text-[9px] font-semibold rounded ${
+                  t.score_riesgo_fiscal <= 25
+                    ? "bg-ok/10 text-ok"
+                    : t.score_riesgo_fiscal <= 65
+                    ? "bg-amber-500/10 text-amber-500"
+                    : "bg-bad/10 text-bad"
+                }`} title={`Riesgo Fiscal SAT Art. 69-B: ${t.score_riesgo_fiscal}/100`}>
+                  Riesgo {t.score_riesgo_fiscal <= 25 ? "Bajo" : t.score_riesgo_fiscal <= 65 ? "Medio" : "Alto"}
+                </span>
+              )}
+            </div>
+          </div>
         </td>
 
         <td className="px-4 py-3">

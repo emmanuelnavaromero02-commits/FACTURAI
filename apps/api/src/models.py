@@ -339,6 +339,11 @@ class Ticket(Base):
     desglose_impuestos: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB, nullable=True)
     estatus_deducibilidad: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
+    # Auditoría Matemática SAT Anexo 20 y Prevención de Riesgo Fiscal Art. 69-B CFF
+    score_riesgo_fiscal: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    auditoria_aritmetica: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+    hash_integridad: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
