@@ -25,7 +25,7 @@ from .base import (
     register_engine,
 )
 from .agent_brain import AgentBrain, AnthropicAgentBrain, BrowserAction
-from .captcha_solver import try_solve_captcha_autonomously
+from .captcha_solver import detect_interactive_captcha, try_solve_captcha_autonomously
 from .stealth_utils import (
     apply_stealth,
     CHROMIUM_STEALTH_ARGS,
@@ -33,6 +33,7 @@ from .stealth_utils import (
     DEFAULT_STEALTH_USER_AGENT,
     DEFAULT_STEALTH_EXTRA_HEADERS,
 )
+from ..services.merchant_learner import extract_portal_recipe_from_page, learn_merchant_recipe
 from ..services.portal_searcher import search_candidate_portal_urls, verify_portal_matches_ticket
 from ..vision.url_sanitizer import sanitize_and_classify_billing_url
 
@@ -62,8 +63,13 @@ class GenericWebEngine(FacturacionEngine):
         start_time = time.time()
         # Si el comercio tiene portal_url oficial en su config, usarlo con máxima prioridad
         merchant_url = None
-        if ctx.merchant and ctx.merchant.config and isinstance(ctx.merchant.config, dict):
-            merchant_url = ctx.merchant.config.get("url_facturacion")
+        merchant_config = (
+            ctx.merchant.config
+            if (ctx.merchant and ctx.merchant.config and isinstance(ctx.merchant.config, dict))
+            else {}
+        )
+        if merchant_config:
+            merchant_url = merchant_config.get("url_facturacion")
         raw_url = merchant_url or ticket.url_facturacion
         if not raw_url:
             return EngineResult(
@@ -101,6 +107,7 @@ class GenericWebEngine(FacturacionEngine):
         captcha_auto_intentos = 0
         human_handoff_intentado = False
         historial_resumido: List[str] = []
+        learned_recipe: Optional[Dict[str, Any]] = None
 
         await ctx.log(
             tipo="motor_generico_iniciado",
@@ -409,6 +416,84 @@ class GenericWebEngine(FacturacionEngine):
                             duracion_segundos=Decimal(str(round(time.time() - start_time, 2))),
                         )
 
+                    # Verificación proactiva de desafío interactivo / WAF en la página (evita bloqueos o esperas infinitas)
+                    detected_captcha = await detect_interactive_captcha(current_page)
+                    if detected_captcha and captcha_auto_intentos < 1:
+                        captcha_auto_intentos += 1
+                        await ctx.log(
+                            tipo="captcha_detectado",
+                            mensaje=f"Se detectó un desafío interactivo ({detected_captcha}) en el portal.",
+                            meta={"tipo": detected_captcha},
+                        )
+                        resuelto_auto = await try_solve_captcha_autonomously(current_page)
+                        if resuelto_auto:
+                            await ctx.log(
+                                tipo="captcha_auto_resuelto",
+                                mensaje=f"Desafío interactivo ({detected_captcha}) resuelto con éxito.",
+                                meta={"tipo": detected_captcha},
+                            )
+                            historial_resumido.append(f"Paso {total_pasos}: Desafío {detected_captcha} resuelto automáticamente.")
+                            await current_page.wait_for_timeout(1500)
+                            continue
+                        else:
+                            historial_resumido.append(f"Paso {total_pasos}: Desafío {detected_captcha} no resuelto en 3.5s; delegando a intervención o rechazo limpio.")
+                            if not human_handoff_intentado:
+                                human_handoff_intentado = True
+                                await ctx.log(
+                                    tipo="handoff_solicitado",
+                                    mensaje=f"El agente solicita intervención humana por: {detected_captcha}.",
+                                    meta={"motivo": detected_captcha},
+                                )
+                                try:
+                                    resuelto = await ctx.handoff.request(
+                                        motivo=detected_captcha,
+                                        page=current_page,
+                                        ctx=ctx,
+                                        submission_attempted=submission_attempted,
+                                    )
+                                    if resuelto:
+                                        await ctx.log(
+                                            tipo="handoff_resuelto",
+                                            mensaje=f"Intervención humana completada para {detected_captcha}. El agente continúa.",
+                                            meta={"motivo": detected_captcha},
+                                        )
+                                        historial_resumido.append(f"Paso {total_pasos}: Intervención humana completada ({detected_captcha}).")
+                                        await current_page.wait_for_timeout(1000)
+                                        continue
+                                except HandoffConcurrenciaExcedidaException:
+                                    return EngineResult(
+                                        ok=False,
+                                        error_code="handoff_tope_concurrencia",
+                                        mensaje=f"Tope de handoffs concurrentes alcanzado ({settings.HANDOFF_MAX_CONCURRENTES}). Ticket reencolado.",
+                                        reintentable=True,
+                                        pasos=total_pasos,
+                                        duracion_segundos=Decimal(str(round(time.time() - start_time, 2))),
+                                    )
+                                except NotImplementedError:
+                                    pass
+
+                            debug_key = await self._save_debug_screenshot(current_page, ctx, storage)
+                            return EngineResult(
+                                ok=False,
+                                error_code="captcha_requerido",
+                                mensaje=f"El portal requiere resolver un desafío interactivo ({detected_captcha}).",
+                                pasos=total_pasos,
+                                tokens_input=total_tokens_in,
+                                tokens_output=total_tokens_out,
+                                costo_usd=total_costo_usd,
+                                reintentable=True,
+                                duracion_segundos=Decimal(str(round(time.time() - start_time, 2))),
+                            )
+
+                    # Auto-aprendizaje continuo: extraer selectores y reglas de inputs si están visibles
+                    if not learned_recipe:
+                        try:
+                            num_inputs = await current_page.locator("input:visible, select:visible").count()
+                            if num_inputs >= 2:
+                                learned_recipe = await extract_portal_recipe_from_page(current_page, ticket)
+                        except Exception as exc:
+                            logger.debug("No se pudo extraer receta preliminar: %s", exc)
+
                     # Captura de pantalla ligera (JPEG quality 75, ventana deslizante)
                     try:
                         screenshot_bytes = await current_page.screenshot(
@@ -429,6 +514,7 @@ class GenericWebEngine(FacturacionEngine):
                         perfil=perfil,
                         page_url=current_page.url,
                         submission_attempted=submission_attempted,
+                        merchant_config=merchant_config,
                     )
 
                     # Contabilidad de tokens y costo
@@ -445,6 +531,13 @@ class GenericWebEngine(FacturacionEngine):
                     # CASO: FACTURADO CON ÉXITO
                     # -------------------------------------------------------
                     if decision.tipo == "facturado_success":
+                        # Auto-aprendizaje de la receta del comercio
+                        try:
+                            final_recipe = learned_recipe or await extract_portal_recipe_from_page(current_page, ticket)
+                            await learn_merchant_recipe(ticket, current_page.url, final_recipe)
+                        except Exception as learn_err:
+                            logger.debug("Error durante auto-aprendizaje de receta: %s", learn_err)
+
                         # Esperar tareas de descarga pendientes si las hubiere
                         if download_tasks:
                             await asyncio.gather(*download_tasks, return_exceptions=True)
@@ -517,12 +610,12 @@ class GenericWebEngine(FacturacionEngine):
                     if decision.tipo == "request_handoff":
                         motivo = decision.handoff_motivo or "captcha"
 
-                        # 1. Intento autónomo de resolución si es captcha (hasta 2 intentos)
-                        if motivo == "captcha" and captcha_auto_intentos < 2:
+                        # 1. Intento autónomo de resolución si es captcha (máximo 1 intento rápido)
+                        if motivo == "captcha" and captcha_auto_intentos < 1:
                             captcha_auto_intentos += 1
                             await ctx.log(
                                 tipo="captcha_auto_resolucion_intento",
-                                mensaje=f"Intentando resolver captcha automáticamente con emulación humana (intento {captcha_auto_intentos}/2)...",
+                                mensaje="Intentando resolver captcha automáticamente con emulación limpia (intento 1/1)...",
                                 meta={"intento": captcha_auto_intentos},
                             )
                             resuelto_auto = await try_solve_captcha_autonomously(current_page)
@@ -532,11 +625,11 @@ class GenericWebEngine(FacturacionEngine):
                                     mensaje="Captcha interactivo resuelto exitosamente sin intervención humana.",
                                     meta={"intento": captcha_auto_intentos},
                                 )
-                                historial_resumido.append(f"Paso {total_pasos}: Captcha resuelto automáticamente de forma humana.")
+                                historial_resumido.append(f"Paso {total_pasos}: Captcha resuelto automáticamente.")
                                 await current_page.wait_for_timeout(2000)
                                 continue
                             else:
-                                historial_resumido.append(f"Paso {total_pasos}: Intento {captcha_auto_intentos}/2 de resolución autónoma de captcha no tuvo éxito.")
+                                historial_resumido.append(f"Paso {total_pasos}: Resolución autónoma de captcha no tuvo éxito; solicitando intervención o rechazo limpio.")
 
                         # 2. Control de sesiones: No abrir sesiones repetidas si ya se intentó para este ticket
                         if human_handoff_intentado:

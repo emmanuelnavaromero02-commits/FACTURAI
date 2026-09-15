@@ -151,11 +151,21 @@ def generate_fiscal_address_variants(perfil: FiscalProfile) -> Dict[str, Any]:
     }
 
 
-def generate_ticket_candidate_variants(ticket: Ticket, perfil: FiscalProfile) -> Dict[str, Any]:
+def generate_ticket_candidate_variants(
+    ticket: Ticket,
+    perfil: FiscalProfile,
+    merchant_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Genera candidatos estructurados y variantes alternativas para que el agente
     pruebe de forma autónoma ante errores de validación de los portales.
+    Prioriza longitudes y formatos si se provee una receta aprendida del comercio.
     """
+    reglas = merchant_config.get("reglas", {}) if isinstance(merchant_config, dict) else {}
+    target_ticket_digits = reglas.get("ticket_digits")
+    target_tienda_digits = reglas.get("tienda_digits")
+    target_fecha_format = reglas.get("fecha_format")
+
     # 1. Candidatos de Folio e Identificadores del Ticket
     folios_candidatos: List[str] = []
     seen_folios = set()
@@ -186,6 +196,15 @@ def generate_ticket_candidate_variants(ticket: Ticket, perfil: FiscalProfile) ->
             # Con relleno a 16 dígitos (formato común en portales como PRB/KFC)
             if len(digits_only) < 16:
                 add_folio(digits_only.zfill(16))
+
+            # Con formato según regla aprendida del comercio (ej. 9 dígitos Alsea)
+            if target_ticket_digits:
+                td = int(target_ticket_digits)
+                if len(digits_only) < td:
+                    add_folio(digits_only.zfill(td))
+                elif len(digits_only) > td:
+                    add_folio(digits_only[:td])
+                    add_folio(digits_only[-td:])
 
         # Permutaciones de confusión OCR (térmicos/borrosos: 0/O, 1/I, 5/S, 8/B)
         for perm in generate_ocr_permutations(raw_folio):
@@ -333,6 +352,36 @@ def generate_ticket_candidate_variants(ticket: Ticket, perfil: FiscalProfile) ->
         for num in re.findall(r"\b\d{4,6}\b", ticket.sucursal):
             if num not in tienda_candidatos:
                 tienda_candidatos.append(num)
+
+    # Si hay regla aprendida de longitud de tienda (ej. 5 dígitos para Alsea)
+    if target_tienda_digits and ticket.sucursal:
+        td_digits = int(target_tienda_digits)
+        for num in re.findall(rf"\b\d{{{td_digits}}}\b", ticket.sucursal):
+            if num not in tienda_candidatos:
+                tienda_candidatos.insert(0, num)
+
+    # Priorización según reglas aprendidas del comercio
+    if target_ticket_digits:
+        td = int(target_ticket_digits)
+        folios_candidatos.sort(
+            key=lambda f: 0 if len(re.sub(r"\D", "", f)) == td else 1
+        )
+
+    if target_tienda_digits:
+        tienda_d = int(target_tienda_digits)
+        tienda_candidatos.sort(
+            key=lambda t: 0 if len(re.sub(r"\D", "", t)) == tienda_d else 1
+        )
+
+    if target_fecha_format:
+        if target_fecha_format == "dd/mm/aaaa":
+            fechas_candidatos.sort(
+                key=lambda f: 0 if "/" in f and len(f.split("/")[0]) == 2 and len(f.split("/")[-1]) == 4 else 1
+            )
+        elif target_fecha_format in ("aaaa-mm-dd", "yyyy-mm-dd"):
+            fechas_candidatos.sort(
+                key=lambda f: 0 if "-" in f and len(f.split("-")[0]) == 4 else 1
+            )
 
     return {
         "folios": folios_candidatos,

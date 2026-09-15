@@ -34,6 +34,11 @@ async def detect_interactive_captcha(page: Page) -> Optional[str]:
         if await hcaptcha_frame.count() > 0 and await hcaptcha_frame.first.is_visible():
             return "hcaptcha"
 
+        # 4. Página de desafío WAF / Cloudflare Managed Challenge
+        title = (await page.title() or "").lower()
+        if "just a moment" in title or "un momento" in title:
+            return "turnstile"
+
     except Exception as exc:
         logger.debug("Error comprobando presencia de captcha: %s", exc)
 
@@ -42,29 +47,35 @@ async def detect_interactive_captcha(page: Page) -> Optional[str]:
 
 async def try_solve_captcha_autonomously(page: Page) -> bool:
     """
-    Intenta resolver automáticamente un captcha interactivo con el contexto
-    endurecido contra detección de huella antes de recurrir al handoff.
-    Retorna True si fue resuelto exitosamente, False si requiere intervención humana.
+    Intenta resolver automáticamente un captcha interactivo con límite estricto
+    de 3.5 segundos. Si requiere rompecabezas, puzzle o desafío interactivo complejo,
+    retorna False de inmediato para no congelar el flujo y permitir un handoff/rechazo limpio.
     """
+    try:
+        return await asyncio.wait_for(_try_solve_internal(page), timeout=3.5)
+    except asyncio.TimeoutError:
+        logger.info("Resolución de captcha excedió el límite de 3.5s; delegando limpiamente a handoff o rechazo.")
+        return False
+    except Exception as exc:
+        logger.warning("Fallo durante intento de resolución autónoma de captcha: %s", exc)
+        return False
+
+
+async def _try_solve_internal(page: Page) -> bool:
     captcha_type = await detect_interactive_captcha(page)
     if not captcha_type:
         logger.info("No se detectó ningún widget de captcha explícito en la página.")
         return False
 
-    logger.info("Intentando resolver automáticamente captcha de tipo: %s con huella endurecida", captcha_type)
-
-    # Asegurar que el contexto del navegador tenga la evasión activa
+    logger.info("Intentando resolver automáticamente captcha de tipo: %s con huella limpia", captcha_type)
     await apply_stealth(page)
 
-    try:
-        if captcha_type == "turnstile":
-            return await _solve_turnstile(page)
-        elif captcha_type == "recaptcha":
-            return await _solve_recaptcha(page)
-        elif captcha_type == "hcaptcha":
-            return await _solve_hcaptcha(page)
-    except Exception as exc:
-        logger.warning("Fallo durante intento de resolución autónoma de %s: %s", captcha_type, exc)
+    if captcha_type == "turnstile":
+        return await _solve_turnstile(page)
+    elif captcha_type == "recaptcha":
+        return await _solve_recaptcha(page)
+    elif captcha_type == "hcaptcha":
+        return await _solve_hcaptcha(page)
 
     return False
 
@@ -79,9 +90,9 @@ async def _solve_turnstile(page: Page) -> bool:
     checkbox = frame.locator('input[type="checkbox"], .ctp-checkbox-label, #challenge-stage, body').first
 
     if await checkbox.count() > 0:
-        await checkbox.click(timeout=4000)
-        # Esperar resolución de validación de Cloudflare
-        for _ in range(8):
+        await checkbox.click(timeout=2000)
+        # Esperar resolución rápida (máx 2s)
+        for _ in range(4):
             await page.wait_for_timeout(500)
             token_val = await page.evaluate("""() => {
                 const inp = document.querySelector('input[name="cf-turnstile-response"], input[name="turnstile-response"]');
