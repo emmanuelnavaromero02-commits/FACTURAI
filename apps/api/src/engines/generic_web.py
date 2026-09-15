@@ -26,6 +26,12 @@ from .base import (
 )
 from .agent_brain import AgentBrain, AnthropicAgentBrain, BrowserAction
 from .captcha_solver import try_solve_captcha_autonomously
+from .stealth_utils import (
+    apply_stealth,
+    CHROMIUM_STEALTH_ARGS,
+    DEFAULT_STEALTH_VIEWPORT,
+    DEFAULT_STEALTH_USER_AGENT,
+)
 from ..services.portal_searcher import search_candidate_portal_urls, verify_portal_matches_ticket
 
 logger = logging.getLogger(__name__)
@@ -101,22 +107,18 @@ class GenericWebEngine(FacturacionEngine):
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
                     headless=True,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--disable-dev-shm-usage",
-                        "--no-sandbox",
-                    ],
+                    args=CHROMIUM_STEALTH_ARGS,
                 )
                 context: BrowserContext = await browser.new_context(
-                    viewport={"width": 1280, "height": 800},
-                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                    viewport=DEFAULT_STEALTH_VIEWPORT,
+                    user_agent=DEFAULT_STEALTH_USER_AGENT,
+                    locale="es-MX",
+                    timezone_id="America/Mexico_City",
+                    permissions=["geolocation", "notifications"],
+                    color_scheme="light",
                     accept_downloads=True,
                 )
-                await context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    });
-                """)
+                await apply_stealth(context)
 
                 active_pages: List[Page] = []
                 download_tasks: List[asyncio.Task] = []
@@ -300,6 +302,8 @@ class GenericWebEngine(FacturacionEngine):
                 # Bucle del Agente
                 while True:
                     total_pasos += 1
+                    # Obtener la página activa más reciente (por si se abrió target="_blank")
+                    current_page = active_pages[-1] if active_pages else page
 
                     # 1. Comprobar tope de pasos
                     if total_pasos > settings.PASOS_MAXIMOS_AGENTE:
@@ -322,31 +326,27 @@ class GenericWebEngine(FacturacionEngine):
                         )
 
                     # 2. Comprobar tope de costo (Decimal)
-                    if pricing and total_costo_usd is not None:
-                        if total_costo_usd >= settings.COSTO_MAXIMO_POR_TICKET_USD:
-                            debug_key = await self._save_debug_screenshot(current_page, ctx, storage)
-                            error_code = "entrega_no_confirmada" if submission_attempted else "agente_costo_excedido"
-                            mensaje = (
-                                "Se envió la factura pero se alcanzó el tope de costo antes de confirmar el CFDI."
-                                if submission_attempted
-                                else (
-                                    f"El agente alcanzó el tope de costo permitido (${settings.COSTO_MAXIMO_POR_TICKET_USD} USD). "
-                                    f"Gasto acumulado: ${total_costo_usd} USD."
-                                )
+                    if pricing and total_costo_usd is not None and total_costo_usd >= settings.COSTO_MAXIMO_POR_TICKET_USD:
+                        debug_key = await self._save_debug_screenshot(current_page, ctx, storage)
+                        error_code = "entrega_no_confirmada" if submission_attempted else "agente_costo_excedido"
+                        mensaje = (
+                            "Se envió la factura pero se alcanzó el tope de costo antes de confirmar el CFDI."
+                            if submission_attempted
+                            else (
+                                f"El agente alcanzó el tope de costo permitido (${settings.COSTO_MAXIMO_POR_TICKET_USD} USD). "
+                                f"Gasto acumulado: ${total_costo_usd} USD."
                             )
-                            return EngineResult(
-                                ok=False,
-                                error_code=error_code,
-                                mensaje=mensaje,
-                                pasos=total_pasos,
-                                tokens_input=total_tokens_in,
-                                tokens_output=total_tokens_out,
-                                costo_usd=total_costo_usd,
-                                duracion_segundos=Decimal(str(round(time.time() - start_time, 2))),
-                            )
-
-                    # Obtener la página activa más reciente (por si se abrió target="_blank")
-                    current_page = active_pages[-1] if active_pages else page
+                        )
+                        return EngineResult(
+                            ok=False,
+                            error_code=error_code,
+                            mensaje=mensaje,
+                            pasos=total_pasos,
+                            tokens_input=total_tokens_in,
+                            tokens_output=total_tokens_out,
+                            costo_usd=total_costo_usd,
+                            duracion_segundos=Decimal(str(round(time.time() - start_time, 2))),
+                        )
 
                     # Comprobar error terminal detectado por diálogo nativo del portal
                     if detected_terminal_error:

@@ -1,9 +1,10 @@
 import asyncio
 import logging
-import random
 from typing import Optional
 
-from playwright.async_api import FrameLocator, Page
+from playwright.async_api import Page
+
+from .stealth_utils import apply_stealth
 
 logger = logging.getLogger(__name__)
 
@@ -41,16 +42,19 @@ async def detect_interactive_captcha(page: Page) -> Optional[str]:
 
 async def try_solve_captcha_autonomously(page: Page) -> bool:
     """
-    Intenta resolver automáticamente un captcha interactivo mediante
-    emulación de movimientos y comportamiento humano antes de recurrir al handoff.
-    Retorna True si fue resuelto exitosamente, False si no pudo resolverse.
+    Intenta resolver automáticamente un captcha interactivo con el contexto
+    endurecido contra detección de huella antes de recurrir al handoff.
+    Retorna True si fue resuelto exitosamente, False si requiere intervención humana.
     """
     captcha_type = await detect_interactive_captcha(page)
     if not captcha_type:
         logger.info("No se detectó ningún widget de captcha explícito en la página.")
         return False
 
-    logger.info("Intentando resolver automáticamente captcha de tipo: %s", captcha_type)
+    logger.info("Intentando resolver automáticamente captcha de tipo: %s con huella endurecida", captcha_type)
+
+    # Asegurar que el contexto del navegador tenga la evasión activa
+    await apply_stealth(page)
 
     try:
         if captcha_type == "turnstile":
@@ -65,34 +69,8 @@ async def try_solve_captcha_autonomously(page: Page) -> bool:
     return False
 
 
-async def _human_click_locator(page: Page, locator) -> None:
-    """
-    Mueve el ratón suavemente hacia el elemento simulando aceleración biológica
-    y hace clic tras una pausa natural.
-    """
-    box = await locator.bounding_box()
-    if not box:
-        # Fallback al click directo de Playwright
-        await locator.click()
-        return
-
-    # Punto objetivo con ligera variación aleatoria respecto al centro
-    target_x = box["x"] + box["width"] / 2 + random.uniform(-3, 3)
-    target_y = box["y"] + box["height"] / 2 + random.uniform(-2, 2)
-
-    # Movimiento fluido en pasos
-    steps = random.randint(12, 22)
-    await page.mouse.move(target_x, target_y, steps=steps)
-
-    # Pausa humana antes de presionar
-    await asyncio.sleep(random.uniform(0.35, 0.70))
-    await page.mouse.down()
-    await asyncio.sleep(random.uniform(0.07, 0.15))
-    await page.mouse.up()
-
-
 async def _solve_turnstile(page: Page) -> bool:
-    """Emula la interacción con Cloudflare Turnstile."""
+    """Interactúa con Cloudflare Turnstile con huella de navegador limpia."""
     iframe_loc = page.locator('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]').first
     if not await iframe_loc.is_visible():
         return False
@@ -101,7 +79,7 @@ async def _solve_turnstile(page: Page) -> bool:
     checkbox = frame.locator('input[type="checkbox"], .ctp-checkbox-label, #challenge-stage, body').first
 
     if await checkbox.count() > 0:
-        await _human_click_locator(page, checkbox)
+        await checkbox.click(timeout=4000)
         # Esperar resolución de validación de Cloudflare
         for _ in range(8):
             await page.wait_for_timeout(500)
@@ -113,7 +91,7 @@ async def _solve_turnstile(page: Page) -> bool:
                 logger.info("Cloudflare Turnstile resuelto con éxito (token generado).")
                 return True
 
-            # O verificar si el iframe desapareció o cambió de estado a checked
+            # Si el iframe desapareció o completó el challenge
             if not await iframe_loc.is_visible():
                 logger.info("Cloudflare Turnstile resuelto (desafío completado y cerrado).")
                 return True
@@ -122,7 +100,7 @@ async def _solve_turnstile(page: Page) -> bool:
 
 
 async def _solve_recaptcha(page: Page) -> bool:
-    """Emula la interacción con Google reCAPTCHA v2 (checkbox)."""
+    """Interactúa con Google reCAPTCHA v2 (checkbox) con huella limpia."""
     iframe_loc = page.locator('iframe[src*="recaptcha/api2/anchor"], iframe[src*="google.com/recaptcha"]').first
     if not await iframe_loc.is_visible():
         return False
@@ -131,8 +109,14 @@ async def _solve_recaptcha(page: Page) -> bool:
     anchor = frame.locator('#recaptcha-anchor, .recaptcha-checkbox-border').first
 
     if await anchor.count() > 0:
-        await _human_click_locator(page, anchor)
-        await page.wait_for_timeout(2500)
+        await anchor.click(timeout=4000)
+        await page.wait_for_timeout(2000)
+
+        # Si se abrió el iframe de desafío de imágenes complejas (bframe), delegar de inmediato a handoff
+        bframe = page.locator('iframe[src*="recaptcha/api2/bframe"]')
+        if await bframe.count() > 0 and await bframe.first.is_visible():
+            logger.info("reCAPTCHA abrió desafío de imágenes; requiere intervención humana.")
+            return False
 
         # Verificar si quedó marcado con checkmark
         is_checked = await anchor.get_attribute("aria-checked")
@@ -149,17 +133,11 @@ async def _solve_recaptcha(page: Page) -> bool:
             logger.info("Google reCAPTCHA v2 resuelto (token generado en g-recaptcha-response).")
             return True
 
-        # Si se abrió el iframe de desafío de imágenes (bframe), no se pudo resolver con checkbox
-        bframe = page.locator('iframe[src*="recaptcha/api2/bframe"]')
-        if await bframe.count() > 0 and await bframe.first.is_visible():
-            logger.info("reCAPTCHA abrió desafío de imágenes complejas; requiere intervención humana.")
-            return False
-
     return False
 
 
 async def _solve_hcaptcha(page: Page) -> bool:
-    """Emula la interacción con hCaptcha."""
+    """Interactúa con hCaptcha."""
     iframe_loc = page.locator('iframe[src*="hcaptcha.com"]').first
     if not await iframe_loc.is_visible():
         return False
@@ -168,8 +146,8 @@ async def _solve_hcaptcha(page: Page) -> bool:
     checkbox = frame.locator('#checkbox').first
 
     if await checkbox.count() > 0:
-        await _human_click_locator(page, checkbox)
-        await page.wait_for_timeout(2500)
+        await checkbox.click(timeout=4000)
+        await page.wait_for_timeout(2000)
 
         is_checked = await checkbox.get_attribute("aria-checked")
         if is_checked == "true":

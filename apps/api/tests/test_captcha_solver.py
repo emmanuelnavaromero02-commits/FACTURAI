@@ -1,5 +1,6 @@
 import pytest
 from playwright.async_api import async_playwright
+
 from src.engines.captcha_solver import (
     detect_interactive_captcha,
     try_solve_captcha_autonomously,
@@ -61,3 +62,43 @@ async def test_detect_recaptcha():
         detected = await detect_interactive_captcha(page)
         assert detected == "recaptcha"
         await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_stealth_fingerprint_evasion():
+    """Verifica que el entorno stealth oculte automatización y configure huellas reales."""
+    from src.engines.stealth_utils import (
+        CHROMIUM_STEALTH_ARGS,
+        DEFAULT_STEALTH_USER_AGENT,
+        DEFAULT_STEALTH_VIEWPORT,
+        apply_stealth,
+    )
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=CHROMIUM_STEALTH_ARGS,
+        )
+        context = await browser.new_context(
+            viewport=DEFAULT_STEALTH_VIEWPORT,
+            user_agent=DEFAULT_STEALTH_USER_AGENT,
+        )
+        await apply_stealth(context)
+        page = await context.new_page()
+
+        res = await page.evaluate("""() => ({
+            webdriver: navigator.webdriver,
+            hasOwnWebdriver: Object.prototype.hasOwnProperty.call(navigator, 'webdriver'),
+            hasChrome: !!window.chrome,
+            pluginsLen: navigator.plugins ? navigator.plugins.length : 0,
+            mimeTypesLen: navigator.mimeTypes ? navigator.mimeTypes.length : 0
+        })""")
+
+        assert res["webdriver"] is False
+        assert res["hasOwnWebdriver"] is False
+        assert res["hasChrome"] is True
+        assert res["pluginsLen"] > 0
+        assert res["mimeTypesLen"] > 0
+
+        await browser.close()
+
