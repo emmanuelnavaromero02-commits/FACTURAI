@@ -51,7 +51,7 @@ OFFICIAL_MERCHANTS: List[Dict[str, Any]] = [
         "tipo_motor": "web",
         "engine_slug": "generico-web",
         "config": {
-            "url_facturacion": "https://facturacion.alsea.com.mx",
+            "url_facturacion": "https://alsea.interfactura.com",
             "portal_nombre": "Portal Unificado Alsea",
             "campos_requeridos": ["ticket", "tienda", "fecha", "total", "rfc"],
             "marcas": ["Domino's Pizza", "Starbucks", "Vips", "Burger King", "Italianni's", "Chili's"],

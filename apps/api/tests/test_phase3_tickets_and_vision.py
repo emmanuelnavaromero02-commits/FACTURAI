@@ -495,7 +495,7 @@ async def test_thermal_wrinkled_ticket_and_enhancement(owner_session: AsyncSessi
         "arrugado_con_web_id",
         VisionExtractionSchema(
             comercio="Dominos Pizza",
-            url_facturacion="https://facturacion.alsea.com.mx",
+            url_facturacion="https://alsea.interfactura.com",
             folio=None,
             web_id="WID-ALSEA-998877",
             total="340.00",

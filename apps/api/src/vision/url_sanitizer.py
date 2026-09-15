@@ -48,7 +48,7 @@ def sanitize_and_classify_billing_url(raw_url: Optional[str]) -> Optional[str]:
 
     # 2. Mapeo de portales conocidos donde el ticket imprime el sitio web general en vez del portal de facturación
     if host in (
-        "alsea.com.mx", "www.alsea.com.mx", "facturacion.alsea.com.mx",
+        "alsea.com.mx", "www.alsea.com.mx", "facturacion.alsea.com.mx", "alsea.interfactura.com",
         "dominos.com.mx", "www.dominos.com.mx",
         "starbucks.com.mx", "www.starbucks.com.mx",
         "burgerking.com.mx", "www.burgerking.com.mx",
@@ -56,7 +56,7 @@ def sanitize_and_classify_billing_url(raw_url: Optional[str]) -> Optional[str]:
         "italiannis.com.mx", "www.italiannis.com.mx",
         "chilis.com.mx", "www.chilis.com.mx",
     ):
-        return "https://facturacion.alsea.com.mx"
+        return "https://alsea.interfactura.com"
 
     if host in ("kfc.com.mx", "www.kfc.com.mx", "facturacion.prb.com.mx"):
         return "https://facturacion.prb.com.mx:444/index.jsp"

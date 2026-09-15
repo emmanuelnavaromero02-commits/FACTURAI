@@ -84,7 +84,6 @@ async def search_candidate_portal_urls(
 
     # Alsea (Domino's, Starbucks, Burger King, Vips, Italianni's, Chili's)
     if any(k in term_lower or k in url_lower for k in ("domino", "starbucks", "alsea", "vips", "burger king", "italianni", "chili")) or rfc_clean in ("OFA9210138U1", "CGI930623RH5", "OVI961128795", "BKM911204853"):
-        add_cand("https://facturacion.alsea.com.mx")
         add_cand("https://alsea.interfactura.com")
 
     # PRB (KFC, Pizza Hut)

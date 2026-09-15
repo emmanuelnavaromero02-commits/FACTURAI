@@ -31,6 +31,7 @@ from .stealth_utils import (
     CHROMIUM_STEALTH_ARGS,
     DEFAULT_STEALTH_VIEWPORT,
     DEFAULT_STEALTH_USER_AGENT,
+    DEFAULT_STEALTH_EXTRA_HEADERS,
 )
 from ..services.portal_searcher import search_candidate_portal_urls, verify_portal_matches_ticket
 
@@ -112,6 +113,7 @@ class GenericWebEngine(FacturacionEngine):
                 context: BrowserContext = await browser.new_context(
                     viewport=DEFAULT_STEALTH_VIEWPORT,
                     user_agent=DEFAULT_STEALTH_USER_AGENT,
+                    extra_http_headers=DEFAULT_STEALTH_EXTRA_HEADERS,
                     locale="es-MX",
                     timezone_id="America/Mexico_City",
                     permissions=["geolocation", "notifications"],
@@ -202,11 +204,16 @@ class GenericWebEngine(FacturacionEngine):
                 page = await context.new_page()
                 handle_new_page(page)
 
-                # Navegar al portal inicial
+                # Navegar al portal inicial con tolerancia a CDNs lentos o páginas pesadas
                 portal_valido = False
                 try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                    await page.wait_for_timeout(1000)
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=12000)
+                        await page.wait_for_timeout(1000)
+                    except Exception:
+                        # Fallback con 'commit' para portales pesados o con CDNs externos que no disparan domcontentloaded a tiempo
+                        await page.goto(url, wait_until="commit", timeout=15000)
+                        await page.wait_for_timeout(3000)
 
                     # Si el portal ya disparó un diálogo de error terminal (ej. alert("El ticket ya se encuentra facturado."))
                     if detected_terminal_error:
@@ -225,14 +232,31 @@ class GenericWebEngine(FacturacionEngine):
 
                     is_local_test = "127.0.0.1" in url_lower or "localhost" in url_lower or "testserver" in url_lower
 
-                    is_food_or_cinema_shop = any(
-                        term in body_lower
-                        for term in ("pedir en línea", "ordena ahora", "tu carrito", "selecciona tu pizza", "ver cartelera", "horarios y boletos", "agrega al carrito")
-                    )
-
-                    if is_local_test:
+                    # Soporte unificado para Alsea Interfactura (Domino's, Starbucks, Burger King, Chili's, etc.)
+                    if "alsea.interfactura.com" in url_lower:
+                        comercio_str = ((ticket.extracted.get("comercio") if ticket.extracted else "") or ticket.sucursal or "").lower()
+                        brand_selectors = [
+                            ("domino", "img[src*='logo_dominos']"),
+                            ("starbucks", "img[src*='logo_starbucks']"),
+                            ("burger", "img[src*='logo_burgerking']"),
+                            ("chili", "img[src*='logo_chilis']"),
+                            ("italianni", "img[src*='logo_italiannis']"),
+                            ("vips", "img[src*='logo_vips']"),
+                            ("chang", "img[src*='logo_pfchangs']"),
+                            ("cheesecake", "img[src*='logo_cheesecake']"),
+                        ]
+                        for brand_key, brand_sel in brand_selectors:
+                            if brand_key in comercio_str:
+                                brand_loc = page.locator(brand_sel).first
+                                if await brand_loc.count() > 0 and await brand_loc.is_visible():
+                                    logger.info("Portal Alsea detectado: seleccionando marca %s (%s)...", brand_key, brand_sel)
+                                    await brand_loc.click(timeout=6000)
+                                    await page.wait_for_timeout(3000)
+                                    break
                         portal_valido = True
-                    elif is_food_or_cinema_shop:
+                    elif is_local_test:
+                        portal_valido = True
+                    elif any(term in body_lower for term in ("pedir en línea", "ordena ahora", "tu carrito", "selecciona tu pizza", "ver cartelera", "horarios y boletos", "agrega al carrito")):
                         # Si es una portada de tienda de comida/cartelera (ej. dominos.com.mx), buscar enlace directo hacia 'Facturación'
                         factura_links = page.locator(
                             "a[href*='factur' i], a:has-text('Facturación'), a:has-text('Facturacion'), a:has-text('Factura tu ticket'), a:has-text('Factura electrónica')"
@@ -273,8 +297,12 @@ class GenericWebEngine(FacturacionEngine):
                             continue
                         logger.info("Probando portal descubierto: %s", cand_url)
                         try:
-                            await page.goto(cand_url, wait_until="domcontentloaded", timeout=20000)
-                            await page.wait_for_timeout(1000)
+                            try:
+                                await page.goto(cand_url, wait_until="domcontentloaded", timeout=12000)
+                                await page.wait_for_timeout(1000)
+                            except Exception:
+                                await page.goto(cand_url, wait_until="commit", timeout=15000)
+                                await page.wait_for_timeout(2500)
                             if await verify_portal_matches_ticket(page, ticket):
                                 url = cand_url
                                 portal_valido = True
