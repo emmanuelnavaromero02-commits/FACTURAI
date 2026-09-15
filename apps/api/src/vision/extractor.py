@@ -202,8 +202,10 @@ REGLAS DE EXTRACCIÓN Y RECUPERACIÓN ANTE TICKETS ARRUGADOS O BORROSOS:
 5. CONFIANZA:
    - 0.85 a 1.0: Ticket nítido con folio, total y comercio claros.
    - 0.60 a 0.84: Ticket algo arrugado, descolorido o con texto tenue, pero donde el total y al menos un número identificador (folio/ticket/web_id) son legibles.
-   - < 0.60: Imagen severamente borrosa, cortada o donde ni el total ni ningún número de folio son discernibles.
+   - < 0.60: Imagen severamente borrosa, cortada o donde ni el total ni ningún número de folio son discernibles con certeza.
 6. FORMATO DE IMPORTES: "total", "subtotal" e "iva" deben ser números limpios sin '$' ni comas (ej. "250.50").
+7. ESTRICTA PROHIBICIÓN DE ADIVINAR O ALUCINAR DÍGITOS:
+   Si un número de folio o monto está parcialmente borroso, cubierto por una arruga o manchado de modo que no puedas distinguir con certeza cada dígito, NO intentes inventar números. Coloca null o caracteres de duda ('?') y asigna una confianza < 0.60. En facturación electrónica mexicana ante el SAT, un dígito malinterpretado invalida la emisión o puede timbrar el consumo de otra persona. Es mil veces preferible reportar la imagen como ilegible para pedir una foto nítida que inventar datos fiscales.
 """
 
 

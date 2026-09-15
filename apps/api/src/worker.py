@@ -209,11 +209,21 @@ async def process_ticket_extraction(
     fecha_norm = normalize_date(extracted.fecha)
     hora_norm = normalize_time(extracted.hora)
 
-    # 6. Regla 5 del worker: verificar legibilidad y completitud
+    # Validación estricta anti-malinterpretación para tickets arrugados o borrosos:
+    # Si el folio contiene signos de interrogación, asteriscos, puntos suspensivos o longitud inválida
+    folio_dudoso = False
+    if extracted.folio:
+        cleaned_f = extracted.folio.strip()
+        if any(c in cleaned_f for c in ("?", "*", "...", "xxx", "XXX")) or len(cleaned_f) < 2:
+            folio_dudoso = True
+
+    # 6. Regla 5 del worker: verificar legibilidad y completitud sin malinterpretar
     es_ilegible = (
         extracted.confianza < 0.6
         or not extracted.folio
+        or folio_dudoso
         or total_norm is None
+        or (total_norm is not None and total_norm <= 0)
     )
 
     # 7. Limpieza de URLs y discriminación de QR del SAT

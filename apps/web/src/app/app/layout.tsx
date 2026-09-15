@@ -28,14 +28,14 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   const [newTenantName, setNewTenantName] = useState("");
   const [creatingTenant, setCreatingTenant] = useState(false);
 
-  // Redirigir a login si no hay sesión
+  // Redirigir a login si no hay sesión activa
   React.useEffect(() => {
     if (!loading && !user) {
-      router.replace("/login");
+      window.location.href = "/login";
     }
-  }, [user, loading, router]);
+  }, [user, loading]);
 
-  if (loading || !user) {
+  if (loading) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-bg">
         <div className="flex flex-col items-center gap-3">
@@ -43,6 +43,25 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
           <span className="text-xs font-semibold uppercase tracking-widest text-muted">
             Cargando sesión...
           </span>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-bg p-4">
+        <div className="flex flex-col items-center gap-3 text-center max-w-sm rounded-2xl border border-line bg-panel p-6 shadow-sm">
+          <span className="text-sm font-bold text-ink">Sesión requerida</span>
+          <p className="text-xs text-muted">
+            No se detectó una sesión activa en este navegador. Redirigiendo a inicio de sesión...
+          </p>
+          <a
+            href="/login"
+            className="mt-2 rounded-xl bg-brand px-4 py-2 text-xs font-bold text-on-brand shadow hover:brightness-105 transition"
+          >
+            Iniciar sesión ahora
+          </a>
         </div>
       </div>
     );
