@@ -378,6 +378,41 @@ OFFICIAL_MERCHANTS: List[Dict[str, Any]] = [
         "activo": True,
         "entrega_esperada": "emisor",
     },
+    {
+        "slug": "g500",
+        "nombre": "G500 Network (Gasolineras G500)",
+        "patrones": [
+            "g500",
+            "g-500",
+            "gasolinera g500",
+            "g500 network",
+            "servicio fento",
+            "GNE140618767",
+            "SFE960528D79",
+            "g500network.com",
+            "g500facturagas",
+        ],
+        "tipo_motor": "web",
+        "engine_slug": "generico-web",
+        "config": {
+            "portal_nombre": "Portal G500 / FacturaGAS",
+            "campos_requeridos": ["folio", "web_id"],
+        },
+        "requiere_captcha": False,
+        "activo": True,
+        "entrega_esperada": "emisor",
+    },
+    {
+        "slug": "generico-web",
+        "nombre": "Portal Web Genérico",
+        "patrones": ["generico", "web", "portal"],
+        "tipo_motor": "web",
+        "engine_slug": "generico-web",
+        "config": {},
+        "requiere_captcha": False,
+        "activo": True,
+        "entrega_esperada": "indiferente",
+    },
 ]
 
 

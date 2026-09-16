@@ -501,6 +501,30 @@ class GenericWebEngine(FacturacionEngine):
                                 duracion_segundos=Decimal(str(round(time.time() - start_time, 2))),
                             )
 
+                    # Verificación proactiva de modo invitado / facturar sin cuenta (Prioridad 1)
+                    if total_pasos == 1 and not ctx.credenciales:
+                        try:
+                            guest_loc = current_page.locator(
+                                "a:has-text('Facturación sin usuario'), button:has-text('Facturación sin usuario'), "
+                                "a:has-text('Facturar sin cuenta'), button:has-text('Facturar sin cuenta'), "
+                                "a:has-text('Continuar como invitado'), button:has-text('Continuar como invitado'), "
+                                "a:has-text('Facturar sin registrarse'), button:has-text('Facturar sin registrarse')"
+                            ).first
+                            if await guest_loc.is_visible(timeout=800):
+                                txt = (await guest_loc.inner_text()).strip()
+                                logger.info("Modo invitado/express detectado proactivamente: '%s'. Avanzando sin requerir login...", txt)
+                                await ctx.log(
+                                    tipo="modo_invitado_detectado",
+                                    mensaje=f"Detectada opción '{txt}'. Ingresando por vía express sin registro.",
+                                    meta={"opcion": txt},
+                                )
+                                await guest_loc.click(timeout=4000)
+                                await current_page.wait_for_timeout(1500)
+                                historial_resumido.append(f"Paso {total_pasos}: Se seleccionó automáticamente '{txt}' para facturar sin cuenta.")
+                                continue
+                        except Exception as guest_err:
+                            logger.debug("Omitiendo clic proactivo de modo invitado: %s", guest_err)
+
                     # Auto-aprendizaje continuo: extraer selectores y reglas de inputs si están visibles
                     if not learned_recipe:
                         try:
@@ -531,6 +555,7 @@ class GenericWebEngine(FacturacionEngine):
                         page_url=current_page.url,
                         submission_attempted=submission_attempted,
                         merchant_config=merchant_config,
+                        credenciales=ctx.credenciales,
                     )
 
                     # Contabilidad de tokens y costo

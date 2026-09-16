@@ -637,6 +637,44 @@ async def process_ticket_facturacion(
                         )
                     return
 
+        if not merchant:
+            # Intentar asociar a un comercio oficial por RFC, URL o nombre
+            async with sin_tenant() as global_session:
+                if rfc_emisor:
+                    m_rfc = await global_session.execute(
+                        select(Merchant).where(Merchant.rfc == rfc_emisor)
+                    )
+                    merchant = m_rfc.scalars().first()
+                if not merchant and url_facturacion:
+                    url_lower = url_facturacion.lower()
+                    if "g500" in url_lower:
+                        m_g500 = await global_session.execute(
+                            select(Merchant).where(Merchant.slug == "g500")
+                        )
+                        merchant = m_g500.scalars().first()
+                    elif "alsea" in url_lower or "interfactura" in url_lower:
+                        m_alsea = await global_session.execute(
+                            select(Merchant).where(Merchant.slug == "alsea")
+                        )
+                        merchant = m_alsea.scalars().first()
+                if not merchant and extracted_data and extracted_data.get("comercio"):
+                    c_name = str(extracted_data["comercio"]).lower()
+                    if "g500" in c_name or "g-500" in c_name or "fento" in c_name:
+                        m_g500 = await global_session.execute(
+                            select(Merchant).where(Merchant.slug == "g500")
+                        )
+                        merchant = m_g500.scalars().first()
+
+            if merchant:
+                merchant_id = merchant.id
+                async with tenant_session(tenant_id) as session:
+                    t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                    t = t_res.scalar_one_or_none()
+                    if t:
+                        t.merchant_id = merchant.id
+                        await session.commit()
+                logger.info("Comercio %s (%s) asociado automáticamente al ticket %s", merchant.nombre, merchant.slug, ticket_id)
+
         # Validación previa de entrega por emisor (Corrección B):
         # Si el comercio entrega por emisor y no hay email configurado, el motor NO se ejecuta
         if merchant and merchant.entrega_esperada == "emisor" and not (perfil_fiscal.email_receptor and perfil_fiscal.email_receptor.strip()):
@@ -661,14 +699,24 @@ async def process_ticket_facturacion(
                 )
             return
 
-        # Descifrar credenciales si existen
+        # Descifrar credenciales si existen (comercio específico o genérico web)
         credenciales = None
+        target_merchant_ids = []
         if merchant_id:
-            async with tenant_session(tenant_id) as session:
+            target_merchant_ids.append(merchant_id)
+
+        async with sin_tenant() as global_session:
+            gw_res = await global_session.execute(select(Merchant.id).where(Merchant.slug == "generico-web"))
+            gw_id = gw_res.scalar_one_or_none()
+            if gw_id and gw_id not in target_merchant_ids:
+                target_merchant_ids.append(gw_id)
+
+        async with tenant_session(tenant_id) as session:
+            for m_id in target_merchant_ids:
                 c_res = await session.execute(
                     select(MerchantCredential).where(
                         MerchantCredential.tenant_id == tenant_id,
-                        MerchantCredential.merchant_id == merchant_id,
+                        MerchantCredential.merchant_id == m_id,
                     )
                 )
                 cred = c_res.scalar_one_or_none()
@@ -676,8 +724,11 @@ async def process_ticket_facturacion(
                     try:
                         plain_bytes = decrypt_credentials(tenant_id, cred.payload_enc, cred.nonce)
                         credenciales = json.loads(plain_bytes.decode("utf-8"))
+                        if credenciales:
+                            logger.info("Credenciales cargadas y descifradas con éxito para merchant_id %s", m_id)
+                            break
                     except Exception as dec_err:
-                        logger.error("Error descifrando credenciales para merchant %s: %s", merchant_id, dec_err)
+                        logger.error("Error descifrando credenciales para merchant %s: %s", m_id, dec_err)
 
         # Resolver motor registrado (si no hay comercio, se usa generico-web por defecto)
         engine_slug = merchant.engine_slug if merchant else "generico-web"

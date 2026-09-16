@@ -12,15 +12,17 @@ from sqlalchemy import delete, select
 
 from ..auth import sign_session_token
 
-from ..db import tenant_session
+from ..db import tenant_session, sin_tenant
 from ..deps import TenantContext, get_tenant_context
 from ..errors import (
+    AppException,
     CfdiExpiradoException,
     MaximoIntentosExcedidoException,
     RecursoNoEncontradoException,
     ReintentoInvalidoException,
 )
-from ..models import FiscalProfile, Merchant, Ticket, TicketEstado, TicketEvent
+from ..models import FiscalProfile, Merchant, MerchantCredential, Ticket, TicketEstado, TicketEvent
+from ..security import encrypt_credentials
 from ..services.cfdi_storage import get_cfdi_storage
 from ..services.fiscal_classifier import analyze_fiscal_classification, parse_cfdi_tax_breakdown
 from ..services.queue import enqueue_ticket_extraction, enqueue_ticket_facturacion
@@ -681,6 +683,105 @@ async def deduce_ticket_portal_endpoint(
             "deduced_url": deduced,
             "url_facturacion_actual": ticket.url_facturacion,
         }
+
+
+class TicketCredentialsRequest(BaseModel):
+    usuario: str
+    password: str
+    merchant_id: Optional[uuid.UUID] = None
+    facturar_ahora: bool = True
+
+
+@router.post("/{ticket_id}/credentials", response_model=TicketResponse)
+async def set_ticket_credentials_and_enqueue(
+    ticket_id: uuid.UUID,
+    payload: TicketCredentialsRequest,
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Guarda las credenciales de acceso para el portal/comercio asociado a este ticket
+    y opcionalmente encola la facturación para reintento inmediato.
+    """
+    should_enqueue = False
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        res = await session.execute(
+            select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
+        )
+        ticket = res.scalar_one_or_none()
+        if not ticket:
+            raise RecursoNoEncontradoException(f"Ticket {ticket_id} no encontrado.")
+
+        target_merchant_id = payload.merchant_id or ticket.merchant_id
+        if not target_merchant_id:
+            # Deducir merchant a partir de URL, rfc_emisor o slug
+            async with sin_tenant() as global_session:
+                url_str = (ticket.url_facturacion or "").lower()
+                com_str = (ticket.extracted.get("comercio") or "").lower() if ticket.extracted else ""
+                if "g500" in url_str or "g500" in com_str or "fento" in com_str:
+                    m_res = await global_session.execute(select(Merchant.id).where(Merchant.slug == "g500"))
+                    target_merchant_id = m_res.scalar_one_or_none()
+                elif "alsea" in url_str or "interfactura" in url_str or "dominos" in url_str:
+                    m_res = await global_session.execute(select(Merchant.id).where(Merchant.slug == "alsea"))
+                    target_merchant_id = m_res.scalar_one_or_none()
+
+                if not target_merchant_id:
+                    m_res = await global_session.execute(select(Merchant.id).where(Merchant.slug == "generico-web"))
+                    target_merchant_id = m_res.scalar_one_or_none()
+
+        if not target_merchant_id:
+            raise AppException(status_code=400, code="merchant_no_resuelto", message="No se pudo asociar un comercio para guardar las credenciales.")
+
+        # Asociar merchant al ticket si aún no lo tenía
+        if not ticket.merchant_id:
+            ticket.merchant_id = target_merchant_id
+
+        # Cifrar credenciales con clave derivada del tenant (AES-256-GCM)
+        cred_dict = {"usuario": payload.usuario.strip(), "password": payload.password.strip()}
+        payload_enc, nonce = encrypt_credentials(ctx.tenant_id, json.dumps(cred_dict).encode("utf-8"))
+
+        # Upsert en merchant_credentials
+        c_res = await session.execute(
+            select(MerchantCredential).where(
+                MerchantCredential.tenant_id == ctx.tenant_id,
+                MerchantCredential.merchant_id == target_merchant_id,
+            )
+        )
+        existing_cred = c_res.scalar_one_or_none()
+        if existing_cred:
+            existing_cred.payload_enc = payload_enc
+            existing_cred.nonce = nonce
+        else:
+            session.add(
+                MerchantCredential(
+                    tenant_id=ctx.tenant_id,
+                    merchant_id=target_merchant_id,
+                    payload_enc=payload_enc,
+                    nonce=nonce,
+                )
+            )
+
+        ticket.error_code = None
+        ticket.error_msg = None
+
+        if payload.facturar_ahora:
+            if ticket.estado in (TicketEstado.EXTRAIDO, TicketEstado.ESPERA_HUMANO, TicketEstado.RECHAZADO):
+                await transition(
+                    session,
+                    ticket,
+                    TicketEstado.ENCOLADO,
+                    "Credenciales configuradas. Facturación encolada.",
+                    tipo="encolado",
+                    meta={"merchant_id": str(target_merchant_id)},
+                )
+                should_enqueue = True
+
+        await session.commit()
+        resp = TicketResponse.from_model(ticket)
+
+    if should_enqueue:
+        await enqueue_ticket_facturacion(ctx.tenant_id, ticket_id)
+
+    return resp
 
 
 @router.get("/{ticket_id}/cfdi")
