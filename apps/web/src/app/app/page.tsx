@@ -38,6 +38,7 @@ import {
   ShieldCheck,
   ShieldAlert,
   Globe,
+  Zap,
 } from "lucide-react";
 
 const CATEGORIAS = [
@@ -253,6 +254,19 @@ export default function TicketsPage() {
     const imageEliminada = !t.image_key || t.estado === "facturado";
     const catInfo = getCategoryInfo(t.categoria_gasto);
     const CatIcon = catInfo.icon;
+    const isLiveCaptcha =
+      t.estado === "espera_humano" &&
+      (t.error_code === "captcha_requerido" || t.error_code === "intervencion_humana");
+    const isMissingPortal =
+      t.estado === "espera_humano" &&
+      (!t.url_facturacion ||
+        t.error_code === "esperando_url_portal" ||
+        t.error_code === "portal_requerido");
+    const canRetry =
+      t.estado === "rechazado" ||
+      t.estado === "cancelado" ||
+      t.estado === "error" ||
+      (t.estado === "espera_humano" && !isLiveCaptcha);
 
     return (
       <tr
@@ -326,27 +340,29 @@ export default function TicketsPage() {
             errorCode={t.error_code}
             errorMsg={t.error_msg}
           />
-          {t.estado === "rechazado" && t.error_msg && (
-            <p
-              className="mt-1 max-w-[180px] truncate text-[10px] text-bad/90"
-              title={t.error_msg}
+        </td>
+
+        <td className="px-4 py-3 text-xs">
+          {imageEliminada ? (
+            <span
+              className="inline-flex items-center gap-1 text-[11px] text-muted cursor-help"
+              title="Tu foto original fue procesada y eliminada para máxima privacidad de tus compras."
             >
-              {t.error_msg}
-            </p>
+              <Database className="h-3 w-3 text-muted/60" />
+              <span>Eliminada</span>
+            </span>
+          ) : (
+            <span
+              className="inline-flex items-center gap-1 text-[11px] text-ok cursor-help"
+              title="Foto y PDF escaneado disponibles mientras se procesa."
+            >
+              <Camera className="h-3 w-3 text-ok" />
+              <span>HD Lista</span>
+            </span>
           )}
         </td>
 
-        <td className="px-4 py-3">
-          <span
-            className={`inline-flex items-center gap-1 text-[11px] font-medium ${
-              imageEliminada ? "text-ok" : "text-muted"
-            }`}
-          >
-            {imageEliminada ? "✓ eliminada" : "en proceso"}
-          </span>
-        </td>
-
-        <td className="px-4 py-3 text-[11px] text-muted">
+        <td className="px-4 py-3 text-xs text-muted">
           {formatDate(t.fecha_ticket || t.created_at)}
         </td>
 
@@ -367,8 +383,19 @@ export default function TicketsPage() {
               </button>
             )}
 
-            {t.estado === "espera_humano" &&
-            (t.error_code === "esperando_url_portal" || t.error_code === "portal_requerido") ? (
+            {isLiveCaptcha && (
+              <button
+                type="button"
+                onClick={() => setSelectedTicketForHandoff(t)}
+                title="Tomar control en vivo para resolver captcha"
+                className="flex items-center gap-1 rounded-lg bg-amber-500 px-2 py-1 text-[11px] font-bold text-white shadow-sm hover:brightness-105 active:scale-95"
+              >
+                <Zap className="h-3 w-3" />
+                <span>Resolver</span>
+              </button>
+            )}
+
+            {isMissingPortal && (
               <button
                 type="button"
                 onClick={() => setSelectedTicketDetail(t)}
@@ -378,16 +405,19 @@ export default function TicketsPage() {
                 <Globe className="h-3 w-3" />
                 <span>Indicar portal</span>
               </button>
-            ) : t.estado === "espera_humano" ? (
+            )}
+
+            {t.estado === "espera_humano" && !isLiveCaptcha && !isMissingPortal && (
               <button
                 type="button"
-                onClick={() => setSelectedTicketForHandoff(t)}
-                title="Tomar control en vivo para resolver captcha"
-                className="flex items-center gap-1 rounded-lg bg-amber-500 px-2 py-1 text-[11px] font-bold text-white shadow-sm hover:brightness-105 active:scale-95"
+                onClick={() => setSelectedTicketDetail(t)}
+                title="Revisar portal o configurar reintento"
+                className="flex items-center gap-1 rounded-lg border border-line-2 bg-panel-2 px-2 py-1 text-[11px] font-bold text-ink-2 shadow-sm hover:bg-line/20 active:scale-95"
               >
-                <span>Resolver</span>
+                <Globe className="h-3 w-3 text-muted" />
+                <span>Revisar portal</span>
               </button>
-            ) : null}
+            )}
 
             {t.estado === "facturado" && (
               <CfdiDownloadButton
@@ -407,12 +437,12 @@ export default function TicketsPage() {
               <Eye className="h-3.5 w-3.5" />
             </button>
 
-            {(t.estado === "rechazado" || t.estado === "cancelado") && (
+            {canRetry && (
               <button
                 type="button"
                 onClick={() => handleRetry(t.id)}
                 title="Reintentar facturación"
-                className="flex h-7 w-7 items-center justify-center rounded-lg border border-line-2 bg-panel text-muted hover:text-brand"
+                className="flex h-7 w-7 items-center justify-center rounded-lg border border-line-2 bg-panel text-muted hover:text-brand transition hover:border-brand/40"
               >
                 <RefreshCw className="h-3.5 w-3.5" />
               </button>
@@ -422,7 +452,7 @@ export default function TicketsPage() {
               type="button"
               onClick={() => handleDelete(t.id)}
               title="Eliminar ticket"
-              className="flex h-7 w-7 items-center justify-center rounded-lg text-muted hover:text-bad"
+              className="flex h-7 w-7 items-center justify-center rounded-lg text-muted hover:text-bad transition"
             >
               <Trash2 className="h-3.5 w-3.5" />
             </button>

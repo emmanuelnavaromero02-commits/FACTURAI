@@ -34,7 +34,7 @@ export function HandoffModal({
   >("connecting");
   const [submissionAttempted, setSubmissionAttempted] = useState(false);
   const [currentFrame, setCurrentFrame] = useState<string | null>(null);
-  const [timeLeft, setTimeLeft] = useState<number>(180);
+  const [timeLeft, setTimeLeft] = useState<number>(0);
   const [isSubmittingDone, setIsSubmittingDone] = useState(false);
   const [customText, setCustomText] = useState("");
   const [retrying, setRetrying] = useState(false);
@@ -58,7 +58,7 @@ export function HandoffModal({
         // Si el backend reporta que ya expiró
         if (info.is_expired) {
           setErrorMsg(
-            "Esta sesión de intervención ya finalizó o expiró. El ticket volvió a la cola de reintentos."
+            "Esta sesión de intervención ya finalizó o expiró. Puedes iniciar un nuevo intento."
           );
           setWsStatus("disconnected");
           setTimeLeft(0);
@@ -77,10 +77,10 @@ export function HandoffModal({
       } catch (err: unknown) {
         if (!isMounted) return;
         setErrorMsg(
-          (err as Error).message ||
-            "No se pudo obtener la sesión de handoff para este ticket."
+          "No hay una sesión interactiva activa en este momento para este ticket."
         );
-        setWsStatus("error");
+        setWsStatus("disconnected");
+        setTimeLeft(0);
       } finally {
         if (isMounted) setLoadingInfo(false);
       }
@@ -306,7 +306,7 @@ export function HandoffModal({
             </div>
           )}
 
-          {errorMsg && (
+          {errorMsg && wsStatus === "error" && (
             <div className="mb-3 rounded-xl border border-bad/30 bg-bad-soft p-3 text-xs text-bad">
               {errorMsg}
             </div>
@@ -431,9 +431,13 @@ export function HandoffModal({
                 </b>{" "}
                 · después el ticket vuelve a la cola
               </p>
-            ) : (
+            ) : wsStatus === "connected" ? (
               <p className="font-semibold text-bad">
                 La sesión expiró. El ticket volvió a la cola de reintentos.
+              </p>
+            ) : (
+              <p className="text-muted">
+                Sesión inactiva · Puedes reintentar la facturación para abrir un nuevo navegador.
               </p>
             )}
           </div>

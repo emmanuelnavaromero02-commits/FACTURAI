@@ -120,6 +120,10 @@ export function TicketDetailModal({
     !currentTicket.url_facturacion ||
     currentTicket.error_code === "esperando_url_portal" ||
     currentTicket.error_code === "portal_requerido";
+  const isLiveCaptcha =
+    isEsperaHumano &&
+    (currentTicket.error_code === "captcha_requerido" ||
+      currentTicket.error_code === "intervencion_humana");
 
   const hasActiveCfdi = Boolean(
     currentTicket.cfdi_disponible_hasta &&
@@ -512,14 +516,18 @@ export function TicketDetailModal({
                   <h4 className="text-sm font-bold text-ink">
                     {isMissingPortal
                       ? "Portal de facturación requerido"
-                      : "Se requiere intervención humana"}
+                      : isLiveCaptcha
+                      ? "Se requiere resolver captcha en vivo"
+                      : "Verificación de portal o reintento requerido"}
                   </h4>
                   <p className="text-xs text-muted mt-0.5">
                     {isMissingPortal
                       ? "El comprobante impreso no contenía enlace web. Tu ticket está 100% resguardado y la imagen no se elimina. Ingresa la URL o haz clic en 'Investigar con IA' en la sección de portal abajo."
-                      : "El portal del comercio solicitó resolver un captcha o verificar un dato especial."}
+                      : isLiveCaptcha
+                      ? "El portal del comercio abrió una sesión interactiva para resolver un desafío de seguridad o captcha."
+                      : (currentTicket.error_msg || "El portal tardó en responder o requiere verificar el enlace. Puedes reintentar la facturación.")}
                   </p>
-                  {!isMissingPortal && onOpenHandoff && (
+                  {isLiveCaptcha && onOpenHandoff && (
                     <button
                       type="button"
                       onClick={() => onOpenHandoff(currentTicket)}
@@ -545,6 +553,16 @@ export function TicketDetailModal({
                         <Sparkles className="h-3.5 w-3.5" />
                       )}
                       <span>Investigar portal con IA ahora</span>
+                    </button>
+                  )}
+                  {!isLiveCaptcha && !isMissingPortal && (
+                    <button
+                      type="button"
+                      onClick={() => onRetry(currentTicket.id)}
+                      className="mt-3 flex items-center gap-2 rounded-xl bg-brand px-4 py-2 text-xs font-bold text-on-brand shadow hover:brightness-105 active:scale-95"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      <span>Reintentar facturación ahora</span>
                     </button>
                   )}
                 </div>
