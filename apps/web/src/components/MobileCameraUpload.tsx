@@ -28,22 +28,93 @@ export function MobileCameraUpload({
   const [showMonthWarning, setShowMonthWarning] = useState(false);
   const [confirmedMonthWarning, setConfirmedMonthWarning] = useState(false);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Compresión en el cliente para subida instantánea en redes móviles
+  const compressImageIfNeeded = async (file: File): Promise<File> => {
+    if (!file.type.match(/^image\/(jpeg|png|webp)$/i) && !file.name.match(/\.(jpe?g|png|webp)$/i)) {
+      return file;
+    }
+    if (file.size < 900 * 1024) {
+      return file;
+    }
+
+    return new Promise((resolve) => {
+      const img = new Image();
+      const objectUrl = URL.createObjectURL(file);
+      img.onload = () => {
+        URL.revokeObjectURL(objectUrl);
+        const maxDim = 1920;
+        let width = img.width;
+        let height = img.height;
+
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve(file);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, width, height);
+
+        canvas.toBlob(
+          (blob) => {
+            if (blob && blob.size < file.size) {
+              const compressed = new File(
+                [blob],
+                file.name.replace(/\.[^.]+$/, ".jpg"),
+                { type: "image/jpeg", lastModified: Date.now() }
+              );
+              resolve(compressed);
+            } else {
+              resolve(file);
+            }
+          },
+          "image/jpeg",
+          0.85
+        );
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        resolve(file);
+      };
+      img.src = objectUrl;
+    });
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // Validación de tamaño (máx 10 MB)
-    if (file.size > 10 * 1024 * 1024) {
-      setErrorMsg("El archivo excede el tamaño máximo permitido de 10 MB.");
+    // Validación de tamaño (máx 20 MB)
+    if (file.size > 20 * 1024 * 1024) {
+      setErrorMsg("El archivo excede el tamaño máximo permitido de 20 MB.");
       return;
     }
 
     setErrorMsg(null);
-    setSelectedFile(file);
 
-    // Generar preview para imágenes (en HEIC en browsers compatibles o JPEG/PNG)
-    if (file.type.startsWith("image/") || file.name.match(/\.(jpe?g|png|webp|heic|heif)$/i)) {
-      const url = URL.createObjectURL(file);
+    let processedFile = file;
+    try {
+      processedFile = await compressImageIfNeeded(file);
+    } catch {
+      // Fallback a archivo original
+    }
+
+    setSelectedFile(processedFile);
+
+    // Generar preview para imágenes
+    if (processedFile.type.startsWith("image/") || processedFile.name.match(/\.(jpe?g|png|webp|heic|heif)$/i)) {
+      const url = URL.createObjectURL(processedFile);
       setPreviewUrl(url);
     } else {
       setPreviewUrl(null);
@@ -57,7 +128,8 @@ export function MobileCameraUpload({
     setErrorMsg(null);
 
     try {
-      const resp = await uploadTicket(tenantId, selectedFile);
+      const fileToUpload = await compressImageIfNeeded(selectedFile);
+      const resp = await uploadTicket(tenantId, fileToUpload);
       setTicketId(resp.id);
     } catch (err: unknown) {
       setErrorMsg(

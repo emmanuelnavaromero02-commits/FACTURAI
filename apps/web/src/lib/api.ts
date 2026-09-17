@@ -47,8 +47,13 @@ async function fetchWithAuth<T>(
     headers.set("X-Tenant-Id", tenantId);
   }
 
+  const isUpload = options.body instanceof FormData;
+  // Subidas de archivos en redes móviles necesitan hasta 60s, peticiones normales 20s
+  const defaultTimeout = isUpload ? 60000 : 20000;
+  const timeoutDuration = (options as any).timeoutMs || defaultTimeout;
+
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 8000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutDuration);
 
   let response: Response;
   try {
@@ -60,7 +65,13 @@ async function fetchWithAuth<T>(
     });
   } catch (err: unknown) {
     if ((err as Error).name === "AbortError") {
-      throw new ApiError(408, "tiempo_agotado", "Tiempo de espera agotado al conectar con el servidor.");
+      throw new ApiError(
+        408,
+        "tiempo_agotado",
+        isUpload
+          ? "El archivo tardó demasiado en subirse. Revisa tu conexión de red o reintenta la subida."
+          : "Tiempo de espera agotado al conectar con el servidor."
+      );
     }
     throw err;
   } finally {
