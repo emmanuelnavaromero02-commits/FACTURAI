@@ -320,9 +320,57 @@ async def process_ticket_extraction(
             ticket.estatus_deducibilidad = fiscal_res["estatus_deducibilidad"]
             ticket.score_riesgo_fiscal = fiscal_res.get("score_riesgo_fiscal")
             ticket.auditoria_aritmetica = fiscal_res.get("auditoria_aritmetica")
-            ticket.hash_integridad = fiscal_res.get("hash_integridad")
+            if not ticket.hash_integridad:
+                ticket.hash_integridad = fiscal_res.get("hash_integridad")
         except Exception as f_err:
             logger.debug("No se pudo clasificar fiscalmente el ticket en extracción: %s", f_err)
+
+        # Detección de duplicado fiscal dentro del tenant (mismo folio y total para el mismo comercio/RFC)
+        if ticket.folio and ticket.total:
+            dup_stmt = select(Ticket).where(
+                Ticket.tenant_id == tenant_id,
+                Ticket.id != ticket_id,
+                Ticket.folio == ticket.folio,
+                Ticket.total == ticket.total,
+                Ticket.estado.in_([
+                    TicketEstado.FACTURADO,
+                    TicketEstado.FACTURANDO,
+                    TicketEstado.ENCOLADO,
+                ]),
+            )
+            if ticket.rfc_emisor:
+                dup_stmt = dup_stmt.where(Ticket.rfc_emisor == ticket.rfc_emisor)
+
+            dup_res = await session.execute(dup_stmt.limit(1))
+            dup_existing = dup_res.scalar_one_or_none()
+
+            if dup_existing:
+                logger.warning(
+                    "Ticket %s detectado como duplicado fiscal de %s (folio %s, total %s)",
+                    ticket_id,
+                    dup_existing.id,
+                    ticket.folio,
+                    ticket.total,
+                )
+                ticket.error_code = "duplicado"
+                if dup_existing.estado == TicketEstado.FACTURADO:
+                    ticket.error_msg = (
+                        f"Comprobante duplicado: el folio {ticket.folio} por ${ticket.total} "
+                        f"ya fue facturado previamente (CFDI UUID: {dup_existing.cfdi_uuid or 'N/A'})."
+                    )
+                else:
+                    ticket.error_msg = (
+                        f"Comprobante duplicado: el folio {ticket.folio} por ${ticket.total} "
+                        f"ya se encuentra en cola o proceso de facturación."
+                    )
+                await transition(
+                    session,
+                    ticket,
+                    TicketEstado.RECHAZADO,
+                    f"Ticket rechazado por duplicidad fiscal con comprobante previo {dup_existing.id}.",
+                    meta={"error_code": "duplicado", "ticket_original_id": str(dup_existing.id)},
+                )
+                return
 
         auto_enqueue = False
         if matched_merchant is not None or billing_url:
@@ -1201,5 +1249,6 @@ class WorkerSettings:
     redis_settings = RedisSettings.from_dsn(get_settings().REDIS_URL)
     on_startup = on_worker_startup
     job_timeout = 600  # 10 minutos
+    max_jobs = 50      # Permite procesar hasta 50 tickets concurrentes en paralelo sin pestañear
 
 

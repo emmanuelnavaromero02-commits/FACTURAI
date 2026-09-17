@@ -139,6 +139,16 @@ export interface PaginatedTicketsResponse {
   next_cursor?: string | null;
 }
 
+export interface BatchUploadResponse {
+  items: TicketResponse[];
+  resumen: {
+    total: number;
+    encolados: number;
+    duplicados: number;
+    fallidos: number;
+  };
+}
+
 export interface TicketEventPayload {
   id: number;
   ticket_id: string;

@@ -529,3 +529,96 @@ async def test_thermal_wrinkled_ticket_and_enhancement(owner_session: AsyncSessi
         assert t_db.folio == "WID-ALSEA-998877"
         assert t_db.total == Decimal("340.00")
 
+
+@pytest.mark.asyncio
+async def test_batch_upload_with_duplicates():
+    """
+    PRUEBA: Subida masiva de tickets con detección de duplicados en el lote y en la BD.
+    1. Envía 3 archivos: dos idénticos (duplicados entre sí) y uno diferente.
+    2. El sistema divide los tickets, encola los no duplicados y marca el repetido como rechazado/duplicado.
+    """
+    transport = ASGITransport(app=app)
+    unique_email = f"batch.{uuid.uuid4().hex[:8]}@test.com"
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        log_res = await client.post("/v1/auth/google", json={"id_token": f"mock:{unique_email}"})
+        cookie = log_res.cookies.get(settings.SESSION_COOKIE_NAME)
+        tenant_id = log_res.json()["created_tenant_id"]
+
+    file1_bytes = VALID_JPEG_HEADER + b"_unique_1_"
+    file2_bytes = VALID_JPEG_HEADER + b"_unique_1_"  # Mismo contenido que file1 (duplicado)
+    file3_bytes = VALID_JPEG_HEADER + b"_unique_2_"
+
+    files = [
+        ("files", ("recibo_1.jpg", io.BytesIO(file1_bytes), "image/jpeg")),
+        ("files", ("recibo_1_copia.jpg", io.BytesIO(file2_bytes), "image/jpeg")),
+        ("files", ("recibo_2.jpg", io.BytesIO(file3_bytes), "image/jpeg")),
+    ]
+
+    async with AsyncClient(transport=transport, base_url="http://test", cookies={settings.SESSION_COOKIE_NAME: cookie}) as auth_client:
+        response = await auth_client.post(
+            "/v1/tickets/batch",
+            files=files,
+            headers={"X-Tenant-Id": tenant_id},
+        )
+
+    assert response.status_code == 202
+    data = response.json()
+    assert "items" in data
+    assert "resumen" in data
+    assert len(data["items"]) == 3
+    assert data["resumen"]["total"] == 3
+    assert data["resumen"]["encolados"] == 2
+    assert data["resumen"]["duplicados"] == 1
+    assert data["resumen"]["fallidos"] == 0
+
+    # Verificar que el segundo ticket fue marcado como duplicado
+    estados = [item["estado"] for item in data["items"]]
+    error_codes = [item["error_code"] for item in data["items"]]
+
+    assert estados.count("recibido") == 2
+    assert estados.count("rechazado") == 1
+    assert "duplicado" in error_codes
+
+
+@pytest.mark.asyncio
+async def test_upload_duplicate_identical_file():
+    """
+    PRUEBA: Detección de duplicado por hash SHA-256 contra base de datos previa.
+    1. Sube un ticket exitosamente.
+    2. Sube la misma foto en una petición posterior.
+    3. La segunda petición devuelve el ticket rechazado de inmediato con error_code='duplicado'.
+    """
+    transport = ASGITransport(app=app)
+    unique_email = f"dup.{uuid.uuid4().hex[:8]}@test.com"
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        log_res = await client.post("/v1/auth/google", json={"id_token": f"mock:{unique_email}"})
+        cookie = log_res.cookies.get(settings.SESSION_COOKIE_NAME)
+        tenant_id = log_res.json()["created_tenant_id"]
+
+    same_bytes = VALID_JPEG_HEADER + b"_identical_ticket_bytes_"
+
+    async with AsyncClient(transport=transport, base_url="http://test", cookies={settings.SESSION_COOKIE_NAME: cookie}) as auth_client:
+        # Subida 1
+        r1 = await auth_client.post(
+            "/v1/tickets",
+            files={"file": ("ticket_original.jpg", io.BytesIO(same_bytes), "image/jpeg")},
+            headers={"X-Tenant-Id": tenant_id},
+        )
+        assert r1.status_code == 202
+        t1 = r1.json()
+        assert t1["estado"] == "recibido"
+        assert t1["error_code"] is None
+
+        # Subida 2 (Misma foto exacta)
+        r2 = await auth_client.post(
+            "/v1/tickets",
+            files={"file": ("ticket_repetido.jpg", io.BytesIO(same_bytes), "image/jpeg")},
+            headers={"X-Tenant-Id": tenant_id},
+        )
+        assert r2.status_code == 202
+        t2 = r2.json()
+        assert t2["estado"] == "rechazado"
+        assert t2["error_code"] == "duplicado"
+        assert "duplicado" in t2["error_msg"].lower()
+
+

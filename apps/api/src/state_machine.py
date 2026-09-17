@@ -14,6 +14,7 @@ FINAL_STATES: Set[TicketEstado] = {
 VALID_TRANSITIONS: Dict[TicketEstado, Set[TicketEstado]] = {
     TicketEstado.RECIBIDO: {
         TicketEstado.EXTRAYENDO,
+        TicketEstado.RECHAZADO,
         TicketEstado.CANCELADO,
     },
     TicketEstado.EXTRAYENDO: {

@@ -2,6 +2,7 @@ import {
   GoogleAuthResponse,
   MeResponse,
   PaginatedTicketsResponse,
+  BatchUploadResponse,
   TeamMemberResponse,
   TenantResponse,
   TicketResponse,
@@ -182,6 +183,31 @@ export async function uploadTicket(
       method: "POST",
       body: formData,
     },
+    tenantId
+  );
+}
+
+export async function uploadTicketsBatch(
+  tenantId: string,
+  files: File[],
+  merchantSlug?: string
+): Promise<BatchUploadResponse> {
+  const formData = new FormData();
+  for (const file of files) {
+    formData.append("files", file);
+  }
+  if (merchantSlug) {
+    formData.append("merchant_slug", merchantSlug);
+  }
+
+  return fetchWithAuth<BatchUploadResponse>(
+    "/v1/tickets/batch",
+    {
+      method: "POST",
+      body: formData,
+      // Mayor timeout para lotes grandes
+      timeoutMs: 120000,
+    } as any,
     tenantId
   );
 }

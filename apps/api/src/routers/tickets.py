@@ -114,6 +114,11 @@ class PaginatedTicketsResponse(BaseModel):
     next_cursor: Optional[str] = None
 
 
+class BatchUploadResponse(BaseModel):
+    items: List[TicketResponse]
+    resumen: Dict[str, Any]
+
+
 @router.post("", response_model=TicketResponse, status_code=status.HTTP_202_ACCEPTED)
 async def upload_ticket(
     file: UploadFile = File(...),
@@ -124,15 +129,16 @@ async def upload_ticket(
     """
     Sube un ticket para procesamiento asíncrono:
     1. Valida el tipo por magic bytes (JPEG, PNG, HEIC, WebP, PDF) y tamaño (máx 10 MB).
-    2. Sube en streaming a S3/MinIO sin cargar el archivo completo en memoria.
-    3. Registra el ticket en estado 'recibido' dentro de tenant_session.
-    4. Encola la tarea de extracción en ARQ con tenant_id explícito y responde 202.
+    2. Sube en streaming a S3/MinIO sin cargar el archivo completo en memoria y calcula SHA-256.
+    3. Detecta si ya existe un ticket idéntico en el tenant para evitar doble facturación o tokens IA duplicados.
+    4. Registra el ticket dentro de tenant_session.
+    5. Encola la tarea de extracción en ARQ con tenant_id explícito y responde 202.
     """
     ticket_id = uuid.uuid4()
     storage = get_storage_service()
 
-    # Subida streaming a S3 con validación de magic bytes
-    storage_key, file_size, mime_type = await process_and_stream_upload(
+    # Subida streaming a S3 con validación de magic bytes y hash SHA-256
+    storage_key, file_size, mime_type, file_hash = await process_and_stream_upload(
         file=file,
         tenant_id=ctx.tenant_id,
         ticket_id=ticket_id,
@@ -141,6 +147,51 @@ async def upload_ticket(
 
     # Registro en base de datos bajo aislamiento RLS
     async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        # Verificar duplicado idéntico por hash en el tenant
+        dup_hash_query = select(Ticket).where(
+            Ticket.tenant_id == ctx.tenant_id,
+            Ticket.hash_integridad == file_hash,
+            Ticket.estado.in_([
+                TicketEstado.FACTURADO,
+                TicketEstado.FACTURANDO,
+                TicketEstado.ENCOLADO,
+                TicketEstado.EXTRAYENDO,
+                TicketEstado.EXTRAIDO,
+                TicketEstado.RECIBIDO,
+            ]),
+        ).order_by(Ticket.created_at.desc()).limit(1)
+        dup_hash_res = await session.execute(dup_hash_query)
+        existing_dup = dup_hash_res.scalar_one_or_none()
+
+        if existing_dup:
+            if existing_dup.estado == TicketEstado.FACTURADO:
+                err_msg = f"Comprobante duplicado: este archivo ya fue facturado previamente (Ticket {str(existing_dup.id)[:8]})."
+            else:
+                err_msg = f"Comprobante duplicado: este archivo ya se encuentra en proceso (Ticket {str(existing_dup.id)[:8]} en estado '{existing_dup.estado.value}')."
+
+            ticket = Ticket(
+                id=ticket_id,
+                tenant_id=ctx.tenant_id,
+                created_by=ctx.user.id,
+                fiscal_profile_id=fiscal_profile_id,
+                estado=TicketEstado.RECHAZADO,
+                image_key=storage_key,
+                hash_integridad=file_hash,
+                error_code="duplicado",
+                error_msg=err_msg,
+            )
+            session.add(ticket)
+            event = TicketEvent(
+                tenant_id=ctx.tenant_id,
+                ticket_id=ticket.id,
+                tipo="rechazado",
+                mensaje="Ticket rechazado automáticamente por duplicidad de archivo.",
+                meta={"error_code": "duplicado", "ticket_referencia_id": str(existing_dup.id)},
+            )
+            session.add(event)
+            await session.flush()
+            return TicketResponse.from_model(ticket)
+
         ticket = Ticket(
             id=ticket_id,
             tenant_id=ctx.tenant_id,
@@ -148,6 +199,7 @@ async def upload_ticket(
             fiscal_profile_id=fiscal_profile_id,
             estado=TicketEstado.RECIBIDO,
             image_key=storage_key,
+            hash_integridad=file_hash,
         )
         session.add(ticket)
 
@@ -156,7 +208,7 @@ async def upload_ticket(
             ticket_id=ticket.id,
             tipo="recibido",
             mensaje="Ticket recibido exitosamente en el servidor.",
-            meta={"file_size": file_size, "mime_type": mime_type},
+            meta={"file_size": file_size, "mime_type": mime_type, "file_hash": file_hash},
         )
         session.add(event)
         await session.flush()
@@ -169,6 +221,163 @@ async def upload_ticket(
     )
 
     return TicketResponse.from_model(ticket)
+
+
+@router.post("/batch", response_model=BatchUploadResponse, status_code=status.HTTP_202_ACCEPTED)
+async def upload_tickets_batch(
+    files: List[UploadFile] = File(...),
+    merchant_slug: Optional[str] = Form(None),
+    fiscal_profile_id: Optional[uuid.UUID] = Form(None),
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Subida masiva y concurrente de múltiples tickets a la vez:
+    1. Valida y procesa cada archivo en streaming de forma individual para aislar fallos.
+    2. Detecta archivos duplicados por hash SHA-256 (tanto contra la BD como dentro del mismo lote).
+    3. Registra cada ticket con aislamiento RLS.
+    4. Encola en ARQ concurrentemente los tickets válidos sin estancamientos.
+    5. Retorna la lista de tickets procesados y el resumen del lote.
+    """
+    storage = get_storage_service()
+    results: List[TicketResponse] = []
+    seen_hashes_in_batch: set = set()
+    total_encolados = 0
+    total_duplicados = 0
+    total_fallidos = 0
+
+    for f in files:
+        ticket_id = uuid.uuid4()
+        file_name = f.filename or "ticket"
+        try:
+            storage_key, file_size, mime_type, file_hash = await process_and_stream_upload(
+                file=f,
+                tenant_id=ctx.tenant_id,
+                ticket_id=ticket_id,
+                storage=storage,
+            )
+        except Exception as exc:
+            total_fallidos += 1
+            err_text = str(getattr(exc, "message", str(exc)))
+            async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+                failed_ticket = Ticket(
+                    id=ticket_id,
+                    tenant_id=ctx.tenant_id,
+                    created_by=ctx.user.id,
+                    fiscal_profile_id=fiscal_profile_id,
+                    estado=TicketEstado.RECHAZADO,
+                    error_code="archivo_invalido",
+                    error_msg=err_text,
+                )
+                session.add(failed_ticket)
+                ev = TicketEvent(
+                    tenant_id=ctx.tenant_id,
+                    ticket_id=ticket_id,
+                    tipo="rechazado",
+                    mensaje=f"Error al procesar archivo {file_name}: {err_text}",
+                    meta={"error": err_text, "filename": file_name},
+                )
+                session.add(ev)
+                await session.flush()
+                results.append(TicketResponse.from_model(failed_ticket))
+            continue
+
+        is_dup = False
+        dup_msg = ""
+        ref_id = None
+
+        if file_hash in seen_hashes_in_batch:
+            is_dup = True
+            dup_msg = f"Comprobante duplicado: el archivo '{file_name}' fue seleccionado más de una vez en este mismo lote."
+        else:
+            seen_hashes_in_batch.add(file_hash)
+            async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+                dup_hash_query = select(Ticket).where(
+                    Ticket.tenant_id == ctx.tenant_id,
+                    Ticket.hash_integridad == file_hash,
+                    Ticket.estado.in_([
+                        TicketEstado.FACTURADO,
+                        TicketEstado.FACTURANDO,
+                        TicketEstado.ENCOLADO,
+                        TicketEstado.EXTRAYENDO,
+                        TicketEstado.EXTRAIDO,
+                        TicketEstado.RECIBIDO,
+                    ]),
+                ).order_by(Ticket.created_at.desc()).limit(1)
+                dup_res = await session.execute(dup_hash_query)
+                existing_dup = dup_res.scalar_one_or_none()
+                if existing_dup:
+                    is_dup = True
+                    ref_id = str(existing_dup.id)
+                    if existing_dup.estado == TicketEstado.FACTURADO:
+                        dup_msg = f"Comprobante duplicado: ya fue facturado previamente (Ticket {ref_id[:8]})."
+                    else:
+                        dup_msg = f"Comprobante duplicado: ya se encuentra en proceso (Ticket {ref_id[:8]} en estado '{existing_dup.estado.value}')."
+
+        if is_dup:
+            total_duplicados += 1
+            async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+                dup_ticket = Ticket(
+                    id=ticket_id,
+                    tenant_id=ctx.tenant_id,
+                    created_by=ctx.user.id,
+                    fiscal_profile_id=fiscal_profile_id,
+                    estado=TicketEstado.RECHAZADO,
+                    image_key=storage_key,
+                    hash_integridad=file_hash,
+                    error_code="duplicado",
+                    error_msg=dup_msg,
+                )
+                session.add(dup_ticket)
+                ev = TicketEvent(
+                    tenant_id=ctx.tenant_id,
+                    ticket_id=ticket_id,
+                    tipo="rechazado",
+                    mensaje=f"Ticket {file_name} rechazado por duplicidad.",
+                    meta={"error_code": "duplicado", "ticket_referencia_id": ref_id, "filename": file_name},
+                )
+                session.add(ev)
+                await session.flush()
+                results.append(TicketResponse.from_model(dup_ticket))
+        else:
+            total_encolados += 1
+            async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+                valid_ticket = Ticket(
+                    id=ticket_id,
+                    tenant_id=ctx.tenant_id,
+                    created_by=ctx.user.id,
+                    fiscal_profile_id=fiscal_profile_id,
+                    estado=TicketEstado.RECIBIDO,
+                    image_key=storage_key,
+                    hash_integridad=file_hash,
+                )
+                session.add(valid_ticket)
+                ev = TicketEvent(
+                    tenant_id=ctx.tenant_id,
+                    ticket_id=ticket_id,
+                    tipo="recibido",
+                    mensaje=f"Ticket {file_name} recibido en lote.",
+                    meta={"file_size": file_size, "mime_type": mime_type, "file_hash": file_hash, "filename": file_name},
+                )
+                session.add(ev)
+                await session.flush()
+                results.append(TicketResponse.from_model(valid_ticket))
+
+            # Encolar en ARQ de forma asíncrona
+            await enqueue_ticket_extraction(
+                tenant_id=ctx.tenant_id,
+                ticket_id=ticket_id,
+                explicit_merchant_slug=merchant_slug,
+            )
+
+    return BatchUploadResponse(
+        items=results,
+        resumen={
+            "total": len(files),
+            "encolados": total_encolados,
+            "duplicados": total_duplicados,
+            "fallidos": total_fallidos,
+        },
+    )
 
 
 @router.post("/upload-cfdi", response_model=TicketResponse, status_code=status.HTTP_201_CREATED)

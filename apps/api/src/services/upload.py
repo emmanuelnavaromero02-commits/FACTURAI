@@ -1,3 +1,4 @@
+import hashlib
 import uuid
 from typing import AsyncGenerator, Tuple
 from fastapi import UploadFile
@@ -16,7 +17,7 @@ def detect_file_type_from_magic_bytes(header: bytes) -> Tuple[str, str]:
     """
     Valida y detecta el tipo de archivo por sus 'magic bytes' iniciales.
     No confía en la extensión ni en el Content-Type que envíe el cliente.
-    Soporta: JPEG, PNG, HEIC/HEIF, WebP y PDF.
+    Soporta: JPEG, PNG, HEIC, WebP y PDF.
     """
     if len(header) < 12:
         raise TipoArchivoInvalidoException(
@@ -57,11 +58,12 @@ async def process_and_stream_upload(
     tenant_id: uuid.UUID,
     ticket_id: uuid.UUID,
     storage: StorageService,
-) -> Tuple[str, int, str]:
+) -> Tuple[str, int, str, str]:
     """
     Valida los magic bytes y transmite el archivo en streaming a S3/MinIO
     sin cargar el contenido completo en memoria.
-    Retorna: (storage_key, total_bytes, mime_type)
+    Calcula simultáneamente el hash SHA-256 en streaming.
+    Retorna: (storage_key, total_bytes, mime_type, file_hash)
     """
     first_chunk = await file.read(CHUNK_SIZE)
     if not first_chunk:
@@ -74,6 +76,9 @@ async def process_and_stream_upload(
     if total_bytes > MAX_FILE_SIZE_BYTES:
         raise ArchivoDemasiadoGrandeException()
 
+    hasher = hashlib.sha256()
+    hasher.update(first_chunk)
+
     async def stream_generator() -> AsyncGenerator[bytes, None]:
         nonlocal total_bytes
         yield first_chunk
@@ -85,9 +90,10 @@ async def process_and_stream_upload(
             total_bytes += len(chunk)
             if total_bytes > MAX_FILE_SIZE_BYTES:
                 raise ArchivoDemasiadoGrandeException()
+            hasher.update(chunk)
             yield chunk
 
     # Subida en streaming al bucket
     await storage.upload_stream(key, stream_generator(), mime_type)
 
-    return key, total_bytes, mime_type
+    return key, total_bytes, mime_type, hasher.hexdigest()
