@@ -395,6 +395,12 @@ class AnthropicVisionExtractor(VisionExtractor):
         except Exception:
             parsed_json = json.loads(raw_text)
 
+        # Coerción de tipos para robustez contra respuestas numéricas del LLM (ej. float/int a str)
+        if isinstance(parsed_json, dict):
+            for field in ("total", "subtotal", "iva", "folio", "web_id", "caja", "transaccion", "rfc_emisor", "comercio", "fecha", "hora", "sucursal", "url_facturacion"):
+                if field in parsed_json and parsed_json[field] is not None:
+                    parsed_json[field] = str(parsed_json[field]).strip()
+
         schema = VisionExtractionSchema.model_validate(parsed_json)
 
         meta = {
