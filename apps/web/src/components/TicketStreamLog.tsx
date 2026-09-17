@@ -93,7 +93,22 @@ export function TicketStreamLog({
                 let subtext = "";
 
                 if (parsed.meta) {
-                  if (parsed.meta.folio) {
+                  if (parsed.meta.error) {
+                    const errStr = String(parsed.meta.error);
+                    if (
+                      errStr.toLowerCase().includes("credit balance is too low") ||
+                      errStr.toLowerCase().includes("plans & billing")
+                    ) {
+                      subtext = "Saldo de Anthropic agotado. Por favor añade créditos en console.anthropic.com";
+                    } else if (
+                      errStr.toLowerCase().includes("invalid x-api-key") ||
+                      errStr.toLowerCase().includes("authentication_error")
+                    ) {
+                      subtext = "La clave ANTHROPIC_API_KEY en .env es inválida.";
+                    } else {
+                      subtext = errStr.length > 180 ? `${errStr.slice(0, 180)}...` : errStr;
+                    }
+                  } else if (parsed.meta.folio) {
                     subtext = `folio ${parsed.meta.folio} · total $${parsed.meta.total || "—"}`;
                   } else if (parsed.meta.file_size) {
                     const kb = Math.round(parsed.meta.file_size / 1024);
@@ -113,7 +128,8 @@ export function TicketStreamLog({
                   if (tipo === "espera_humano" && onEsperaHumano) onEsperaHumano();
                 } else if (tipo === "error" || tipo === "rechazado") {
                   status = "warn";
-                  setIsError(true);
+                  setIsDone(true);
+                  if (onFinished) onFinished();
                 }
 
                 setSteps((prev) => {
@@ -210,10 +226,10 @@ export function TicketStreamLog({
         </div>
       )}
 
-      {isError && (
+      {isError && steps.length === 0 && (
         <div className="mt-2 flex items-center gap-2 rounded-lg border border-bad/30 bg-bad-soft p-3 text-xs text-bad">
           <AlertCircle className="h-4 w-4 shrink-0" />
-          <span>No se pudo completar la conexión con la bitácora del agente.</span>
+          <span>No se pudo conectar en tiempo real con la bitácora del agente. El ticket continúa procesándose en el servidor.</span>
         </div>
       )}
     </div>

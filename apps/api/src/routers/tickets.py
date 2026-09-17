@@ -955,6 +955,46 @@ async def get_ticket_handoff_info(
         }
 
 
+@router.get("/{ticket_id}/image")
+async def get_ticket_image(
+    ticket_id: uuid.UUID,
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Descarga o visualiza la imagen del ticket cargada por el usuario (si aún no ha sido eliminada por privacidad).
+    """
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        res = await session.execute(
+            select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
+        )
+        ticket = res.scalar_one_or_none()
+        if not ticket:
+            raise RecursoNoEncontradoException("Ticket no encontrado.")
+
+        if not ticket.image_key or ticket.image_deleted_at:
+            raise RecursoNoEncontradoException("La imagen del ticket no está disponible o ya fue eliminada por privacidad.")
+
+    storage = get_storage_service()
+    try:
+        img_bytes = await storage.get_bytes(ticket.image_key)
+    except Exception as exc:
+        raise RecursoNoEncontradoException(f"No se pudo recuperar la imagen: {exc}")
+
+    content_type = "image/jpeg"
+    if img_bytes.startswith(b"%PDF"):
+        content_type = "application/pdf"
+    elif img_bytes.startswith(b"\x89PNG"):
+        content_type = "image/png"
+    elif img_bytes.startswith(b"RIFF") and len(img_bytes) > 12 and img_bytes[8:12] == b"WEBP":
+        content_type = "image/webp"
+
+    return Response(
+        content=img_bytes,
+        media_type=content_type,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
 @router.delete("/{ticket_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_ticket(
     ticket_id: uuid.UUID,

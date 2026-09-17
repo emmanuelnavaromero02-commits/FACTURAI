@@ -31,11 +31,16 @@ import {
   Sparkles,
   Edit3,
   Save,
+  Camera,
+  Maximize2,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import { TicketResponse } from "@/types/api";
 import { StatusBadge } from "@/components/StatusBadge";
 import { formatCurrency } from "@/lib/utils";
 import {
+  API_BASE_URL,
   getCfdiDownloadUrl,
   getCfdiPdfDownloadUrl,
   getCfdiXmlDownloadUrl,
@@ -81,6 +86,11 @@ export function TicketDetailModal({
     type: "success" | "error" | "info";
     text: string;
   } | null>(null);
+
+  // Estados del Visor de Ticket Original
+  const [showImagePreview, setShowImagePreview] = useState<boolean>(true);
+  const [isZoomedImage, setIsZoomedImage] = useState<boolean>(false);
+  const [imageError, setImageError] = useState<boolean>(false);
 
   useEffect(() => {
     setCurrentTicket(ticket);
@@ -256,6 +266,101 @@ export function TicketDetailModal({
 
         {/* Scrollable Content */}
         <div className="flex-1 overflow-y-auto p-6 space-y-6">
+          {/* Visor de Ticket Original */}
+          {currentTicket.image_key && !currentTicket.image_deleted_at && !imageError && (
+            <div className="rounded-2xl border border-line bg-panel-2/40 overflow-hidden shadow-xs">
+              <div className="flex items-center justify-between border-b border-line px-4 py-2.5 bg-panel-2/60">
+                <div className="flex items-center gap-2">
+                  <Camera className="h-4 w-4 text-brand" />
+                  <span className="text-xs font-bold text-ink">Visor del Ticket Capturado</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsZoomedImage(true)}
+                    className="flex items-center gap-1 text-[11px] font-semibold text-brand hover:underline"
+                  >
+                    <Maximize2 className="h-3 w-3" />
+                    <span>Ampliar</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowImagePreview(!showImagePreview)}
+                    className="rounded p-1 text-muted hover:text-ink transition"
+                    title={showImagePreview ? "Ocultar imagen" : "Mostrar imagen"}
+                  >
+                    {showImagePreview ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                  </button>
+                </div>
+              </div>
+
+              {showImagePreview && (
+                <div className="relative flex justify-center bg-black/5 p-3">
+                  <div
+                    onClick={() => setIsZoomedImage(true)}
+                    className="group relative max-h-64 cursor-zoom-in overflow-hidden rounded-lg border border-line/60 shadow-xs transition hover:opacity-95"
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={`${API_BASE_URL}/v1/tickets/${currentTicket.id}/image${tenantId ? `?tenant_id=${tenantId}` : ""}`}
+                      alt="Foto original del comprobante"
+                      onError={() => setImageError(true)}
+                      className="max-h-64 object-contain"
+                    />
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/20 opacity-0 group-hover:opacity-100 transition">
+                      <span className="rounded-full bg-black/70 px-3 py-1 text-[11px] font-semibold text-white backdrop-blur-xs flex items-center gap-1.5">
+                        <Maximize2 className="h-3 w-3" /> Clic para ampliar
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Modal de Zoom de Imagen */}
+          {isZoomedImage && (
+            <div
+              className="fixed inset-0 z-60 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm animate-in fade-in"
+              onClick={() => setIsZoomedImage(false)}
+            >
+              <div
+                className="relative max-h-[92vh] max-w-4xl overflow-auto rounded-2xl bg-panel p-2 shadow-2xl"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="flex items-center justify-between border-b border-line px-3 py-2">
+                  <span className="text-xs font-bold text-ink flex items-center gap-1.5">
+                    <Camera className="h-3.5 w-3.5 text-brand" /> Foto del ticket ({currentTicket.folio || currentTicket.id.slice(0, 8)})
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <a
+                      href={`${API_BASE_URL}/v1/tickets/${currentTicket.id}/image${tenantId ? `?tenant_id=${tenantId}` : ""}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center gap-1 rounded-lg border border-line px-2.5 py-1 text-xs text-muted hover:text-ink"
+                    >
+                      <ExternalLink className="h-3 w-3" /> Abrir pestaña
+                    </a>
+                    <button
+                      type="button"
+                      onClick={() => setIsZoomedImage(false)}
+                      className="rounded-lg p-1 text-muted hover:text-ink"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                </div>
+                <div className="flex justify-center p-2">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={`${API_BASE_URL}/v1/tickets/${currentTicket.id}/image${tenantId ? `?tenant_id=${tenantId}` : ""}`}
+                    alt="Ticket ampliado"
+                    className="max-h-[80vh] w-auto object-contain rounded-lg"
+                  />
+                </div>
+              </div>
+            </div>
+          )}
           {/* Bloque de Estado si ya está Facturado */}
           {isFacturado && (
             <div className="rounded-xl border border-ok/30 bg-ok-soft/30 p-4 shadow-sm">
@@ -407,10 +512,34 @@ export function TicketDetailModal({
               <div className="flex items-start gap-3">
                 <AlertCircle className="h-5 w-5 text-bad shrink-0 mt-0.5" />
                 <div className="flex-1">
-                  <h4 className="text-sm font-bold text-ink">Facturación no completada</h4>
+                  <h4 className="text-sm font-bold text-ink">
+                    {currentTicket.error_code === "saldo_ia_agotado"
+                      ? "Saldo de IA agotado en Anthropic"
+                      : "Facturación no completada"}
+                  </h4>
                   <p className="text-xs text-bad/90 mt-1 font-mono">
                     {currentTicket.error_msg || currentTicket.error_code || "El portal no completó la emisión."}
                   </p>
+
+                  {currentTicket.error_code === "saldo_ia_agotado" && (
+                    <div className="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-ink">
+                      <p className="font-bold text-amber-500 mb-1">¿Cómo solucionarlo?</p>
+                      <p className="text-[12px] text-muted leading-relaxed">
+                        Tu cuenta de Anthropic no tiene créditos disponibles para procesar la imagen con visión artificial.
+                        Para continuar procesando tickets reales, agrega saldo en{" "}
+                        <a
+                          href="https://console.anthropic.com/settings/plans"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="font-bold text-brand underline inline-flex items-center gap-1"
+                        >
+                          console.anthropic.com <ExternalLink className="h-3 w-3" />
+                        </a>{" "}
+                        o actualiza la variable <code className="rounded bg-panel px-1.5 py-0.5 font-mono text-ink">ANTHROPIC_API_KEY</code> en tu archivo <code className="rounded bg-panel px-1.5 py-0.5 font-mono text-ink">apps/api/.env</code>.
+                      </p>
+                    </div>
+                  )}
+
                   <div className="mt-3 flex flex-wrap items-center gap-2">
                     <button
                       type="button"

@@ -10,12 +10,11 @@ import {
 
 function getApiBaseUrl(): string {
   if (typeof window !== "undefined") {
-    // Si estamos en el navegador en un celular/otra máquina en LAN, apuntar al mismo host en el puerto 8000
-    if (window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") {
-      return `http://${window.location.hostname}:8000`;
-    }
+    // En el navegador, usar la ruta relativa /v1/... a través del reverse proxy de Next.js
+    // Esto funciona 100% en localhost, IP de red local (celulares) y túneles externos.
+    return "";
   }
-  return process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, "") || "http://localhost:8000";
+  return process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, "") || "http://127.0.0.1:8000";
 }
 
 export const API_BASE_URL = getApiBaseUrl();

@@ -40,6 +40,7 @@ node_modules/
 .next/
 out/
 .pnpm-store
+*.tsbuildinfo
 
 # IDE & OS
 .DS_Store

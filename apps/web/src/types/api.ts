@@ -96,6 +96,7 @@ export interface TicketResponse {
   error_code?: string | null;
   error_msg?: string | null;
   image_key?: string | null;
+  image_deleted_at?: string | null;
   cfdi_uuid?: string | null;
   correo_capturado_en_portal?: string | null;
   cfdi_disponible_hasta?: string | null;

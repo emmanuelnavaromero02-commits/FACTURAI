@@ -47,6 +47,10 @@ export function StatusBadge({ estado, errorCode, errorMsg, className }: StatusBa
     case "rechazado":
       if (errorCode === "ticket_ya_facturado" || errorCode === "duplicado") {
         label = "Ya facturado";
+      } else if (errorCode === "saldo_ia_agotado") {
+        label = "Saldo IA agotado";
+      } else if (errorCode === "api_key_invalida") {
+        label = "API Key inválida";
       } else if (errorCode === "perfil_incompleto") {
         label = "Datos faltantes";
       } else if (errorCode === "imagen_ilegible") {

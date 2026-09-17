@@ -126,14 +126,26 @@ async def process_ticket_extraction(
                         select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == tenant_id)
                     )
                     t = res.scalar_one()
-                    t.error_code = "error_vision"
-                    t.error_msg = "El modelo de visión no pudo interpretar el formato del ticket."
+                    exc_str = str(exc)
+                    if "credit balance is too low" in exc_str.lower() or "plans & billing" in exc_str.lower():
+                        t.error_code = "saldo_ia_agotado"
+                        t.error_msg = (
+                            "La cuenta de Anthropic no tiene créditos disponibles (saldo de IA agotado). "
+                            "Por favor recarga saldo en console.anthropic.com o actualiza tu ANTHROPIC_API_KEY en .env para leer los tickets."
+                        )
+                    elif "invalid x-api-key" in exc_str.lower() or "authentication_error" in exc_str.lower():
+                        t.error_code = "api_key_invalida"
+                        t.error_msg = "La clave ANTHROPIC_API_KEY configurada es inválida o fue revocada."
+                    else:
+                        t.error_code = "error_vision"
+                        t.error_msg = "El modelo de visión no pudo interpretar el formato del ticket."
+
                     await transition(
                         session,
                         t,
                         TicketEstado.RECHAZADO,
                         "Fallo definitivo al procesar con visión tras reintento.",
-                        meta={"error": str(exc)},
+                        meta={"error": exc_str},
                     )
                 return
 
@@ -327,7 +339,7 @@ async def process_ticket_extraction(
         if extracted and extracted.otros:
             is_gas = any(any(w in str(getattr(x, "etiqueta", "") if hasattr(x, "etiqueta") else x.get("etiqueta", "")).lower() for w in ("cre", "estacion", "dispensario", "combustible")) for x in extracted.otros)
 
-        if matched_merchant is None and (not billing_url or is_hub or is_gas):
+        if matched_merchant is None and (not billing_url or is_hub or is_gas) and settings.ENVIRONMENT not in ("test", "testing"):
             from .services.portal_searcher import deduce_portal_for_ticket
             deduced_portal = await deduce_portal_for_ticket(
                 comercio=extracted.comercio or extracted.sucursal,
