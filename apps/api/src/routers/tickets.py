@@ -509,10 +509,13 @@ async def retry_ticket(
         if ticket.estado == TicketEstado.ESPERA_HUMANO:
             ticket.intentos = 0
 
+        needs_extraction = not ticket.extracted and not ticket.folio
+        target_state = TicketEstado.RECIBIDO if needs_extraction else TicketEstado.ENCOLADO
+
         await transition(
             session,
             ticket,
-            TicketEstado.ENCOLADO,
+            target_state,
             f"Reintento manual solicitado por usuario (intento previo {intento_previo}/3).",
             tipo="reintento",
         )
@@ -521,8 +524,11 @@ async def retry_ticket(
         await session.flush()
         response_data = TicketResponse.from_model(ticket)
 
-    # Encolar en la cola ARQ de facturación
-    await enqueue_ticket_facturacion(ctx.tenant_id, ticket_id)
+    # Encolar en la cola ARQ correspondiente
+    if needs_extraction:
+        await enqueue_ticket_extraction(ctx.tenant_id, ticket_id)
+    else:
+        await enqueue_ticket_facturacion(ctx.tenant_id, ticket_id)
 
     return response_data
 
