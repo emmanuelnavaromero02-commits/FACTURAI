@@ -33,6 +33,7 @@ import {
   Save,
   Camera,
   Maximize2,
+  RotateCw,
   Eye,
   EyeOff,
 } from "lucide-react";
@@ -91,6 +92,7 @@ export function TicketDetailModal({
   // Estados del Visor de Ticket Original
   const [showImagePreview, setShowImagePreview] = useState<boolean>(true);
   const [isZoomedImage, setIsZoomedImage] = useState<boolean>(false);
+  const [imageRotation, setImageRotation] = useState<number>(0);
   const [imageError, setImageError] = useState<boolean>(false);
 
   useEffect(() => {
@@ -288,6 +290,15 @@ export function TicketDetailModal({
                   </a>
                   <button
                     type="button"
+                    onClick={() => setImageRotation((prev) => (prev + 90) % 360)}
+                    className="flex items-center gap-1 text-[11px] font-semibold text-muted hover:text-ink transition"
+                    title="Girar imagen 90°"
+                  >
+                    <RotateCw className="h-3 w-3" />
+                    <span>Girar{imageRotation !== 0 ? ` ${imageRotation}°` : ""}</span>
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setIsZoomedImage(true)}
                     className="flex items-center gap-1 text-[11px] font-semibold text-brand hover:underline"
                   >
@@ -306,16 +317,20 @@ export function TicketDetailModal({
               </div>
 
               {showImagePreview && (
-                <div className="relative flex justify-center bg-black/5 p-3">
+                <div className="relative flex justify-center bg-black/5 p-3 overflow-hidden">
                   <div
                     onClick={() => setIsZoomedImage(true)}
-                    className="group relative max-h-64 cursor-zoom-in overflow-hidden rounded-lg border border-line/60 shadow-xs transition hover:opacity-95"
+                    className="group relative max-h-64 cursor-zoom-in overflow-hidden rounded-lg border border-line/60 shadow-xs transition hover:opacity-95 flex items-center justify-center"
                   >
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
                       src={`${API_BASE_URL}/v1/tickets/${currentTicket.id}/image${tenantId ? `?tenant_id=${tenantId}` : ""}`}
                       alt="Foto original del comprobante"
                       onError={() => setImageError(true)}
+                      style={{
+                        transform: `rotate(${imageRotation}deg)`,
+                        transition: "transform 0.25s ease-in-out",
+                      }}
                       className="max-h-64 object-contain"
                     />
                     <div className="absolute inset-0 flex items-center justify-center bg-black/20 opacity-0 group-hover:opacity-100 transition">
@@ -344,6 +359,14 @@ export function TicketDetailModal({
                     <Camera className="h-3.5 w-3.5 text-brand" /> Foto del ticket ({currentTicket.folio || currentTicket.id.slice(0, 8)})
                   </span>
                   <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setImageRotation((prev) => (prev + 90) % 360)}
+                      className="flex items-center gap-1 rounded-lg border border-line px-2.5 py-1 text-xs text-muted hover:text-ink transition"
+                      title="Girar imagen 90°"
+                    >
+                      <RotateCw className="h-3.5 w-3.5" /> Girar{imageRotation !== 0 ? ` ${imageRotation}°` : ""}
+                    </button>
                     <a
                       href={getScannedPdfDownloadUrl(currentTicket.id, tenantId || undefined)}
                       target="_blank"
@@ -369,11 +392,15 @@ export function TicketDetailModal({
                     </button>
                   </div>
                 </div>
-                <div className="flex justify-center p-2">
+                <div className="flex justify-center p-4 overflow-hidden">
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
                     src={`${API_BASE_URL}/v1/tickets/${currentTicket.id}/image${tenantId ? `?tenant_id=${tenantId}` : ""}`}
                     alt="Ticket ampliado"
+                    style={{
+                      transform: `rotate(${imageRotation}deg)`,
+                      transition: "transform 0.25s ease-in-out",
+                    }}
                     className="max-h-[80vh] w-auto object-contain rounded-lg"
                   />
                 </div>

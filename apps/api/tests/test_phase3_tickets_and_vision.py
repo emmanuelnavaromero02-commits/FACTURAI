@@ -636,3 +636,69 @@ async def test_upload_duplicate_identical_file():
         assert pdf_res.content.startswith(b"%PDF")
 
 
+@pytest.mark.asyncio
+async def test_autonomous_visual_recovery_on_bad_photo(owner_session: AsyncSession):
+    """
+    PRUEBA:
+    Cuando la foto inicial resulta ilegible o con baja confianza (< 0.60),
+    el worker reintenta autónomamente con variantes visuales (giro y realce no destructivo)
+    en lugar de rechazar el ticket de inmediato.
+    """
+    from PIL import Image as PILImage
+
+    storage = InMemoryStorageService()
+    set_storage_service(storage)
+    vision = FakeVisionExtractor()
+    set_vision_extractor(vision)
+
+    t_id = uuid.uuid4()
+    u_id = uuid.uuid4()
+    tenant = Tenant(id=t_id, nombre="Empresa Recuperacion", slug=f"rec-{t_id.hex[:6]}", plan="free")
+    user = User(id=u_id, email=f"user-{u_id.hex[:6]}@test.com", nombre="User", google_sub=f"sub-{u_id.hex}")
+    owner_session.add_all([tenant, user])
+    await owner_session.flush()
+
+    # Modo que falla en el primer intento y tiene éxito en la variante
+    vision.set_mode("reintento_con_variante")
+
+    # Crear imagen de ticket horizontal simulado (ancho > alto)
+    buf = io.BytesIO()
+    img = PILImage.new("RGB", (300, 150), color=(220, 220, 220))
+    img.save(buf, format="JPEG")
+    ticket_bytes = buf.getvalue()
+
+    ticket_id = uuid.uuid4()
+    image_key = f"tickets/{t_id}/{ticket_id}"
+    await storage.upload_bytes(image_key, ticket_bytes, "image/jpeg")
+
+    ticket = Ticket(
+        id=ticket_id,
+        tenant_id=t_id,
+        created_by=u_id,
+        estado=TicketEstado.RECIBIDO,
+        image_key=image_key,
+    )
+    await owner_session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(t_id)})
+    owner_session.add(ticket)
+    await owner_session.commit()
+
+    # Ejecutar worker de extracción
+    await process_ticket_extraction(t_id, ticket_id)
+
+    # Verificar que el ticket fue recuperado a EXTRAIDO gracias a la variante
+    async with tenant_session(t_id) as session:
+        t_db = (await session.execute(select(Ticket).where(Ticket.id == ticket_id))).scalar_one()
+        assert t_db.estado == TicketEstado.EXTRAIDO
+        assert t_db.folio == "4821-993-0077"
+        assert t_db.total == Decimal("1284.50")
+        assert t_db.confianza >= Decimal("0.85")
+
+        # Verificar eventos de auditoría del reintento autónomo
+        events_res = await session.execute(
+            select(TicketEvent).where(TicketEvent.ticket_id == ticket_id).order_by(TicketEvent.ts)
+        )
+        tipos_eventos = [e.tipo for e in events_res.scalars().all()]
+        assert "reintento_vision_autonomo" in tipos_eventos
+        assert "recuperacion_vision_exitosa" in tipos_eventos
+
+

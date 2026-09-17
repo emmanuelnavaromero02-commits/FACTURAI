@@ -24,7 +24,12 @@ from .services.cfdi_storage import get_cfdi_storage
 from .services.fiscal_classifier import analyze_fiscal_classification
 from .state_machine import transition
 from .storage import get_storage_service
-from .vision.extractor import enhance_receipt_image, extract_qr_code, get_vision_extractor
+from .vision.extractor import (
+    enhance_receipt_image,
+    extract_qr_code,
+    generate_vision_recovery_variants,
+    get_vision_extractor,
+)
 from .vision.merchant_matcher import match_merchant_cascade
 from .vision.normalizer import normalize_amount, normalize_date, normalize_time
 from .vision.url_sanitizer import sanitize_and_classify_billing_url
@@ -238,6 +243,105 @@ async def process_ticket_extraction(
         or total_norm is None
         or (total_norm is not None and total_norm <= 0)
     )
+
+    # Si la lectura inicial es incompleta o ilegible, reintentar de inmediato con variantes visuales
+    # (giro a 90°/270° si el ticket fue capturado de lado, o realce no destructivo de tinta térmica)
+    if es_ilegible:
+        logger.info(
+            "Lectura inicial con baja certeza para ticket %s (confianza=%.2f, tiene_folio=%s). Reintentando con variantes visuales autónomas...",
+            ticket_id,
+            extracted.confianza,
+            bool(extracted.folio),
+        )
+        async with tenant_session(tenant_id) as session:
+            ev_reintento = TicketEvent(
+                tenant_id=tenant_id,
+                ticket_id=ticket_id,
+                tipo="reintento_vision_autonomo",
+                mensaje="Lectura inicial con baja certeza o ticket de lado. Reintentando análisis autónomo con corrección de orientación y realce no destructivo...",
+                meta={
+                    "confianza_inicial": float(extracted.confianza),
+                    "tiene_folio": bool(extracted.folio),
+                },
+            )
+            session.add(ev_reintento)
+
+        variants = generate_vision_recovery_variants(image_bytes)
+        for variant_name, variant_bytes in variants:
+            try:
+                if not qr_url:
+                    qr_url = extract_qr_code(variant_bytes)
+
+                cand_extracted = await vision.extract(
+                    variant_bytes,
+                    model=settings.ANTHROPIC_MODEL_AGENTE or settings.ANTHROPIC_MODEL_VISION,
+                )
+                if cand_extracted is None:
+                    continue
+
+                if not cand_extracted.folio:
+                    c_folio = None
+                    if cand_extracted.web_id:
+                        c_folio = cand_extracted.web_id
+                    elif cand_extracted.transaccion:
+                        c_folio = cand_extracted.transaccion
+                    elif cand_extracted.otros:
+                        for item in cand_extracted.otros:
+                            k = getattr(item, "etiqueta", "") if hasattr(item, "etiqueta") else str(item.get("etiqueta", ""))
+                            v = getattr(item, "valor", "") if hasattr(item, "valor") else str(item.get("valor", ""))
+                            k_lower = k.lower()
+                            if any(kw in k_lower for kw in ("ticket", "folio", "orden", "trans", "docto", "ref", "operaci", "control", "código", "codigo", "venta")):
+                                if len(str(v).strip()) >= 2:
+                                    c_folio = str(v).strip()
+                                    break
+                    if c_folio:
+                        cand_extracted.folio = c_folio
+
+                c_total = normalize_amount(cand_extracted.total)
+                c_folio_dudoso = False
+                if cand_extracted.folio:
+                    c_f = cand_extracted.folio.strip()
+                    if any(c in c_f for c in ("?", "*", "...", "xxx", "XXX")) or len(c_f) < 2:
+                        c_folio_dudoso = True
+
+                c_tiene_esenciales = bool(cand_extracted.folio and not c_folio_dudoso and c_total is not None and c_total > 0)
+                c_ilegible = (
+                    (cand_extracted.confianza < 0.6 and not c_tiene_esenciales)
+                    or (cand_extracted.confianza < 0.45)
+                    or not cand_extracted.folio
+                    or c_folio_dudoso
+                    or c_total is None
+                    or (c_total is not None and c_total <= 0)
+                )
+
+                if not c_ilegible:
+                    logger.info(
+                        "Ticket %s recuperado exitosamente con variante visual '%s' (confianza=%.2f, folio=%s)",
+                        ticket_id,
+                        variant_name,
+                        cand_extracted.confianza,
+                        cand_extracted.folio,
+                    )
+                    extracted = cand_extracted
+                    total_norm = c_total
+                    subtotal_norm = normalize_amount(extracted.subtotal)
+                    iva_norm = normalize_amount(extracted.iva)
+                    fecha_norm = normalize_date(extracted.fecha)
+                    hora_norm = normalize_time(extracted.hora)
+                    es_ilegible = False
+
+                    async with tenant_session(tenant_id) as session:
+                        ev_ok = TicketEvent(
+                            tenant_id=tenant_id,
+                            ticket_id=ticket_id,
+                            tipo="recuperacion_vision_exitosa",
+                            mensaje=f"Ticket recuperado con éxito mediante ajuste visual ({variant_name.replace('_', ' ')}). Confianza: {round(extracted.confianza * 100)}%.",
+                            meta={"variante": variant_name, "confianza": float(extracted.confianza)},
+                        )
+                        session.add(ev_ok)
+                    break
+            except Exception as v_err:
+                logger.debug("Variante visual %s no logró extraer ticket: %s", variant_name, v_err)
 
     # 7. Limpieza de URLs y discriminación de QR del SAT
     sanitized_qr = sanitize_and_classify_billing_url(qr_url)
@@ -1017,7 +1121,7 @@ async def process_ticket_facturacion(
                     )
                 return
 
-            backoffs = [30, 300, 1800]
+            backoffs = [3, 8, 15]
             if result.error_code in ("agente_error", "portal_invalido"):
                 from .services.portal_searcher import search_candidate_portal_urls
                 candidates = await search_candidate_portal_urls(
@@ -1026,13 +1130,23 @@ async def process_ticket_facturacion(
                     sucursal=sucursal,
                     extracted_data=extracted_data,
                 )
-                alt_cands = [c for c in candidates if c != url_facturacion]
-                if alt_cands:
+                tried_urls = set()
+                if extracted_data and isinstance(extracted_data.get("_tried_portals"), list):
+                    tried_urls = set(extracted_data["_tried_portals"])
+                if url_facturacion:
+                    tried_urls.add(url_facturacion)
+
+                alt_cands = [c for c in candidates if c not in tried_urls]
+                if alt_cands and intentos < 3:
                     next_url = alt_cands[0]
+                    tried_urls.add(next_url)
                     async with tenant_session(tenant_id) as session:
                         t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
                         t = t_res.scalar_one()
                         t.url_facturacion = next_url
+                        if t.extracted is None:
+                            t.extracted = {}
+                        t.extracted["_tried_portals"] = list(tried_urls)
                         await transition(
                             session,
                             t,
@@ -1041,7 +1155,21 @@ async def process_ticket_facturacion(
                             meta={"url_anterior": url_facturacion, "url_nueva": next_url, "intento": t.intentos},
                         )
                     from .services.queue import enqueue_ticket_facturacion
-                    await enqueue_ticket_facturacion(tenant_id, ticket_id, defer_seconds=5)
+                    await enqueue_ticket_facturacion(tenant_id, ticket_id, defer_seconds=3)
+                    return
+                elif intentos >= 3 or not alt_cands:
+                    async with tenant_session(tenant_id) as session:
+                        t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+                        t = t_res.scalar_one()
+                        t.error_code = result.error_code
+                        t.error_msg = result.mensaje or "No se pudo facturar automáticamente en los portales candidatos. Ingresa el link de facturación."
+                        await transition(
+                            session,
+                            t,
+                            TicketEstado.ESPERA_HUMANO,
+                            "Portales automáticos agotados o con error. Esperando link directo de facturación.",
+                            meta={"error_code": result.error_code, "intentos": t.intentos},
+                        )
                     return
 
             if result.reintentable and (intentos < 3 or result.error_code == "handoff_tope_concurrencia"):
@@ -1141,47 +1269,50 @@ async def process_ticket_facturacion(
 # ---------------------------------------------------------------------------
 # Reconciliación y Configuración del Worker ARQ
 # ---------------------------------------------------------------------------
-async def reconcile_stuck_tickets() -> None:
+async def reconcile_stuck_tickets(max_age_minutes: int = 3) -> None:
     """
     Reconcilia tickets que hayan quedado colgados en estado 'facturando' o 'extrayendo'
-    debido a reinicios de worker o caídas de red (> 10 minutos sin actividad).
+    debido a reinicios de worker o caídas de red (> 3 minutos sin actividad).
     """
     try:
+        threshold = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
         async with engine.connect() as conn:
             res = await conn.execute(
                 text("""
-                    SELECT id, tenant_id, folio, estado, updated_at
+                    SELECT id, tenant_id, folio, estado, url_facturacion, updated_at
                     FROM tickets
-                    WHERE estado = 'facturando'
-                      AND updated_at < (NOW() - INTERVAL '10 minutes')
-                """)
+                    WHERE estado IN ('facturando', 'extrayendo')
+                      AND updated_at < :th
+                """),
+                {"th": threshold}
             )
             stuck_tickets = res.fetchall()
 
         if stuck_tickets:
-            logger.warning("Reconciliando %d tickets colgados en 'facturando'...", len(stuck_tickets))
+            logger.warning("Reconciliando %d tickets colgados...", len(stuck_tickets))
             for row in stuck_tickets:
                 t_id = row.id
                 t_tenant = row.tenant_id
+                target_state = TicketEstado.ESPERA_HUMANO if row.url_facturacion else TicketEstado.RECHAZADO
                 try:
                     async with tenant_session(t_tenant) as session:
                         t_res = await session.execute(select(Ticket).where(Ticket.id == t_id))
                         ticket = t_res.scalar_one_or_none()
-                        if ticket and ticket.estado == TicketEstado.FACTURANDO:
+                        if ticket and ticket.estado in (TicketEstado.FACTURANDO, TicketEstado.EXTRAYENDO):
                             ticket.error_code = "tiempo_expirado"
-                            ticket.error_msg = "El proceso de facturación anterior excedió el tiempo límite (10 minutos) o el worker fue reiniciado."
+                            ticket.error_msg = "El proceso anterior excedió el tiempo límite sin respuesta. Puedes volver a facturar o ingresar el link del portal."
                             await transition(
                                 session,
                                 ticket,
-                                TicketEstado.RECHAZADO,
-                                "Ticket recuperado automáticamente tras tiempo límite de facturación excedido.",
+                                target_state,
+                                "Ticket recuperado automáticamente tras tiempo límite excedido.",
                                 meta={"error_code": "tiempo_expirado"},
                             )
-                            logger.info("Ticket colgado %s reconciliado a RECHAZADO (tiempo_expirado)", t_id)
+                            logger.info("Ticket colgado %s reconciliado a %s", t_id, target_state.value)
                 except Exception as rec_err:
                     logger.error("Error reconciliando ticket %s: %s", t_id, rec_err)
     except Exception as e:
-        logger.warning("No se pudo ejecutar la reconciliación inicial de tickets: %s", e)
+        logger.warning("No se pudo ejecutar la reconciliación de tickets: %s", e)
 
 
 async def extract_ticket_task(ctx, tenant_id: str, ticket_id: str, explicit_merchant_slug: Optional[str] = None):

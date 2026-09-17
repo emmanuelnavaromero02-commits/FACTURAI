@@ -152,6 +152,12 @@ class FakeVisionExtractor(VisionExtractor):
                 return self._fixtures["bueno"]
             return self._fixtures["borroso"]
 
+        if self._current_mode == "reintento_con_variante":
+            matching = [inv for inv in self.invocations if inv.get("mode") == "reintento_con_variante"]
+            if len(matching) > 2:
+                return self._fixtures["bueno"]
+            return self._fixtures["borroso"]
+
         if self._current_mode in self._fixtures:
             return self._fixtures[self._current_mode]
         return self._fixtures["bueno"]
@@ -209,41 +215,70 @@ REGLAS DE EXTRACCIÓN Y RECUPERACIÓN ANTE TICKETS ARRUGADOS O BORROSOS:
 """
 
 
-def apply_camscanner_hd_filter(img: Image.Image) -> Image.Image:
+def remove_black_letterbox(img: Image.Image, threshold: int = 20) -> Image.Image:
     """
-    Filtro HD estilo CamScanner para comprobantes fiscales y tickets:
-    1. Corrige rotación física EXIF.
-    2. Blanquea el fondo eliminando sombras desiguales de iluminación y manos.
-    3. Oscurece y resalta la tinta térmica tenue (alto contraste negro sobre blanco).
-    4. Aplica máscara de enfoque HD para afilar micro-caracteres alfanuméricos y folios.
+    Elimina franjas negras externas (letterbox) producidas por capturas de pantalla de celular
+    o aplicaciones de cámara, recortando automáticamente al área útil del comprobante.
+    """
+    try:
+        gray = img.convert("L")
+        mask = gray.point(lambda p: 255 if p > threshold else 0)
+        bbox = mask.getbbox()
+        if bbox:
+            w, h = img.size
+            bw = bbox[2] - bbox[0]
+            bh = bbox[3] - bbox[1]
+            if (bw * bh) >= 0.35 * (w * h) and (bw < w or bh < h):
+                return img.crop(bbox)
+    except Exception as exc:
+        logger.debug("No se pudo aplicar recorte de franjas negras: %s", exc)
+    return img
+
+
+def clean_camscanner_hd(img: Image.Image) -> Image.Image:
+    """
+    Filtro HD inteligente estilo CamScanner 'Color Mágico':
+    - NO destruye colores ni convierte a escala de grises ruidosa.
+    - Preserva intacta la tinta térmica tenue evitando blanqueos agresivos.
+    - Aplica autocorrección sutil de contraste y unsharp mask de micro-enfoque.
     """
     from PIL import ImageEnhance
+
+    try:
+        img = ImageOps.exif_transpose(img) or img
+    except Exception:
+        pass
 
     if img.mode != "RGB":
         img = img.convert("RGB")
 
-    # 1. Autocontraste dinámico sobre escala de grises
-    img_gray = ImageOps.autocontrast(img.convert("L"), cutoff=1)
+    # 1. Quitar franjas negras de letterbox si existen
+    img = remove_black_letterbox(img)
 
-    # 2. Aumentar contraste para purificar blancos y profundizar negros de tinta térmica
-    contrast_enhancer = ImageEnhance.Contrast(img_gray)
-    high_contrast = contrast_enhancer.enhance(1.65)
+    # 2. Ajuste sutil no destructivo de contraste (+12%) para resaltar letras sin borrar tinta tenue
+    contrast_enhancer = ImageEnhance.Contrast(img)
+    enhanced = contrast_enhancer.enhance(1.12)
 
-    # 3. Aumento sutil de brillo para eliminar sombras de teléfono y mesas
-    brightness_enhancer = ImageEnhance.Brightness(high_contrast)
-    bright = brightness_enhancer.enhance(1.12)
+    # 3. Elevación suave de brillo (+3%) para nivelar sombras tenues
+    brightness_enhancer = ImageEnhance.Brightness(enhanced)
+    enhanced = brightness_enhancer.enhance(1.03)
 
-    # 4. Enfoque y máscara UnsharpMask de alta definición
-    sharpness_enhancer = ImageEnhance.Sharpness(bright)
-    sharp = sharpness_enhancer.enhance(1.9)
-    hd_doc = sharp.filter(ImageFilter.UnsharpMask(radius=1.5, percent=160, threshold=2))
+    # 4. Máscara de enfoque micro-HD para definir bordes de números y códigos sin granular
+    sharpness_enhancer = ImageEnhance.Sharpness(enhanced)
+    enhanced = sharpness_enhancer.enhance(1.25)
+    enhanced = enhanced.filter(ImageFilter.UnsharpMask(radius=1.0, percent=50, threshold=3))
 
-    return hd_doc.convert("RGB")
+    return enhanced
+
+
+def apply_camscanner_hd_filter(img: Image.Image) -> Image.Image:
+    """Compatibilidad: delega al procesador HD no destructivo."""
+    return clean_camscanner_hd(img)
 
 
 def enhance_receipt_image(image_bytes: bytes) -> bytes:
     """
-    Mejora visualmente imágenes de tickets térmicos degradados, arrugados o de bajo contraste.
+    Mejora visualmente imágenes de tickets térmicos sin pérdida de calidad.
     """
     try:
         import pillow_heif
@@ -253,11 +288,10 @@ def enhance_receipt_image(image_bytes: bytes) -> bytes:
 
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        img = ImageOps.exif_transpose(img) or img
-        hd_img = apply_camscanner_hd_filter(img)
+        hd_img = clean_camscanner_hd(img)
 
         buf = io.BytesIO()
-        hd_img.save(buf, format="JPEG", quality=90, optimize=True)
+        hd_img.save(buf, format="JPEG", quality=92, optimize=True)
         return buf.getvalue()
     except Exception as exc:
         logger.debug("No se pudo aplicar realce CamScanner a la imagen: %s", exc)
@@ -266,12 +300,11 @@ def enhance_receipt_image(image_bytes: bytes) -> bytes:
 
 def convert_image_to_camscanner_pdf(image_bytes: bytes) -> bytes:
     """
-    Convierte una imagen de ticket a un PDF escaneado en HD estilo CamScanner:
-    1. Corrige orientación EXIF de fotos de smartphone.
-    2. Blanquea el fondo eliminando sombras desiguales de iluminación y manos.
-    3. Oscurece y resalta la tinta térmica tenue (alto contraste negro sobre blanco).
-    4. Aplica máscara de enfoque HD para afilar micro-caracteres alfanuméricos y folios.
-    5. Guarda y vectoriza como documento PDF estándar legible en cualquier lector.
+    Convierte una imagen de ticket a un PDF escaneado en alta resolución:
+    1. Corrige orientación EXIF física.
+    2. Elimina franjas negras de captura.
+    3. Aplica realce CamScanner no destructivo (preserva colores y textos térmicos).
+    4. Genera documento PDF estándar a 150 DPI.
     """
     try:
         import pillow_heif
@@ -281,15 +314,13 @@ def convert_image_to_camscanner_pdf(image_bytes: bytes) -> bytes:
 
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        img = ImageOps.exif_transpose(img) or img
-        hd_img = apply_camscanner_hd_filter(img)
+        hd_img = clean_camscanner_hd(img)
 
         buf = io.BytesIO()
         hd_img.save(buf, format="PDF", resolution=150.0)
         return buf.getvalue()
     except Exception as exc:
         logger.warning("Error al generar PDF escaneado CamScanner: %s", exc)
-        # Fallback: intentar convertir directamente la imagen a PDF sin filtros
         try:
             img = Image.open(io.BytesIO(image_bytes))
             if img.mode != "RGB":
@@ -301,11 +332,69 @@ def convert_image_to_camscanner_pdf(image_bytes: bytes) -> bytes:
             return image_bytes
 
 
+def generate_vision_recovery_variants(image_bytes: bytes) -> list[tuple[str, bytes]]:
+    """
+    Genera variantes visuales orientadas a recuperar la lectura cuando
+    la foto original resulta con baja confianza, sin folio o ilegible:
+    1. Giro 90° horario (los tickets capturados de lado en horizontal son el fallo #1)
+    2. Giro 270° horario (giro antihorario)
+    3. Realce selectivo de contraste de tinta térmica
+    4. Giro 180° (ticket invertido)
+    """
+    variants: list[tuple[str, bytes]] = []
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img = ImageOps.exif_transpose(img) or img
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        img = remove_black_letterbox(img)
+
+        w, h = img.size
+        is_horizontal = w > (h * 1.15)
+
+        def to_bytes(target: Image.Image, quality: int = 92) -> bytes:
+            b = io.BytesIO()
+            target.save(b, format="JPEG", quality=quality, optimize=True)
+            return b.getvalue()
+
+        # Giros: PIL rotate rota en sentido antihorario; 270 es 90° horario
+        rot_90 = img.rotate(270, expand=True)
+        rot_270 = img.rotate(90, expand=True)
+        rot_180 = img.rotate(180, expand=True)
+
+        from PIL import ImageEnhance
+        # Realce selectivo para tinta desvanecida
+        ink_enhancer = ImageEnhance.Contrast(img).enhance(1.28)
+        ink_enhancer = ImageEnhance.Sharpness(ink_enhancer).enhance(1.35)
+        ink_enhancer = ink_enhancer.filter(ImageFilter.UnsharpMask(radius=1.0, percent=65, threshold=2))
+
+        if is_horizontal:
+            variants.append(("rotacion_90_grados", to_bytes(rot_90)))
+            variants.append(("rotacion_270_grados", to_bytes(rot_270)))
+            variants.append(("realce_tinta_termica", to_bytes(ink_enhancer)))
+            variants.append(("rotacion_180_grados", to_bytes(rot_180)))
+        else:
+            variants.append(("realce_tinta_termica", to_bytes(ink_enhancer)))
+            variants.append(("rotacion_90_grados", to_bytes(rot_90)))
+            variants.append(("rotacion_270_grados", to_bytes(rot_270)))
+            variants.append(("rotacion_180_grados", to_bytes(rot_180)))
+    except Exception as exc:
+        logger.warning("Error al generar variantes de recuperación visual: %s", exc)
+
+    return variants
+
+
 def prepare_image_for_anthropic(image_bytes: bytes) -> tuple[str, str]:
     """
-    Optimiza, escanea estilo CamScanner HD y convierte la imagen a formato JPEG
-    en base64 compatible con la Messages API.
-    Soporta HEIC de iPhone, corrige rotación EXIF, y redimensiona a máximo 1568px de lado mayor.
+    Optimiza y convierte la imagen a formato JPEG en base64 para la API de visión.
+    Preserva máxima fidelidad de color y microtextos térmicos sin quemar blancos.
+    Redimensiona proporcionalmente a máximo 1568px en el lado mayor.
     """
     try:
         import pillow_heif
@@ -315,15 +404,17 @@ def prepare_image_for_anthropic(image_bytes: bytes) -> tuple[str, str]:
 
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        # Corregir orientación física de teléfonos móviles
         img = ImageOps.exif_transpose(img) or img
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
 
-        # Escanear y procesar en HD estilo CamScanner para máxima legibilidad de números y folios
-        img = apply_camscanner_hd_filter(img)
+        # Quitar franjas negras de encuadre si las hay
+        img = remove_black_letterbox(img)
 
-        # Limitar lado mayor a 1568px: óptimo para densidad de píxeles y velocidad
+        # Aplicar realce suave
+        img = clean_camscanner_hd(img)
+
+        # Limitar a máximo 1568px para velocidad y precisión óptima de Claude Vision
         max_dim = 1568
         if max(img.size) > max_dim:
             scale = max_dim / max(img.size)
@@ -331,7 +422,7 @@ def prepare_image_for_anthropic(image_bytes: bytes) -> tuple[str, str]:
             img = img.resize(new_size, Image.Resampling.LANCZOS)
 
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=88, optimize=True)
+        img.save(buf, format="JPEG", quality=90, optimize=True)
         out_bytes = buf.getvalue()
         media_type = "image/jpeg"
     except Exception:

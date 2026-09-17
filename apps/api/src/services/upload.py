@@ -95,19 +95,17 @@ async def process_and_stream_upload(
         raw_bytes = b"".join(chunks)
         file_hash = hasher.hexdigest()
 
-        # 1. Aplicar filtro CamScanner HD a la imagen
+        # 1. Almacenar los bytes originales intactos en la clave principal (cero pérdida de calidad)
+        await storage.upload_bytes(key, raw_bytes, mime_type)
+
+        # 2. Generar y almacenar automáticamente el documento PDF escaneado en HD sin alterar la foto original
         try:
-            from ..vision.extractor import enhance_receipt_image, convert_image_to_camscanner_pdf
+            from ..vision.extractor import convert_image_to_camscanner_pdf
 
-            hd_image_bytes = enhance_receipt_image(raw_bytes)
-            await storage.upload_bytes(key, hd_image_bytes, "image/jpeg")
-
-            # 2. Generar y almacenar automáticamente el documento PDF escaneado
-            pdf_bytes = convert_image_to_camscanner_pdf(hd_image_bytes)
+            pdf_bytes = convert_image_to_camscanner_pdf(raw_bytes)
             await storage.upload_bytes(f"{key}.pdf", pdf_bytes, "application/pdf")
         except Exception:
-            # En caso de excepción, guardar la imagen original
-            await storage.upload_bytes(key, raw_bytes, mime_type)
+            pass
 
         return key, total_bytes, mime_type, file_hash
 
