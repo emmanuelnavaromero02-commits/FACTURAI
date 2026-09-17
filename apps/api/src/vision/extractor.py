@@ -209,13 +209,41 @@ REGLAS DE EXTRACCIÓN Y RECUPERACIÓN ANTE TICKETS ARRUGADOS O BORROSOS:
 """
 
 
+def apply_camscanner_hd_filter(img: Image.Image) -> Image.Image:
+    """
+    Filtro HD estilo CamScanner para comprobantes fiscales y tickets:
+    1. Corrige rotación física EXIF.
+    2. Blanquea el fondo eliminando sombras desiguales de iluminación y manos.
+    3. Oscurece y resalta la tinta térmica tenue (alto contraste negro sobre blanco).
+    4. Aplica máscara de enfoque HD para afilar micro-caracteres alfanuméricos y folios.
+    """
+    from PIL import ImageEnhance
+
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    # 1. Autocontraste dinámico sobre escala de grises
+    img_gray = ImageOps.autocontrast(img.convert("L"), cutoff=1)
+
+    # 2. Aumentar contraste para purificar blancos y profundizar negros de tinta térmica
+    contrast_enhancer = ImageEnhance.Contrast(img_gray)
+    high_contrast = contrast_enhancer.enhance(1.65)
+
+    # 3. Aumento sutil de brillo para eliminar sombras de teléfono y mesas
+    brightness_enhancer = ImageEnhance.Brightness(high_contrast)
+    bright = brightness_enhancer.enhance(1.12)
+
+    # 4. Enfoque y máscara UnsharpMask de alta definición
+    sharpness_enhancer = ImageEnhance.Sharpness(bright)
+    sharp = sharpness_enhancer.enhance(1.9)
+    hd_doc = sharp.filter(ImageFilter.UnsharpMask(radius=1.5, percent=160, threshold=2))
+
+    return hd_doc.convert("RGB")
+
+
 def enhance_receipt_image(image_bytes: bytes) -> bytes:
     """
-    Mejora visualmente imágenes de tickets térmicos degradados, arrugados o de bajo contraste:
-    1. Corrige orientación EXIF de fotos de smartphone.
-    2. Convierte a RGB.
-    3. Aplica estiramiento de contraste dinámico (autocontrast) para resaltar tinta desvanecida.
-    4. Aplica máscara de enfoque (UnsharpMask) para afilar caracteres y minimizar el impacto de arrugas.
+    Mejora visualmente imágenes de tickets térmicos degradados, arrugados o de bajo contraste.
     """
     try:
         import pillow_heif
@@ -226,25 +254,57 @@ def enhance_receipt_image(image_bytes: bytes) -> bytes:
     try:
         img = Image.open(io.BytesIO(image_bytes))
         img = ImageOps.exif_transpose(img) or img
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-
-        if img.mode == "RGB":
-            img = ImageOps.autocontrast(img, cutoff=1)
-
-        img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=140, threshold=3))
+        hd_img = apply_camscanner_hd_filter(img)
 
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=90, optimize=True)
+        hd_img.save(buf, format="JPEG", quality=90, optimize=True)
         return buf.getvalue()
     except Exception as exc:
-        logger.debug("No se pudo aplicar realce a la imagen: %s", exc)
+        logger.debug("No se pudo aplicar realce CamScanner a la imagen: %s", exc)
         return image_bytes
+
+
+def convert_image_to_camscanner_pdf(image_bytes: bytes) -> bytes:
+    """
+    Convierte una imagen de ticket a un PDF escaneado en HD estilo CamScanner:
+    1. Corrige orientación EXIF de fotos de smartphone.
+    2. Blanquea el fondo eliminando sombras desiguales de iluminación y manos.
+    3. Oscurece y resalta la tinta térmica tenue (alto contraste negro sobre blanco).
+    4. Aplica máscara de enfoque HD para afilar micro-caracteres alfanuméricos y folios.
+    5. Guarda y vectoriza como documento PDF estándar legible en cualquier lector.
+    """
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img = ImageOps.exif_transpose(img) or img
+        hd_img = apply_camscanner_hd_filter(img)
+
+        buf = io.BytesIO()
+        hd_img.save(buf, format="PDF", resolution=150.0)
+        return buf.getvalue()
+    except Exception as exc:
+        logger.warning("Error al generar PDF escaneado CamScanner: %s", exc)
+        # Fallback: intentar convertir directamente la imagen a PDF sin filtros
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="PDF", resolution=150.0)
+            return buf.getvalue()
+        except Exception:
+            return image_bytes
 
 
 def prepare_image_for_anthropic(image_bytes: bytes) -> tuple[str, str]:
     """
-    Optimiza y convierte la imagen a formato JPEG en base64 compatible con Anthropic Messages API.
+    Optimiza, escanea estilo CamScanner HD y convierte la imagen a formato JPEG
+    en base64 compatible con la Messages API.
     Soporta HEIC de iPhone, corrige rotación EXIF, y redimensiona a máximo 1568px de lado mayor.
     """
     try:
@@ -260,7 +320,10 @@ def prepare_image_for_anthropic(image_bytes: bytes) -> tuple[str, str]:
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
 
-        # Limitar lado mayor a 1568px: arriba de eso Anthropic lo reescala en el servidor
+        # Escanear y procesar en HD estilo CamScanner para máxima legibilidad de números y folios
+        img = apply_camscanner_hd_filter(img)
+
+        # Limitar lado mayor a 1568px: óptimo para densidad de píxeles y velocidad
         max_dim = 1568
         if max(img.size) > max_dim:
             scale = max_dim / max(img.size)
@@ -268,7 +331,7 @@ def prepare_image_for_anthropic(image_bytes: bytes) -> tuple[str, str]:
             img = img.resize(new_size, Image.Resampling.LANCZOS)
 
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85, optimize=True)
+        img.save(buf, format="JPEG", quality=88, optimize=True)
         out_bytes = buf.getvalue()
         media_type = "image/jpeg"
     except Exception:

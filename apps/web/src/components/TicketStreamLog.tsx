@@ -114,7 +114,7 @@ export function TicketStreamLog({
                     const kb = Math.round(parsed.meta.file_size / 1024);
                     subtext = `${kb} KB · sesión aislada`;
                   } else if (parsed.meta.modelo_destino) {
-                    subtext = `escalando a ${parsed.meta.modelo_destino}`;
+                    subtext = "análisis visual HD avanzado";
                   }
                 }
 

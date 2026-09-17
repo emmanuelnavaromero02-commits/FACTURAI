@@ -467,7 +467,7 @@ export default function TicketsPage() {
             className="flex items-center gap-2 rounded-xl bg-brand px-4 py-2.5 text-xs font-bold text-on-brand shadow-sm transition-all hover:brightness-105 active:scale-95"
           >
             <Plus className="h-4 w-4 stroke-[2.5]" />
-            <span>Subir ticket</span>
+            <span>Subir tickets (Lote masivo)</span>
           </button>
         </div>
       </div>
@@ -849,7 +849,7 @@ export default function TicketsPage() {
                 }`}
               >
                 <Camera className="h-3.5 w-3.5 text-brand" />
-                <span>Foto de Ticket (OCR + Facturación)</span>
+                <span>📸 Escaneo CamScanner HD (Individual o Lote)</span>
               </button>
               <button
                 type="button"

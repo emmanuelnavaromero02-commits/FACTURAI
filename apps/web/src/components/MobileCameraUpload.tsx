@@ -14,8 +14,9 @@ import {
   Trash2,
   Sparkles,
   FileText,
+  ExternalLink,
 } from "lucide-react";
-import { uploadTicket, uploadTicketsBatch } from "@/lib/api";
+import { uploadTicket, uploadTicketsBatch, getScannedPdfDownloadUrl } from "@/lib/api";
 import { TicketStreamLog } from "./TicketStreamLog";
 import { TicketResponse } from "@/types/api";
 import { cn } from "@/lib/utils";
@@ -27,6 +28,7 @@ interface BatchItem {
   size: number;
   previewUrl: string | null;
   isDuplicateInBatch: boolean;
+  isPdf: boolean;
 }
 
 interface ProcessedTicketStatus {
@@ -53,6 +55,7 @@ export function MobileCameraUpload({
   const galleryInputRef = useRef<HTMLInputElement>(null);
 
   const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgressText, setUploadProgressText] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -61,13 +64,12 @@ export function MobileCameraUpload({
   const [processedResults, setProcessedResults] = useState<ProcessedTicketStatus[]>([]);
   const [activeTicketId, setActiveTicketId] = useState<string | null>(null);
 
-  // Advertencia de fecha de mes anterior
-  const [showMonthWarning, setShowMonthWarning] = useState(false);
-  const [confirmedMonthWarning, setConfirmedMonthWarning] = useState(false);
-
-  // Compresión optimizada en el navegador para subida instantánea (< 100ms) y OCR ultra rápido
+  // Compresión y escaneo CamScanner HD en el navegador para vista previa instantánea y máxima legibilidad
   const compressImageIfNeeded = async (file: File): Promise<File> => {
-    if (!file.type.match(/^image\/(jpeg|png|webp)$/i) && !file.name.match(/\.(jpe?g|png|webp)$/i)) {
+    if (
+      !file.type.match(/^image\/(jpeg|png|webp)$/i) &&
+      !file.name.match(/\.(jpe?g|png|webp)$/i)
+    ) {
       return file;
     }
 
@@ -76,7 +78,7 @@ export function MobileCameraUpload({
       const objectUrl = URL.createObjectURL(file);
       img.onload = () => {
         URL.revokeObjectURL(objectUrl);
-        const maxDim = 1280; // Resolución perfecta para lectura de tickets con peso pluma (< 100 KB)
+        const maxDim = 1568; // Resolución ideal de escáner HD para folios y números pequeños
         let width = img.width;
         let height = img.height;
 
@@ -88,9 +90,6 @@ export function MobileCameraUpload({
             width = Math.round((width * maxDim) / height);
             height = maxDim;
           }
-        } else if (file.size < 180 * 1024) {
-          resolve(file);
-          return;
         }
 
         const canvas = document.createElement("canvas");
@@ -101,11 +100,18 @@ export function MobileCameraUpload({
           resolve(file);
           return;
         }
+
+        // Filtro estilo CamScanner HD: alto contraste, fondo blanco y tinta definida
+        try {
+          ctx.filter = "contrast(1.35) brightness(1.08) grayscale(0.2)";
+        } catch {
+          // Si el navegador no soporta ctx.filter, se dibuja normalmente
+        }
         ctx.drawImage(img, 0, 0, width, height);
 
         canvas.toBlob(
           (blob) => {
-            if (blob && (blob.size < file.size || width !== img.width)) {
+            if (blob) {
               const compressed = new File(
                 [blob],
                 file.name.replace(/\.[^.]+$/, ".jpg"),
@@ -117,7 +123,7 @@ export function MobileCameraUpload({
             }
           },
           "image/jpeg",
-          0.80
+          0.85
         );
       };
       img.onerror = () => {
@@ -128,8 +134,10 @@ export function MobileCameraUpload({
     });
   };
 
-  const handleFilesAdded = async (fileList: FileList | null) => {
-    if (!fileList || fileList.length === 0) return;
+  const handleFilesAdded = async (fileList: FileList | File[] | null) => {
+    if (!fileList) return;
+    const filesArray = Array.from(fileList);
+    if (filesArray.length === 0) return;
 
     setErrorMsg(null);
     const newItems: BatchItem[] = [];
@@ -137,18 +145,23 @@ export function MobileCameraUpload({
       batchItems.map((item) => `${item.name}-${item.size}`)
     );
 
-    for (let i = 0; i < fileList.length; i++) {
-      const rawFile = fileList[i];
-      if (rawFile.size > 20 * 1024 * 1024) {
-        setErrorMsg(`El archivo "${rawFile.name}" excede el tamaño máximo permitido de 20 MB.`);
+    for (const rawFile of filesArray) {
+      if (rawFile.size > 25 * 1024 * 1024) {
+        setErrorMsg(`El archivo "${rawFile.name}" excede el tamaño máximo permitido de 25 MB.`);
         continue;
       }
 
+      const isPdfFile =
+        rawFile.type === "application/pdf" ||
+        rawFile.name.toLowerCase().endsWith(".pdf");
+
       let processedFile = rawFile;
-      try {
-        processedFile = await compressImageIfNeeded(rawFile);
-      } catch {
-        // Fallback al original
+      if (!isPdfFile) {
+        try {
+          processedFile = await compressImageIfNeeded(rawFile);
+        } catch {
+          // Fallback al original
+        }
       }
 
       const signature = `${processedFile.name}-${processedFile.size}`;
@@ -156,10 +169,7 @@ export function MobileCameraUpload({
       existingSignatures.add(signature);
 
       let previewUrl: string | null = null;
-      if (
-        processedFile.type.startsWith("image/") ||
-        processedFile.name.match(/\.(jpe?g|png|webp|heic|heif)$/i)
-      ) {
+      if (!isPdfFile) {
         previewUrl = URL.createObjectURL(processedFile);
       }
 
@@ -170,6 +180,7 @@ export function MobileCameraUpload({
         size: processedFile.size,
         previewUrl,
         isDuplicateInBatch: isDup,
+        isPdf: isPdfFile,
       });
     }
 
@@ -195,7 +206,7 @@ export function MobileCameraUpload({
 
     setUploading(true);
     setErrorMsg(null);
-    setUploadProgressText("Optimizando y enviando tickets al servidor...");
+    setUploadProgressText("Escaneando en HD y enviando tickets a la cola...");
 
     try {
       const filesToUpload = batchItems.map((it) => it.file);
@@ -205,7 +216,10 @@ export function MobileCameraUpload({
 
       const mappedStatuses: ProcessedTicketStatus[] = resp.items.map((t, idx) => {
         const originalName = batchItems[idx]?.name || `Ticket ${idx + 1}`;
-        const isDup = t.error_code === "duplicado" || (t.error_msg && t.error_msg.toLowerCase().includes("duplicad")) || false;
+        const isDup =
+          t.error_code === "duplicado" ||
+          (t.error_msg && t.error_msg.toLowerCase().includes("duplicad")) ||
+          false;
         return {
           ticketId: t.id,
           name: originalName,
@@ -247,8 +261,6 @@ export function MobileCameraUpload({
     setProcessedResults([]);
     setActiveTicketId(null);
     setErrorMsg(null);
-    setShowMonthWarning(false);
-    setConfirmedMonthWarning(false);
     if (cameraInputRef.current) cameraInputRef.current.value = "";
     if (galleryInputRef.current) galleryInputRef.current.value = "";
   };
@@ -257,19 +269,9 @@ export function MobileCameraUpload({
 
   return (
     <div className="w-full">
-      {/* Inputs ocultos: Cámara directa y Galería múltiple */}
+      {/* Inputs HTML nativos vinculados por ID a etiquetas <label> */}
       <input
-        ref={cameraInputRef}
-        type="file"
-        accept="image/*,.heic,.heif"
-        capture="environment"
-        onChange={(e) => {
-          handleFilesAdded(e.target.files);
-          if (cameraInputRef.current) cameraInputRef.current.value = "";
-        }}
-        className="hidden"
-      />
-      <input
+        id="batch-ticket-file-input"
         ref={galleryInputRef}
         type="file"
         accept="image/*,.heic,.heif,application/pdf"
@@ -278,16 +280,43 @@ export function MobileCameraUpload({
           handleFilesAdded(e.target.files);
           if (galleryInputRef.current) galleryInputRef.current.value = "";
         }}
-        className="hidden"
+        className="sr-only hidden"
+      />
+      <input
+        id="camera-ticket-file-input"
+        ref={cameraInputRef}
+        type="file"
+        accept="image/*,.heic,.heif"
+        capture="environment"
+        onChange={(e) => {
+          handleFilesAdded(e.target.files);
+          if (cameraInputRef.current) cameraInputRef.current.value = "";
+        }}
+        className="sr-only hidden"
       />
 
-      {/* VISTA 1: Selector Inicial (Cámara vs Subida Masiva / Galería) */}
+      {/* VISTA 1: Selector Inicial (Subida Masiva / Drag & Drop vs Cámara) */}
       {batchItems.length === 0 && processedResults.length === 0 && (
         <div className="flex flex-col gap-3">
-          {/* Botón Principal: Subida Masiva / Galería Múltiple */}
-          <div
-            onClick={() => galleryInputRef.current?.click()}
-            className="group flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-line-2 bg-panel-2 p-7 text-center transition-all hover:border-brand hover:bg-brand-soft active:scale-[0.99]"
+          {/* Zona Drag-and-Drop con etiqueta nativa <label> */}
+          <label
+            htmlFor="batch-ticket-file-input"
+            onDragOver={(e) => {
+              e.preventDefault();
+              setIsDragging(true);
+            }}
+            onDragLeave={() => setIsDragging(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setIsDragging(false);
+              handleFilesAdded(e.dataTransfer.files);
+            }}
+            className={cn(
+              "group flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed p-7 text-center transition-all active:scale-[0.99]",
+              isDragging
+                ? "border-brand bg-brand-soft/70 shadow-lg ring-2 ring-brand/30"
+                : "border-line-2 bg-panel-2 hover:border-brand hover:bg-brand-soft"
+            )}
           >
             <div className="mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-brand text-on-brand shadow-lg transition-transform group-hover:scale-105">
               <Upload className="h-7 w-7 stroke-[2.2]" />
@@ -297,24 +326,23 @@ export function MobileCameraUpload({
               Subir múltiples tickets a la vez
             </b>
             <span className="mt-1 text-xs text-muted max-w-xs">
-              Selecciona fotos de tu galería o archivos PDF. Procesamiento masivo con IA y detección de duplicados.
+              Arrastra o toca para seleccionar fotos o PDFs de tu galería. Se escanearán en HD CamScanner y se procesarán masivamente.
             </span>
 
             <div className="mt-4 flex items-center gap-2 rounded-full border border-line-2 bg-panel px-4 py-1.5 text-xs font-semibold text-ink shadow-sm">
               <Sparkles className="h-3.5 w-3.5 text-brand" />
-              <span>Elegir varios tickets a la vez</span>
+              <span>Elegir varios tickets a la vez (Fotos / PDFs)</span>
             </div>
-          </div>
+          </label>
 
           {/* Botón Secundario: Tomar Foto Directa con Cámara */}
-          <button
-            type="button"
-            onClick={() => cameraInputRef.current?.click()}
-            className="flex items-center justify-center gap-2.5 rounded-xl border border-line-2 bg-panel py-3 px-4 text-xs font-bold text-ink transition-all hover:bg-panel-2 active:scale-[0.99]"
+          <label
+            htmlFor="camera-ticket-file-input"
+            className="flex cursor-pointer items-center justify-center gap-2.5 rounded-xl border border-line-2 bg-panel py-3 px-4 text-xs font-bold text-ink transition-all hover:bg-panel-2 active:scale-[0.99]"
           >
             <Camera className="h-4 w-4 text-brand stroke-[2.2]" />
-            <span>Tomar foto con la cámara</span>
-          </button>
+            <span>Tomar foto con la cámara (Escaneo HD)</span>
+          </label>
         </div>
       )}
 
@@ -330,12 +358,13 @@ export function MobileCameraUpload({
                     ? "1 ticket preparado"
                     : `Lote de ${batchItems.length} tickets listos`}
                 </b>
-                <span className="rounded-full bg-brand-soft px-2.5 py-0.5 text-[11px] font-bold text-brand">
-                  Masivo
+                <span className="rounded-full bg-brand-soft px-2.5 py-0.5 text-[11px] font-bold text-brand flex items-center gap-1">
+                  <Sparkles className="h-3 w-3" />
+                  <span>Escaneo CamScanner HD</span>
                 </span>
               </div>
               <p className="text-xs text-muted">
-                Revisa tus comprobantes antes de iniciar el procesamiento concurrente
+                Tus comprobantes han sido optimizados en alto contraste. Se generará su PDF y se extraerán en paralelo.
               </p>
             </div>
 
@@ -393,6 +422,21 @@ export function MobileCameraUpload({
                     </div>
                   )}
 
+                  {/* Insignia CamScanner o PDF */}
+                  <div className="absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded-md bg-black/70 px-1.5 py-0.5 text-[9px] font-bold text-white shadow backdrop-blur-sm">
+                    {item.isPdf ? (
+                      <>
+                        <FileText className="h-2.5 w-2.5 text-blue-400" />
+                        <span>PDF</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="h-2.5 w-2.5 text-brand" />
+                        <span>CamScanner HD</span>
+                      </>
+                    )}
+                  </div>
+
                   {/* Insignia de duplicado */}
                   {item.isDuplicateInBatch && (
                     <div className="absolute top-1.5 left-1.5 flex items-center gap-1 rounded-md bg-amber-500 px-1.5 py-0.5 text-[9px] font-bold text-white shadow">
@@ -425,8 +469,8 @@ export function MobileCameraUpload({
             ))}
 
             {/* Tarjeta para agregar más */}
-            <div
-              onClick={() => galleryInputRef.current?.click()}
+            <label
+              htmlFor="batch-ticket-file-input"
               className="flex aspect-[3/4] cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-line-2 bg-panel p-2 text-center transition-all hover:border-brand hover:bg-brand-soft/50"
             >
               <div className="flex h-8 w-8 items-center justify-center rounded-full bg-panel-2 text-brand mb-1">
@@ -434,19 +478,18 @@ export function MobileCameraUpload({
               </div>
               <span className="text-[11px] font-bold text-ink">Agregar más</span>
               <span className="text-[9px] text-muted">Fotos o PDFs</span>
-            </div>
+            </label>
           </div>
 
           {/* Botones de Acción */}
           <div className="flex items-center gap-2 pt-2">
-            <button
-              type="button"
-              onClick={() => cameraInputRef.current?.click()}
-              className="flex items-center gap-1.5 rounded-xl border border-line-2 bg-panel px-3.5 py-2.5 text-xs font-semibold text-ink hover:bg-panel-2 transition-colors"
+            <label
+              htmlFor="camera-ticket-file-input"
+              className="flex cursor-pointer items-center gap-1.5 rounded-xl border border-line-2 bg-panel px-3.5 py-2.5 text-xs font-semibold text-ink hover:bg-panel-2 transition-colors"
             >
               <Camera className="h-3.5 w-3.5 text-brand" />
               <span>Cámara</span>
-            </button>
+            </label>
 
             <button
               type="button"
@@ -466,7 +509,7 @@ export function MobileCameraUpload({
                 <>
                   <span>
                     Procesar lote ({batchItems.length}{" "}
-                    {batchItems.length === 1 ? "ticket" : "tickets"}) en masa
+                    {batchItems.length === 1 ? "ticket" : "tickets"}) masivamente
                   </span>
                   <ArrowRight className="h-4 w-4" />
                 </>
@@ -531,7 +574,7 @@ export function MobileCameraUpload({
           {/* Visor de Bitácora SSE en Tiempo Real para el Ticket Seleccionado */}
           {activeTicketId && (
             <div className="rounded-xl border border-line bg-panel p-4 shadow-sm">
-              <div className="mb-2 flex items-center justify-between border-b border-line pb-2">
+              <div className="mb-2 flex items-center justify-between border-b border-line pb-2 flex-wrap gap-2">
                 <div>
                   <b className="text-xs font-bold text-ink">
                     Bitácora en Vivo del Agente
@@ -541,11 +584,24 @@ export function MobileCameraUpload({
                   </p>
                 </div>
 
-                {processedResults.find((r) => r.ticketId === activeTicketId)?.isDuplicate && (
-                  <span className="rounded-md bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 text-[10px] font-bold text-amber-600 dark:text-amber-400">
-                    Comprobante Duplicado
-                  </span>
-                )}
+                <div className="flex items-center gap-2">
+                  <a
+                    href={getScannedPdfDownloadUrl(activeTicketId, tenantId)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-1.5 rounded-lg border border-line-2 bg-panel-2 px-2.5 py-1 text-[11px] font-semibold text-ink hover:bg-panel transition-colors"
+                  >
+                    <FileText className="h-3.5 w-3.5 text-brand" />
+                    <span>Ver PDF CamScanner</span>
+                    <ExternalLink className="h-3 w-3 text-muted" />
+                  </a>
+
+                  {processedResults.find((r) => r.ticketId === activeTicketId)?.isDuplicate && (
+                    <span className="rounded-md bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 text-[10px] font-bold text-amber-600 dark:text-amber-400">
+                      Comprobante Duplicado
+                    </span>
+                  )}
+                </div>
               </div>
 
               {processedResults.find((r) => r.ticketId === activeTicketId)?.isDuplicate ? (

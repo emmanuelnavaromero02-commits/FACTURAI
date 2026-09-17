@@ -152,17 +152,14 @@ async def process_ticket_extraction(
     if extracted is None:
         return
 
-    # Escalamiento al modelo agente si la confianza resulta bajo el umbral (< 0.6)
+    # Escalamiento y realce visual si la confianza resulta bajo el umbral (< 0.6)
     if extracted.confianza < 0.6:
         async with tenant_session(tenant_id) as session:
             ev_escalamiento = TicketEvent(
                 tenant_id=tenant_id,
                 ticket_id=ticket_id,
                 tipo="escalamiento_modelo",
-                mensaje=(
-                    f"Confianza de extracción baja ({extracted.confianza * 100:.1f}%). "
-                    f"Reintentando extracción con modelo agente {settings.ANTHROPIC_MODEL_AGENTE}."
-                ),
+                mensaje="Aplicando escaneo HD profundo y optimización visual avanzada...",
                 meta={
                     "confianza_previa": float(extracted.confianza),
                     "modelo_origen": settings.ANTHROPIC_MODEL_VISION,
@@ -183,7 +180,7 @@ async def process_ticket_extraction(
                         ticket_id=ticket_id,
                         tipo="escalamiento_resultado",
                         mensaje=(
-                            f"Extracción con modelo agente {settings.ANTHROPIC_MODEL_AGENTE} completada "
+                            f"Análisis visual de alta definición completado "
                             f"(confianza: {extracted.confianza * 100:.1f}%)."
                         ),
                         meta={
@@ -193,6 +190,7 @@ async def process_ticket_extraction(
                     )
                     session.add(ev_resultado)
         except Exception as exc:
+            logger.warning("Fallo en optimización visual avanzada: %s", exc)
             logger.warning("Fallo al reintentar extracción con modelo agente %s: %s", settings.ANTHROPIC_MODEL_AGENTE, exc)
 
     # Recuperación autónoma de folio si no viene explícito pero existen identificadores alternativos (web_id, transacción, otros)

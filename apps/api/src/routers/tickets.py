@@ -1210,6 +1210,57 @@ async def get_ticket_image(
     )
 
 
+@router.get("/{ticket_id}/scanned-pdf")
+@router.get("/{ticket_id}/pdf")
+async def get_ticket_scanned_pdf(
+    ticket_id: uuid.UUID,
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Descarga o visualiza el documento PDF escaneado en HD estilo CamScanner del ticket.
+    Si el ticket fue subido originalmente como foto, se entrega el PDF generado con filtro HD.
+    """
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        res = await session.execute(
+            select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
+        )
+        ticket = res.scalar_one_or_none()
+        if not ticket:
+            raise RecursoNoEncontradoException("Ticket no encontrado.")
+
+        if not ticket.image_key or ticket.image_deleted_at:
+            raise RecursoNoEncontradoException("El documento no está disponible o ya fue eliminado por privacidad.")
+
+    storage = get_storage_service()
+    pdf_key = f"{ticket.image_key}.pdf"
+
+    try:
+        if await storage.exists(pdf_key):
+            pdf_bytes = await storage.get_bytes(pdf_key)
+        else:
+            raw_bytes = await storage.get_bytes(ticket.image_key)
+            if raw_bytes.startswith(b"%PDF"):
+                pdf_bytes = raw_bytes
+            else:
+                from ..vision.extractor import convert_image_to_camscanner_pdf
+                pdf_bytes = convert_image_to_camscanner_pdf(raw_bytes)
+                try:
+                    await storage.upload_bytes(pdf_key, pdf_bytes, "application/pdf")
+                except Exception:
+                    pass
+    except Exception as exc:
+        raise RecursoNoEncontradoException(f"No se pudo recuperar el PDF escaneado: {exc}")
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="ticket_{str(ticket_id)[:8]}_camscanner.pdf"',
+            "Cache-Control": "private, max-age=3600",
+        },
+    )
+
+
 @router.delete("/{ticket_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_ticket(
     ticket_id: uuid.UUID,
@@ -1217,7 +1268,7 @@ async def delete_ticket(
 ):
     """
     Elimina un ticket del tenant:
-    - Borra la imagen de S3/MinIO si no ha sido borrada aún.
+    - Borra la imagen y PDF escaneado de S3/MinIO si no han sido borrados aún.
     - Borra los eventos asociados y el ticket de la base de datos (con RLS activo).
     """
     async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
@@ -1230,10 +1281,11 @@ async def delete_ticket(
 
         storage = get_storage_service()
 
-        # Borrar imagen en S3/MinIO si existe
+        # Borrar imagen y PDF escaneado en S3/MinIO si existen
         if ticket.image_key and not ticket.image_deleted_at:
             try:
                 await storage.delete(ticket.image_key)
+                await storage.delete(f"{ticket.image_key}.pdf")
             except Exception:
                 pass
 

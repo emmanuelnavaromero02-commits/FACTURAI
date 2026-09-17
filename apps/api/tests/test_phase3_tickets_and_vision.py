@@ -595,7 +595,12 @@ async def test_upload_duplicate_identical_file():
         cookie = log_res.cookies.get(settings.SESSION_COOKIE_NAME)
         tenant_id = log_res.json()["created_tenant_id"]
 
-    same_bytes = VALID_JPEG_HEADER + b"_identical_ticket_bytes_"
+    # Generar un JPEG real válido con Pillow
+    from PIL import Image
+    _img = Image.new("RGB", (60, 60), color="white")
+    _buf = io.BytesIO()
+    _img.save(_buf, format="JPEG")
+    same_bytes = _buf.getvalue()
 
     async with AsyncClient(transport=transport, base_url="http://test", cookies={settings.SESSION_COOKIE_NAME: cookie}) as auth_client:
         # Subida 1
@@ -620,5 +625,14 @@ async def test_upload_duplicate_identical_file():
         assert t2["estado"] == "rechazado"
         assert t2["error_code"] == "duplicado"
         assert "duplicado" in t2["error_msg"].lower()
+
+        # Verificación de CamScanner Scanned PDF
+        pdf_res = await auth_client.get(
+            f"/v1/tickets/{t1['id']}/scanned-pdf",
+            headers={"X-Tenant-Id": tenant_id},
+        )
+        assert pdf_res.status_code == 200
+        assert pdf_res.headers["content-type"] == "application/pdf"
+        assert pdf_res.content.startswith(b"%PDF")
 
 

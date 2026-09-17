@@ -311,6 +311,11 @@ export function getCfdiPdfDownloadUrl(ticketId: string, tenantId?: string): stri
   return `${API_BASE_URL}/v1/tickets/${ticketId}/cfdi/pdf${query}`;
 }
 
+export function getScannedPdfDownloadUrl(ticketId: string, tenantId?: string): string {
+  const query = tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : "";
+  return `${API_BASE_URL}/v1/tickets/${ticketId}/scanned-pdf${query}`;
+}
+
 export function getCfdiXmlDownloadUrl(ticketId: string, tenantId?: string): string {
   const query = tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : "";
   return `${API_BASE_URL}/v1/tickets/${ticketId}/cfdi/xml${query}`;

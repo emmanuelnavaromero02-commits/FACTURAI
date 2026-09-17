@@ -60,9 +60,9 @@ async def process_and_stream_upload(
     storage: StorageService,
 ) -> Tuple[str, int, str, str]:
     """
-    Valida los magic bytes y transmite el archivo en streaming a S3/MinIO
-    sin cargar el contenido completo en memoria.
-    Calcula simultáneamente el hash SHA-256 en streaming.
+    Valida los magic bytes y transmite el archivo al almacenamiento efímero (S3/MinIO).
+    Calcula simultáneamente el hash SHA-256 para detección instantánea de duplicados.
+    Si es una foto, aplica automáticamente escaneo CamScanner HD y genera una versión PDF nítida.
     Retorna: (storage_key, total_bytes, mime_type, file_hash)
     """
     first_chunk = await file.read(CHUNK_SIZE)
@@ -79,6 +79,39 @@ async def process_and_stream_upload(
     hasher = hashlib.sha256()
     hasher.update(first_chunk)
 
+    # Si es imagen (JPEG, PNG, HEIC, WebP), procesar escaneo CamScanner HD y generar PDF
+    if mime_type.startswith("image/"):
+        chunks = [first_chunk]
+        while True:
+            chunk = await file.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > MAX_FILE_SIZE_BYTES:
+                raise ArchivoDemasiadoGrandeException()
+            hasher.update(chunk)
+            chunks.append(chunk)
+
+        raw_bytes = b"".join(chunks)
+        file_hash = hasher.hexdigest()
+
+        # 1. Aplicar filtro CamScanner HD a la imagen
+        try:
+            from ..vision.extractor import enhance_receipt_image, convert_image_to_camscanner_pdf
+
+            hd_image_bytes = enhance_receipt_image(raw_bytes)
+            await storage.upload_bytes(key, hd_image_bytes, "image/jpeg")
+
+            # 2. Generar y almacenar automáticamente el documento PDF escaneado
+            pdf_bytes = convert_image_to_camscanner_pdf(hd_image_bytes)
+            await storage.upload_bytes(f"{key}.pdf", pdf_bytes, "application/pdf")
+        except Exception:
+            # En caso de excepción, guardar la imagen original
+            await storage.upload_bytes(key, raw_bytes, mime_type)
+
+        return key, total_bytes, mime_type, file_hash
+
+    # Si es documento PDF nativo
     async def stream_generator() -> AsyncGenerator[bytes, None]:
         nonlocal total_bytes
         yield first_chunk
@@ -95,5 +128,11 @@ async def process_and_stream_upload(
 
     # Subida en streaming al bucket
     await storage.upload_stream(key, stream_generator(), mime_type)
+    # También asegurar la referencia .pdf para endpoints uniformes
+    try:
+        pdf_data = await storage.get_bytes(key)
+        await storage.upload_bytes(f"{key}.pdf", pdf_data, "application/pdf")
+    except Exception:
+        pass
 
     return key, total_bytes, mime_type, hasher.hexdigest()

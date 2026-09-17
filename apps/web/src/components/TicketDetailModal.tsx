@@ -44,6 +44,7 @@ import {
   getCfdiDownloadUrl,
   getCfdiPdfDownloadUrl,
   getCfdiXmlDownloadUrl,
+  getScannedPdfDownloadUrl,
   updateTicketPortal,
   deduceTicketPortal,
 } from "@/lib/api";
@@ -275,6 +276,16 @@ export function TicketDetailModal({
                   <span className="text-xs font-bold text-ink">Visor del Ticket Capturado</span>
                 </div>
                 <div className="flex items-center gap-2">
+                  <a
+                    href={getScannedPdfDownloadUrl(currentTicket.id, tenantId || undefined)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-1 text-[11px] font-semibold text-brand hover:underline"
+                    title="Ver o descargar PDF escaneado en HD estilo CamScanner"
+                  >
+                    <FileText className="h-3 w-3" />
+                    <span>PDF CamScanner</span>
+                  </a>
                   <button
                     type="button"
                     onClick={() => setIsZoomedImage(true)}
@@ -334,12 +345,20 @@ export function TicketDetailModal({
                   </span>
                   <div className="flex items-center gap-2">
                     <a
+                      href={getScannedPdfDownloadUrl(currentTicket.id, tenantId || undefined)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center gap-1 rounded-lg border border-brand/30 bg-brand-soft px-2.5 py-1 text-xs font-semibold text-brand hover:brightness-105"
+                    >
+                      <FileText className="h-3 w-3" /> Ver PDF CamScanner
+                    </a>
+                    <a
                       href={`${API_BASE_URL}/v1/tickets/${currentTicket.id}/image${tenantId ? `?tenant_id=${tenantId}` : ""}`}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="flex items-center gap-1 rounded-lg border border-line px-2.5 py-1 text-xs text-muted hover:text-ink"
                     >
-                      <ExternalLink className="h-3 w-3" /> Abrir pestaña
+                      <ExternalLink className="h-3 w-3" /> Abrir foto
                     </a>
                     <button
                       type="button"
