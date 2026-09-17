@@ -386,7 +386,15 @@ class AnthropicVisionExtractor(VisionExtractor):
             end_idx = raw_text.rfind("}") + 1
             raw_text = raw_text[start_idx:end_idx]
 
-        parsed_json = json.loads(raw_text)
+        # Limpieza robusta de JSON (comentarios y comas finales huérfanas producidas por LLMs)
+        cleaned_json = re.sub(r"//.*?\n", "\n", raw_text)
+        cleaned_json = re.sub(r",\s*([}\]])", r"\1", cleaned_json)
+
+        try:
+            parsed_json = json.loads(cleaned_json)
+        except Exception:
+            parsed_json = json.loads(raw_text)
+
         schema = VisionExtractionSchema.model_validate(parsed_json)
 
         meta = {

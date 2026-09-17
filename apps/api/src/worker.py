@@ -231,8 +231,10 @@ async def process_ticket_extraction(
             folio_dudoso = True
 
     # 6. Regla 5 del worker: verificar legibilidad y completitud sin malinterpretar
+    tiene_datos_esenciales = bool(extracted.folio and not folio_dudoso and total_norm is not None and total_norm > 0)
     es_ilegible = (
-        extracted.confianza < 0.6
+        (extracted.confianza < 0.6 and not tiene_datos_esenciales)
+        or (extracted.confianza < 0.45)
         or not extracted.folio
         or folio_dudoso
         or total_norm is None
