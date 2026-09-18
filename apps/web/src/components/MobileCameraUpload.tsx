@@ -40,6 +40,13 @@ interface ProcessedTicketStatus {
   ticket?: TicketResponse;
 }
 
+// Debe coincidir con MAX_FILE_SIZE_BYTES en apps/api/src/services/upload.py
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+// Fotos más grandes que esto se reducen en el navegador; 4096 px conserva de sobra el texto del ticket
+const MAX_UPLOAD_EDGE_PX = 4096;
+// Tope para no intentar decodificar archivos gigantes en el celular
+const MAX_RAW_INPUT_BYTES = 40 * 1024 * 1024;
+
 interface MobileCameraUploadProps {
   tenantId: string;
   onSuccess?: () => void;
@@ -64,12 +71,15 @@ export function MobileCameraUpload({
   const [processedResults, setProcessedResults] = useState<ProcessedTicketStatus[]>([]);
   const [activeTicketId, setActiveTicketId] = useState<string | null>(null);
 
-  // Compresión y escaneo CamScanner HD en el navegador para vista previa instantánea y máxima legibilidad
-  const compressImageIfNeeded = async (file: File): Promise<File> => {
+  // Prepara la foto para subirla SIN filtros: el texto del papel térmico es gris claro y
+  // cualquier aumento de contraste o brillo lo vuelve blanco. El servidor recorta el ticket
+  // sobre la foto original, así que aquí solo se reduce si es enorme o excede el límite.
+  const prepareImageForUpload = async (file: File): Promise<File> => {
     if (
       !file.type.match(/^image\/(jpeg|png|webp)$/i) &&
       !file.name.match(/\.(jpe?g|png|webp)$/i)
     ) {
+      // HEIC y PDF se envían tal cual; el servidor los decodifica
       return file;
     }
 
@@ -78,52 +88,44 @@ export function MobileCameraUpload({
       const objectUrl = URL.createObjectURL(file);
       img.onload = () => {
         URL.revokeObjectURL(objectUrl);
-        const maxDim = 1568; // Resolución ideal de escáner HD para folios y números pequeños
-        let width = img.width;
-        let height = img.height;
+        const longest = Math.max(img.width, img.height);
 
-        if (width > maxDim || height > maxDim) {
-          if (width > height) {
-            height = Math.round((height * maxDim) / width);
-            width = maxDim;
-          } else {
-            width = Math.round((width * maxDim) / height);
-            height = maxDim;
-          }
-        }
-
-        const canvas = document.createElement("canvas");
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext("2d", { willReadFrequently: true });
-        if (!ctx) {
+        // Foto original intacta: máxima nitidez para folios y códigos pequeños
+        if (longest <= MAX_UPLOAD_EDGE_PX && file.size <= MAX_UPLOAD_BYTES) {
           resolve(file);
           return;
         }
 
-        // Filtro estilo CamScanner HD: alto contraste, fondo blanco y tinta definida
-        try {
-          ctx.filter = "contrast(1.35) brightness(1.08) grayscale(0.2)";
-        } catch {
-          // Si el navegador no soporta ctx.filter, se dibuja normalmente
+        const scale = Math.min(1, MAX_UPLOAD_EDGE_PX / longest);
+        const width = Math.round(img.width * scale);
+        const height = Math.round(img.height * scale);
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve(file);
+          return;
         }
+        ctx.imageSmoothingQuality = "high";
         ctx.drawImage(img, 0, 0, width, height);
 
         canvas.toBlob(
           (blob) => {
             if (blob) {
-              const compressed = new File(
-                [blob],
-                file.name.replace(/\.[^.]+$/, ".jpg"),
-                { type: "image/jpeg", lastModified: Date.now() }
+              resolve(
+                new File([blob], file.name.replace(/\.[^.]+$/, ".jpg"), {
+                  type: "image/jpeg",
+                  lastModified: Date.now(),
+                })
               );
-              resolve(compressed);
             } else {
               resolve(file);
             }
           },
           "image/jpeg",
-          0.85
+          0.92
         );
       };
       img.onerror = () => {
@@ -146,8 +148,8 @@ export function MobileCameraUpload({
     );
 
     for (const rawFile of filesArray) {
-      if (rawFile.size > 25 * 1024 * 1024) {
-        setErrorMsg(`El archivo "${rawFile.name}" excede el tamaño máximo permitido de 25 MB.`);
+      if (rawFile.size > MAX_RAW_INPUT_BYTES) {
+        setErrorMsg(`El archivo "${rawFile.name}" es demasiado grande para procesarlo.`);
         continue;
       }
 
@@ -158,10 +160,18 @@ export function MobileCameraUpload({
       let processedFile = rawFile;
       if (!isPdfFile) {
         try {
-          processedFile = await compressImageIfNeeded(rawFile);
+          processedFile = await prepareImageForUpload(rawFile);
         } catch {
           // Fallback al original
         }
+      }
+
+      // Mismo límite que el servidor, para no fallar después de subir
+      if (processedFile.size > MAX_UPLOAD_BYTES) {
+        setErrorMsg(
+          `El archivo "${rawFile.name}" supera los 10 MB que acepta el servidor. Toma la foto de nuevo o exporta el PDF más ligero.`
+        );
+        continue;
       }
 
       const signature = `${processedFile.name}-${processedFile.size}`;
@@ -206,7 +216,7 @@ export function MobileCameraUpload({
 
     setUploading(true);
     setErrorMsg(null);
-    setUploadProgressText("Escaneando en HD y enviando tickets a la cola...");
+    setUploadProgressText("Enviando tickets a la cola...");
 
     try {
       const filesToUpload = batchItems.map((it) => it.file);
@@ -326,7 +336,7 @@ export function MobileCameraUpload({
               Subir múltiples tickets a la vez
             </b>
             <span className="mt-1 text-xs text-muted max-w-xs">
-              Arrastra o toca para seleccionar fotos o PDFs de tu galería. Se escanearán en HD CamScanner y se procesarán masivamente.
+              Arrastra o toca para seleccionar fotos o PDFs de tu galería. Se envía la foto original, sin filtros, para leer bien folios y códigos.
             </span>
 
             <div className="mt-4 flex items-center gap-2 rounded-full border border-line-2 bg-panel px-4 py-1.5 text-xs font-semibold text-ink shadow-sm">
@@ -341,7 +351,7 @@ export function MobileCameraUpload({
             className="flex cursor-pointer items-center justify-center gap-2.5 rounded-xl border border-line-2 bg-panel py-3 px-4 text-xs font-bold text-ink transition-all hover:bg-panel-2 active:scale-[0.99]"
           >
             <Camera className="h-4 w-4 text-brand stroke-[2.2]" />
-            <span>Tomar foto con la cámara (Escaneo HD)</span>
+            <span>Tomar foto con la cámara</span>
           </label>
         </div>
       )}
@@ -360,11 +370,11 @@ export function MobileCameraUpload({
                 </b>
                 <span className="rounded-full bg-brand-soft px-2.5 py-0.5 text-[11px] font-bold text-brand flex items-center gap-1">
                   <Sparkles className="h-3 w-3" />
-                  <span>Escaneo CamScanner HD</span>
+                  <span>Foto original HD</span>
                 </span>
               </div>
               <p className="text-xs text-muted">
-                Tus comprobantes han sido optimizados en alto contraste. Se generará su PDF y se extraerán en paralelo.
+                Se enviarán las fotos originales, sin filtros. El sistema ubica el ticket, genera su PDF y los lee en paralelo.
               </p>
             </div>
 
@@ -432,7 +442,7 @@ export function MobileCameraUpload({
                     ) : (
                       <>
                         <Sparkles className="h-2.5 w-2.5 text-brand" />
-                        <span>CamScanner HD</span>
+                        <span>Original HD</span>
                       </>
                     )}
                   </div>

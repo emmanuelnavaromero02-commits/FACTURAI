@@ -41,27 +41,59 @@ class VisionExtractionSchema(BaseModel):
     confianza: float = Field(0.0, ge=0.0, le=1.0)
 
 
-def extract_qr_code(image_bytes: bytes) -> Optional[str]:
+# Si la imagen es pequeña, los QR del ticket miden pocos píxeles: se reintenta ampliada
+QR_UPSCALE_MAX_EDGE = 2000
+
+
+def extract_all_codes(image_bytes: bytes) -> List[str]:
     """
-    Intenta decodificar un código QR presente en la imagen del ticket.
-    Muchos tickets mexicanos contienen en el QR la URL de facturación directa.
+    Decodifica TODOS los códigos QR y de barras de la imagen, en orden de aparición.
+    Un ticket puede traer varios (facturación, publicidad, encuesta), así que no basta con el primero.
     """
     if zxingcpp is None:
-        return None
+        return []
 
     try:
+        try:
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+        except Exception:
+            pass
         image = Image.open(io.BytesIO(image_bytes))
-        result = zxingcpp.read_barcode(image)
-        if result and result.valid and result.text:
-            text_found = result.text.strip()
-            # Si el QR contiene una URL o liga HTTP/HTTPS
-            if text_found.startswith("http://") or text_found.startswith("https://"):
-                return text_found
-            return text_found
-    except Exception as exc:
-        logger.debug("No se pudo leer QR de la imagen: %s", exc)
+        image = ImageOps.exif_transpose(image) or image
+        gray = image.convert("L")
 
-    return None
+        texts: List[str] = []
+        for r in zxingcpp.read_barcodes(gray):
+            if r.valid and r.text and r.text.strip() not in texts:
+                texts.append(r.text.strip())
+
+        if max(gray.size) <= QR_UPSCALE_MAX_EDGE:
+            big = gray.resize((gray.width * 2, gray.height * 2), Image.Resampling.LANCZOS)
+            for r in zxingcpp.read_barcodes(big):
+                if r.valid and r.text and r.text.strip() not in texts:
+                    texts.append(r.text.strip())
+        return texts
+    except Exception as exc:
+        logger.debug("No se pudieron leer códigos de la imagen: %s", exc)
+        return []
+
+
+def extract_qr_code(image_bytes: bytes) -> Optional[str]:
+    """
+    Devuelve el código más útil para facturar entre todos los que trae el ticket:
+    primero una URL que parezca portal de facturación, luego cualquier URL y al final cualquier texto.
+    """
+    from .url_sanitizer import looks_like_billing_url
+
+    texts = extract_all_codes(image_bytes)
+    urls = [t for t in texts if t.lower().startswith(("http://", "https://", "www."))]
+    for u in urls:
+        if looks_like_billing_url(u):
+            return u
+    if urls:
+        return urls[0]
+    return texts[0] if texts else None
 
 
 class VisionExtractor(abc.ABC):
@@ -298,6 +330,9 @@ def enhance_receipt_image(image_bytes: bytes) -> bytes:
         return image_bytes
 
 
+PDF_MAX_EDGE = 2480
+
+
 def convert_image_to_camscanner_pdf(image_bytes: bytes) -> bytes:
     """
     Convierte una imagen de ticket a un PDF escaneado en alta resolución:
@@ -314,6 +349,8 @@ def convert_image_to_camscanner_pdf(image_bytes: bytes) -> bytes:
 
     try:
         img = Image.open(io.BytesIO(image_bytes))
+        # La foto original puede ser de 12 MP o más; para el PDF basta el ancho de un A4 a 300 dpi
+        img.thumbnail((PDF_MAX_EDGE, PDF_MAX_EDGE), Image.Resampling.LANCZOS)
         hd_img = clean_camscanner_hd(img)
 
         buf = io.BytesIO()
@@ -390,11 +427,38 @@ def generate_vision_recovery_variants(image_bytes: bytes) -> list[tuple[str, byt
     return variants
 
 
-def prepare_image_for_anthropic(image_bytes: bytes) -> tuple[str, str]:
+# Modelos con visión de alta resolución: aceptan hasta 2576 px en el lado mayor.
+# Los demás (p. ej. claude-haiku-4-5) reescalan internamente a 1568 px.
+HIGH_RES_VISION_MODEL_PREFIXES = (
+    "claude-sonnet-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-fable-5",
+    "claude-mythos-5",
+)
+DEFAULT_MAX_IMAGE_EDGE = 1568
+HIGH_RES_MAX_IMAGE_EDGE = 2576
+# Factor máximo de ampliación para un recorte pequeño (más píxeles por carácter para el modelo)
+MAX_CROP_UPSCALE = 3.0
+# Por debajo de este tamaño no vale la pena ubicar el ticket dentro de la imagen
+MIN_EDGE_FOR_TICKET_LOCATOR = 300
+LOCATOR_PREVIEW_EDGE = 1024
+
+
+def max_image_edge_for_model(model: Optional[str]) -> int:
+    """Lado mayor máximo que conviene enviar al modelo de visión indicado."""
+    normalized = (model or "").strip().lower()
+    if normalized.startswith(HIGH_RES_VISION_MODEL_PREFIXES):
+        return HIGH_RES_MAX_IMAGE_EDGE
+    return DEFAULT_MAX_IMAGE_EDGE
+
+
+def load_ticket_image(image_bytes: bytes) -> Image.Image:
     """
-    Optimiza y convierte la imagen a formato JPEG en base64 para la API de visión.
-    Preserva máxima fidelidad de color y microtextos térmicos sin quemar blancos.
-    Redimensiona proporcionalmente a máximo 1568px en el lado mayor.
+    Abre la imagen sin alterar sus píxeles: corrige la orientación EXIF, la pasa a RGB
+    y quita franjas negras de capturas de pantalla. No aplica contraste, brillo ni enfoque:
+    en papel térmico esos filtros borran la tinta tenue.
     """
     try:
         import pillow_heif
@@ -402,34 +466,163 @@ def prepare_image_for_anthropic(image_bytes: bytes) -> tuple[str, str]:
     except Exception:
         pass
 
+    img = Image.open(io.BytesIO(image_bytes))
+    img = ImageOps.exif_transpose(img) or img
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    return remove_black_letterbox(img)
+
+
+def scale_for_model(img: Image.Image, max_edge: int, max_upscale: float = 1.0) -> Image.Image:
+    """
+    Ajusta la imagen para que su lado mayor quede en max_edge.
+    Reduce siempre que sobrepase el límite y solo amplía hasta max_upscale veces.
+    """
+    longest = max(img.size)
+    if longest <= 0:
+        return img
+    factor = min(max_edge / longest, max_upscale)
+    if abs(factor - 1.0) < 0.01:
+        return img
+    new_size = (max(1, round(img.size[0] * factor)), max(1, round(img.size[1] * factor)))
+    return img.resize(new_size, Image.Resampling.LANCZOS)
+
+
+def encode_jpeg_b64(img: Image.Image, quality: int = 92) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def expand_and_validate_bbox(
+    bbox: tuple[float, float, float, float],
+    image_size: tuple[int, int],
+    margin_ratio: float = 0.03,
+) -> Optional[tuple[int, int, int, int]]:
+    """
+    Valida la caja del ticket (en píxeles de la imagen original) y le agrega un margen.
+    Devuelve None si la caja es inválida, diminuta o si ya ocupa casi toda la imagen.
+    """
+    w, h = image_size
+    x0, y0, x1, y1 = bbox
+    x0, x1 = sorted((max(0.0, min(float(x0), w)), max(0.0, min(float(x1), w))))
+    y0, y1 = sorted((max(0.0, min(float(y0), h)), max(0.0, min(float(y1), h))))
+    bw, bh = x1 - x0, y1 - y0
+    if bw < 20 or bh < 20:
+        return None
+    area_ratio = (bw * bh) / float(w * h)
+    if area_ratio < 0.02 or area_ratio > 0.85:
+        return None
+    margin = max(8.0, margin_ratio * max(bw, bh))
+    return (
+        int(max(0, x0 - margin)),
+        int(max(0, y0 - margin)),
+        int(min(w, x1 + margin)),
+        int(min(h, y1 + margin)),
+    )
+
+
+def _parse_json_object(text: str) -> Dict[str, Any]:
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("La respuesta no contiene un objeto JSON.")
+    return json.loads(text[start : end + 1])
+
+
+async def locate_ticket_bbox(
+    img: Image.Image,
+    api_key: str,
+    model: str,
+) -> tuple[Optional[tuple[int, int, int, int]], Dict[str, int]]:
+    """
+    Ubica el ticket de papel dentro de la fotografía con un modelo rápido sobre una vista reducida.
+    Devuelve la caja en píxeles de la imagen original (o None para usar la imagen completa)
+    y el uso de tokens de la llamada. Cualquier falla devuelve None: el recorte nunca bloquea la lectura.
+    """
+    usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+    if max(img.size) < MIN_EDGE_FOR_TICKET_LOCATOR:
+        return None, usage
+
+    preview = scale_for_model(img, LOCATOR_PREVIEW_EDGE)
+    pw, ph = preview.size
+    payload: Dict[str, Any] = {
+        "model": model,
+        "max_tokens": 300,
+        "system": "Localizas el ticket de compra impreso en papel dentro de una fotografía.",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": encode_jpeg_b64(preview, 85)},
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            f"La imagen mide {pw}x{ph} píxeles. Devuelve SOLO un objeto JSON con la caja que "
+                            "contiene el ticket de papel completo, incluyendo encabezado, códigos QR y pie: "
+                            '{"encontrado": true, "x0": entero, "y0": entero, "x1": entero, "y1": entero} '
+                            "en píxeles de esta imagen, donde (x0, y0) es la esquina superior izquierda. "
+                            'Si no hay un ticket visible responde {"encontrado": false}.'
+                        ),
+                    },
+                ],
+            }
+        ],
+    }
+    if model.strip().lower().startswith("claude-haiku"):
+        payload["temperature"] = 0.0
+
     try:
-        img = Image.open(io.BytesIO(image_bytes))
-        img = ImageOps.exif_transpose(img) or img
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json=payload,
+            )
+        if response.status_code != 200:
+            logger.warning("Localizador de ticket respondió %s; se usa la imagen completa.", response.status_code)
+            return None, usage
 
-        # Quitar franjas negras de encuadre si las hay
-        img = remove_black_letterbox(img)
+        data = response.json()
+        raw_usage = data.get("usage", {}) or {}
+        usage = {
+            "input_tokens": int(raw_usage.get("input_tokens", 0) or 0),
+            "output_tokens": int(raw_usage.get("output_tokens", 0) or 0),
+        }
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        parsed = _parse_json_object(text)
+        if not parsed.get("encontrado"):
+            return None, usage
 
-        # Aplicar realce suave
-        img = clean_camscanner_hd(img)
+        sx, sy = img.size[0] / pw, img.size[1] / ph
+        bbox = (
+            float(parsed["x0"]) * sx,
+            float(parsed["y0"]) * sy,
+            float(parsed["x1"]) * sx,
+            float(parsed["y1"]) * sy,
+        )
+        return expand_and_validate_bbox(bbox, img.size), usage
+    except Exception as exc:
+        logger.warning("No se pudo ubicar el ticket en la imagen; se usa la imagen completa: %s", type(exc).__name__)
+        return None, usage
 
-        # Limitar a máximo 1568px para velocidad y precisión óptima de Claude Vision
-        max_dim = 1568
-        if max(img.size) > max_dim:
-            scale = max_dim / max(img.size)
-            new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
-            img = img.resize(new_size, Image.Resampling.LANCZOS)
 
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=90, optimize=True)
-        out_bytes = buf.getvalue()
-        media_type = "image/jpeg"
+def prepare_image_for_anthropic(image_bytes: bytes, max_dim: int = DEFAULT_MAX_IMAGE_EDGE) -> tuple[str, str]:
+    """
+    Convierte la imagen a JPEG en base64 para la API de visión SIN filtros de contraste ni enfoque.
+    Corrige orientación EXIF, quita franjas negras y reduce a max_dim en el lado mayor.
+    """
+    try:
+        img = scale_for_model(load_ticket_image(image_bytes), max_dim)
+        return encode_jpeg_b64(img), "image/jpeg"
     except Exception:
-        out_bytes = image_bytes
-        media_type = "image/jpeg"
-
-    return base64.b64encode(out_bytes).decode("utf-8"), media_type
+        return base64.b64encode(image_bytes).decode("utf-8"), "image/jpeg"
 
 
 class AnthropicVisionExtractor(VisionExtractor):
@@ -442,10 +635,43 @@ class AnthropicVisionExtractor(VisionExtractor):
         self,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
+        recortar_ticket: Optional[bool] = None,
     ):
         settings = get_settings()
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY") or settings.ANTHROPIC_API_KEY
         self.model = model or os.environ.get("ANTHROPIC_MODEL_VISION") or settings.ANTHROPIC_MODEL_VISION
+        self.recortar_ticket = settings.VISION_RECORTE_TICKET if recortar_ticket is None else recortar_ticket
+        self.modelo_localizador = settings.ANTHROPIC_MODEL_LOCALIZADOR
+
+    async def _prepare_image(self, image_bytes: bytes, model: str) -> tuple[str, str, Dict[str, Any]]:
+        """
+        Prepara la imagen para el modelo de lectura:
+        1. La abre sin filtros (solo orientación EXIF y franjas negras).
+        2. Ubica el ticket y recorta el fondo (mesa, mano, piso).
+        3. Ajusta el recorte al tamaño máximo que aprovecha el modelo, ampliándolo si es pequeño.
+        """
+        max_edge = max_image_edge_for_model(model)
+        info: Dict[str, Any] = {"recorte_ticket": False, "recorte_bbox": None, "localizador_tokens": None}
+        try:
+            img = load_ticket_image(image_bytes)
+        except Exception:
+            b64, media_type = prepare_image_for_anthropic(image_bytes, max_edge)
+            return b64, media_type, info
+
+        bbox = None
+        if self.recortar_ticket and self.modelo_localizador:
+            bbox, locator_usage = await locate_ticket_bbox(img, self.api_key, self.modelo_localizador)
+            info["localizador_tokens"] = locator_usage
+
+        if bbox:
+            img = scale_for_model(img.crop(bbox), max_edge, MAX_CROP_UPSCALE)
+            info["recorte_ticket"] = True
+            info["recorte_bbox"] = list(bbox)
+        else:
+            img = scale_for_model(img, max_edge)
+
+        info["tamano_enviado"] = list(img.size)
+        return encode_jpeg_b64(img), "image/jpeg", info
 
     async def extract_with_usage(
         self,
@@ -463,11 +689,12 @@ class AnthropicVisionExtractor(VisionExtractor):
             )
 
         active_model = model or self.model
-        b64_image, media_type = prepare_image_for_anthropic(image_bytes)
+        b64_image, media_type, image_info = await self._prepare_image(image_bytes, active_model)
 
         payload = {
             "model": active_model,
-            "max_tokens": 1500,
+            # Holgura para el razonamiento adaptativo de los modelos actuales: si se queda corto, no llega el JSON
+            "max_tokens": 4096,
             "system": TICKET_SYSTEM_PROMPT,
             "messages": [
                 {
@@ -525,9 +752,15 @@ class AnthropicVisionExtractor(VisionExtractor):
         else:
             cost_usd = None
 
+        stop_reason = resp_data.get("stop_reason")
+        if stop_reason == "refusal":
+            raise ValueError("El modelo de visión declinó procesar la imagen.")
+
         content_list = resp_data.get("content", [])
         text_response = "".join(b.get("text", "") for b in content_list if b.get("type") == "text").strip()
         if not text_response:
+            if stop_reason == "max_tokens":
+                raise ValueError("La respuesta del modelo de visión se cortó antes de entregar el JSON.")
             raise ValueError("Respuesta vacía o inesperada de la API de Anthropic.")
 
         raw_text = text_response
@@ -566,6 +799,7 @@ class AnthropicVisionExtractor(VisionExtractor):
             "elapsed_seconds": round(elapsed, 2),
             "media_type": media_type,
             "image_size_bytes": len(image_bytes),
+            **image_info,
         }
 
         return schema, meta

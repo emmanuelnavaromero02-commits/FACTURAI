@@ -292,11 +292,15 @@ async def test_vision_fixtures_outcomes(owner_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_vision_model_escalation_records_ticket_events(owner_session):
+async def test_vision_model_escalation_records_ticket_events(owner_session, monkeypatch):
     """
     PRUEBA: Si la confianza es baja (< 0.6) con ANTHROPIC_MODEL_VISION,
     el worker escala UNA vez a ANTHROPIC_MODEL_AGENTE y registra el evento en ticket_events.
     """
+    # Modelos fijos de prueba: no depender de los valores del .env local
+    monkeypatch.setattr(settings, "ANTHROPIC_MODEL_VISION", "modelo-vision-prueba")
+    monkeypatch.setattr(settings, "ANTHROPIC_MODEL_AGENTE", "modelo-agente-prueba")
+
     storage = InMemoryStorageService()
     set_storage_service(storage)
     vision = FakeVisionExtractor()
@@ -362,6 +366,65 @@ async def test_vision_model_escalation_records_ticket_events(owner_session):
         t = t_res.scalar_one()
         assert t.estado in (TicketEstado.EXTRAIDO, TicketEstado.ENCOLADO)
         assert t.confianza >= Decimal("0.6")
+
+
+@pytest.mark.asyncio
+async def test_escalation_uses_fallback_model_when_agent_equals_vision(owner_session, monkeypatch):
+    """
+    PRUEBA: Si el modelo de visión y el del agente son el mismo, releer con ese modelo no aporta nada;
+    el escalamiento por baja confianza debe usar ANTHROPIC_MODEL_FALLBACK con la foto original.
+    """
+    monkeypatch.setattr(settings, "ANTHROPIC_MODEL_VISION", "modelo-compartido-prueba")
+    monkeypatch.setattr(settings, "ANTHROPIC_MODEL_AGENTE", "modelo-compartido-prueba")
+    monkeypatch.setattr(settings, "ANTHROPIC_MODEL_FALLBACK", "modelo-respaldo-prueba")
+
+    class VisionPorModelo(FakeVisionExtractor):
+        """Lee borroso con cualquier modelo excepto el de respaldo; registra los bytes recibidos."""
+
+        def __init__(self):
+            super().__init__()
+            self.bytes_por_modelo = {}
+
+        async def extract(self, image_bytes, model=None):
+            self.bytes_por_modelo.setdefault(model, image_bytes)
+            if model == "modelo-respaldo-prueba":
+                return self._fixtures["bueno"]
+            return self._fixtures["borroso"]
+
+    storage = InMemoryStorageService()
+    set_storage_service(storage)
+    vision = VisionPorModelo()
+    set_vision_extractor(vision)
+
+    t_id, u_id, ticket_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    tenant = Tenant(id=t_id, nombre="Empresa Respaldo", slug=f"resp-{t_id.hex[:6]}", plan="free")
+    user = User(id=u_id, email=f"user-{u_id.hex[:6]}@test.com", nombre="User", google_sub=f"sub-{u_id.hex}")
+    owner_session.add_all([tenant, user])
+    await owner_session.flush()
+
+    image_key = f"tickets/{t_id}/{ticket_id}"
+    await storage.upload_bytes(image_key, VALID_JPEG_HEADER, "image/jpeg")
+    await owner_session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(t_id)})
+    owner_session.add(
+        Ticket(id=ticket_id, tenant_id=t_id, created_by=u_id, estado=TicketEstado.RECIBIDO, image_key=image_key)
+    )
+    await owner_session.commit()
+
+    await process_ticket_extraction(t_id, ticket_id)
+
+    async with tenant_session(t_id) as session:
+        ev_res = await session.execute(
+            select(TicketEvent).where(TicketEvent.ticket_id == ticket_id, TicketEvent.tipo == "escalamiento_modelo")
+        )
+        ev_esc = ev_res.scalars().first()
+        assert ev_esc is not None
+        assert ev_esc.meta["modelo_destino"] == "modelo-respaldo-prueba"
+
+        t = (await session.execute(select(Ticket).where(Ticket.id == ticket_id))).scalar_one()
+        assert t.confianza >= Decimal("0.6")
+
+    # El reintento recibe la foto original, sin filtros de realce
+    assert vision.bytes_por_modelo["modelo-respaldo-prueba"] == VALID_JPEG_HEADER
 
 
 @pytest.mark.asyncio

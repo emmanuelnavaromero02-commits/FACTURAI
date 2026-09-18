@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     ANTHROPIC_MODEL_VISION: str = "claude-opus-5"
     ANTHROPIC_MODEL_AGENTE: str = "claude-fable-5-1"
     ANTHROPIC_MODEL_FALLBACK: str = "claude-sonnet-5"
+    # Modelo rápido que ubica el ticket dentro de la foto antes de leerlo
+    ANTHROPIC_MODEL_LOCALIZADOR: str = "claude-haiku-4-5"
+    # Recortar el ticket del fondo antes de mandarlo al modelo de lectura
+    VISION_RECORTE_TICKET: bool = True
 
     # Agente Genérico Web y Control de Costos (Paso B)
     COSTO_MAXIMO_POR_TICKET_USD: Decimal = Decimal("0.50")

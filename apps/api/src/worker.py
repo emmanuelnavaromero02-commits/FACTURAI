@@ -25,14 +25,13 @@ from .services.fiscal_classifier import analyze_fiscal_classification
 from .state_machine import transition
 from .storage import get_storage_service
 from .vision.extractor import (
-    enhance_receipt_image,
     extract_qr_code,
     generate_vision_recovery_variants,
     get_vision_extractor,
 )
 from .vision.merchant_matcher import match_merchant_cascade
 from .vision.normalizer import normalize_amount, normalize_date, normalize_time
-from .vision.url_sanitizer import sanitize_and_classify_billing_url
+from .vision.url_sanitizer import choose_billing_url, sanitize_and_classify_billing_url
 
 logger = logging.getLogger(__name__)
 
@@ -157,26 +156,30 @@ async def process_ticket_extraction(
     if extracted is None:
         return
 
-    # Escalamiento y realce visual si la confianza resulta bajo el umbral (< 0.6)
+    # Escalamiento a un modelo distinto si la confianza resulta bajo el umbral (< 0.6).
+    # Se relee la foto original: los filtros de contraste borran la tinta térmica tenue.
     if extracted.confianza < 0.6:
+        modelo_escalamiento = settings.ANTHROPIC_MODEL_AGENTE
+        if not modelo_escalamiento or modelo_escalamiento == settings.ANTHROPIC_MODEL_VISION:
+            modelo_escalamiento = settings.ANTHROPIC_MODEL_FALLBACK or settings.ANTHROPIC_MODEL_VISION
+
         async with tenant_session(tenant_id) as session:
             ev_escalamiento = TicketEvent(
                 tenant_id=tenant_id,
                 ticket_id=ticket_id,
                 tipo="escalamiento_modelo",
-                mensaje="Aplicando escaneo HD profundo y optimización visual avanzada...",
+                mensaje=f"Lectura con baja confianza. Releyendo el ticket con el modelo {modelo_escalamiento}...",
                 meta={
                     "confianza_previa": float(extracted.confianza),
                     "modelo_origen": settings.ANTHROPIC_MODEL_VISION,
-                    "modelo_destino": settings.ANTHROPIC_MODEL_AGENTE,
+                    "modelo_destino": modelo_escalamiento,
                 },
             )
             session.add(ev_escalamiento)
 
         try:
-            enhanced_bytes = enhance_receipt_image(image_bytes)
-            vision_agente = get_vision_extractor(model=settings.ANTHROPIC_MODEL_AGENTE)
-            escalated_extracted = await vision_agente.extract(enhanced_bytes, model=settings.ANTHROPIC_MODEL_AGENTE)
+            vision_agente = get_vision_extractor(model=modelo_escalamiento)
+            escalated_extracted = await vision_agente.extract(image_bytes, model=modelo_escalamiento)
             if escalated_extracted is not None:
                 extracted = escalated_extracted
                 async with tenant_session(tenant_id) as session:
@@ -190,13 +193,12 @@ async def process_ticket_extraction(
                         ),
                         meta={
                             "confianza_nueva": float(extracted.confianza),
-                            "modelo": settings.ANTHROPIC_MODEL_AGENTE,
+                            "modelo": modelo_escalamiento,
                         },
                     )
                     session.add(ev_resultado)
         except Exception as exc:
-            logger.warning("Fallo en optimización visual avanzada: %s", exc)
-            logger.warning("Fallo al reintentar extracción con modelo agente %s: %s", settings.ANTHROPIC_MODEL_AGENTE, exc)
+            logger.warning("Fallo al releer ticket %s con modelo %s: %s", ticket_id, modelo_escalamiento, type(exc).__name__)
 
     # Recuperación autónoma de folio si no viene explícito pero existen identificadores alternativos (web_id, transacción, otros)
     if not extracted.folio:
@@ -346,7 +348,8 @@ async def process_ticket_extraction(
     # 7. Limpieza de URLs y discriminación de QR del SAT
     sanitized_qr = sanitize_and_classify_billing_url(qr_url)
     sanitized_printed = sanitize_and_classify_billing_url(extracted.url_facturacion) if extracted else None
-    billing_url = sanitized_qr or sanitized_printed
+    # Un QR publicitario (sitio del comercio) no debe ganarle a la URL de facturación impresa
+    billing_url = choose_billing_url(sanitized_qr, sanitized_printed)
 
     # 8. Identificación del comercio en cascada (si no es ilegible)
     matched_merchant = None

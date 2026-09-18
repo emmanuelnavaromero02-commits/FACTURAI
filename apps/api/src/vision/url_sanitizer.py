@@ -84,3 +84,38 @@ def sanitize_and_classify_billing_url(raw_url: Optional[str]) -> Optional[str]:
     ))
 
     return normalized
+
+
+# Pistas en el dominio o la ruta que indican un portal de facturación y no publicidad
+BILLING_URL_HINTS = (
+    "factur",
+    "invoice",
+    "billing",
+    "cfdi",
+    "timbr",
+    "autofact",
+    "efactura",
+    "e-factura",
+    "comprobante",
+)
+
+
+def looks_like_billing_url(url: Optional[str]) -> bool:
+    """True si la URL parece llevar a un portal de facturación."""
+    if not url:
+        return False
+    low = url.lower()
+    return any(hint in low for hint in BILLING_URL_HINTS)
+
+
+def choose_billing_url(qr_url: Optional[str], printed_url: Optional[str]) -> Optional[str]:
+    """
+    Elige la URL de facturación entre la del código QR y la impresa en el ticket.
+    El QR gana si parece de facturación, porque se lee sin errores de OCR.
+    Si el QR no lo parece (p. ej. el sitio del restaurante) y la impresa sí, gana la impresa.
+    """
+    if qr_url and looks_like_billing_url(qr_url):
+        return qr_url
+    if printed_url and looks_like_billing_url(printed_url):
+        return printed_url
+    return qr_url or printed_url
