@@ -2,6 +2,7 @@ import asyncio
 import base64
 from decimal import Decimal
 import io
+import json
 import logging
 import os
 import shutil
@@ -35,9 +36,15 @@ from .stealth_utils import (
 )
 from ..services.merchant_learner import extract_portal_recipe_from_page, learn_merchant_recipe
 from ..services.portal_searcher import search_candidate_portal_urls, verify_portal_matches_ticket
-from ..vision.url_sanitizer import sanitize_and_classify_billing_url
+from ..vision.url_sanitizer import choose_start_url, sanitize_and_classify_billing_url
 
 logger = logging.getLogger(__name__)
+
+
+def _merchant_config(ctx: EngineContext) -> Dict[str, Any]:
+    """Configuración del comercio del catálogo, o un dict vacío si no hay comercio."""
+    config_comercio = ctx.merchant.config if ctx.merchant else None
+    return config_comercio if isinstance(config_comercio, dict) else {}
 
 
 @register_engine("generico-web")
@@ -54,6 +61,16 @@ class GenericWebEngine(FacturacionEngine):
     def __init__(self, brain: Optional[AgentBrain] = None):
         self.brain = brain or AnthropicAgentBrain()
 
+    async def resolve_start_url(self, ctx: EngineContext) -> Optional[str]:
+        """
+        URL con la que arranca el motor.
+        La del ticket va primero: ahí quedan el portal alternativo que eligió el worker tras un fallo
+        y el portal que el usuario indicó a mano. La del catálogo del comercio es el respaldo.
+        Se salta cualquier URL cuyo dominio no existe, para no gastar un intento en un portal muerto.
+        """
+        merchant_url = _merchant_config(ctx).get("url_facturacion")
+        return await choose_start_url(ctx.ticket.url_facturacion, merchant_url)
+
     async def facturar(self, ctx: EngineContext) -> EngineResult:
         settings = get_settings()
         ticket = ctx.ticket
@@ -61,16 +78,8 @@ class GenericWebEngine(FacturacionEngine):
         storage = get_storage_service()
 
         start_time = time.time()
-        # Si el comercio tiene portal_url oficial en su config, usarlo con máxima prioridad
-        merchant_url = None
-        merchant_config = (
-            ctx.merchant.config
-            if (ctx.merchant and ctx.merchant.config and isinstance(ctx.merchant.config, dict))
-            else {}
-        )
-        if merchant_config:
-            merchant_url = merchant_config.get("url_facturacion")
-        raw_url = merchant_url or ticket.url_facturacion
+        merchant_config = _merchant_config(ctx)
+        raw_url = await self.resolve_start_url(ctx)
 
         # Si la URL es un hub genérico de red o ticket de gasolinera, refinar al portal exacto de la estación
         is_hub = bool(raw_url and any(h in raw_url.lower() for h in ("g500network.com", "efectifactura.com")))

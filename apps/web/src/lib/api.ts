@@ -243,6 +243,16 @@ export async function retryTicket(tenantId: string, ticketId: string): Promise<T
   );
 }
 
+export async function resolveTicket(tenantId: string, ticketId: string): Promise<TicketResponse> {
+  return fetchWithAuth<TicketResponse>(
+    `/v1/tickets/${ticketId}/resolve`,
+    {
+      method: "POST",
+    },
+    tenantId
+  );
+}
+
 export async function facturarTicket(tenantId: string, ticketId: string): Promise<TicketResponse> {
   return fetchWithAuth<TicketResponse>(
     `/v1/tickets/${ticketId}/facturar`,

@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState } from "react";
 import { useAuth } from "@/lib/auth-context";
-import { deleteTicket, facturarTicket, getTickets, retryTicket } from "@/lib/api";
+import { deleteTicket, facturarTicket, getTickets, retryTicket, resolveTicket } from "@/lib/api";
 import { TicketResponse } from "@/types/api";
 import { StatusBadge } from "@/components/StatusBadge";
 import { CfdiDownloadButton } from "@/components/CfdiDownloadButton";
@@ -217,6 +217,22 @@ export default function TicketsPage() {
     }
   };
 
+  const handleResolver = async (t: TicketResponse) => {
+    const isLiveCaptcha =
+      t.error_code === "captcha_requerido" || t.error_code === "intervencion_humana";
+    if (isLiveCaptcha) {
+      setSelectedTicketForHandoff(t);
+      return;
+    }
+    if (!tenantId) return;
+    try {
+      await resolveTicket(tenantId, t.id);
+      await loadTickets();
+    } catch (err: unknown) {
+      alert((err as Error).message || "No se pudo resolver automáticamente el ticket.");
+    }
+  };
+
   const handleDelete = async (tId: string) => {
     if (!tenantId) return;
     if (!confirm("¿Eliminar este ticket y su historial? Esta acción es inmediata."))
@@ -383,39 +399,15 @@ export default function TicketsPage() {
               </button>
             )}
 
-            {isLiveCaptcha && (
+            {t.estado === "espera_humano" && (
               <button
                 type="button"
-                onClick={() => setSelectedTicketForHandoff(t)}
-                title="Tomar control en vivo para resolver captcha"
-                className="flex items-center gap-1 rounded-lg bg-amber-500 px-2 py-1 text-[11px] font-bold text-white shadow-sm hover:brightness-105 active:scale-95"
+                onClick={() => handleResolver(t)}
+                title="Resolver ticket automáticamente"
+                className="flex items-center gap-1.5 rounded-lg bg-amber-500 px-2.5 py-1 text-[11px] font-bold text-white shadow-sm hover:brightness-105 active:scale-95 transition"
               >
                 <Zap className="h-3 w-3" />
                 <span>Resolver</span>
-              </button>
-            )}
-
-            {isMissingPortal && (
-              <button
-                type="button"
-                onClick={() => setSelectedTicketDetail(t)}
-                title="Indicar o investigar portal de facturación con IA"
-                className="flex items-center gap-1 rounded-lg bg-brand px-2 py-1 text-[11px] font-bold text-on-brand shadow-sm hover:brightness-105 active:scale-95"
-              >
-                <Globe className="h-3 w-3" />
-                <span>Indicar portal</span>
-              </button>
-            )}
-
-            {t.estado === "espera_humano" && !isLiveCaptcha && !isMissingPortal && (
-              <button
-                type="button"
-                onClick={() => setSelectedTicketDetail(t)}
-                title="Revisar portal o configurar reintento"
-                className="flex items-center gap-1 rounded-lg border border-line-2 bg-panel-2 px-2 py-1 text-[11px] font-bold text-ink-2 shadow-sm hover:bg-line/20 active:scale-95"
-              >
-                <Globe className="h-3 w-3 text-muted" />
-                <span>Revisar portal</span>
               </button>
             )}
 

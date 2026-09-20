@@ -378,11 +378,16 @@ KNOWN_CHAINS_MAP = [
         "rfcs": ["SEA630403K46"],
         "urls": ["https://facturacion.sears.com.mx"],
     },
-    # Liverpool / Suburbia
+    # Liverpool / Suburbia: mismo portal, el parámetro uid elige la marca
     {
-        "keywords": ["liverpool", "suburbia"],
+        "keywords": ["suburbia"],
+        "rfcs": ["SUB910603SB3"],
+        "urls": ["https://facturacionclientes.liverpool.com.mx/generarFactura/&uid=suburbia"],
+    },
+    {
+        "keywords": ["liverpool"],
         "rfcs": ["DLI931201MI9"],
-        "urls": ["https://facturacion.liverpool.com.mx"],
+        "urls": ["https://facturacionclientes.liverpool.com.mx/generarFactura/&uid=liverpool"],
     },
     # Coppel
     {
@@ -697,6 +702,10 @@ async def search_candidate_portal_urls(
     if gas_portal:
         add_cand(gas_portal, prepend=True)
 
+    # 0. Prioridad número 1: URL extraída directamente del comprobante físico (impreso/QR)
+    if extracted_data and extracted_data.get("url_facturacion"):
+        add_cand(extracted_data["url_facturacion"], prepend=True)
+
     term_clean = clean_search_term(comercio) or clean_search_term(sucursal) or ""
     term_lower = term_clean.lower()
     url_lower = (current_url or "").lower()
@@ -796,9 +805,19 @@ async def deduce_portal_for_ticket(
     nom = comercio or ext.get("comercio") or sucursal or ext.get("sucursal")
     rfc = rfc_emisor or ext.get("rfc_emisor")
 
+    # 0. Prioridad absoluta: URL de facturación extraída directamente del comprobante (impreso/QR)
+    # salvo que sea un hub genérico de red (ej. g500network.com) que requiere refinarse a la estación
+    extracted_url = ext.get("url_facturacion")
+    is_ext_hub = bool(extracted_url and any(hub in extracted_url.lower() for hub in ("g500network.com", "efectifactura.com")))
+    if extracted_url and not is_ext_hub:
+        sanitized_ext = sanitize_and_classify_billing_url(extracted_url)
+        if sanitized_ext:
+            logger.info("Usando URL de facturación extraída directamente del comprobante: %s", sanitized_ext)
+            return sanitized_ext
+
     # 1. Si current_url es un hub genérico de red (ej. g500network.com, efectifactura sin estación)
     # o si tenemos identificadores de estación de gasolina, resolver estación específica primero:
-    is_hub = current_url and any(hub in current_url.lower() for hub in ("g500network.com", "efectifactura.com"))
+    is_hub = bool((current_url and any(hub in current_url.lower() for hub in ("g500network.com", "efectifactura.com"))) or is_ext_hub)
     gas_ident = extract_gas_station_identifiers(comercio=nom, sucursal=sucursal, extracted_data=ext)
 
     if is_hub or gas_ident["is_gas_station"]:

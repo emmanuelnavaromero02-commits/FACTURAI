@@ -48,6 +48,7 @@ import {
   getScannedPdfDownloadUrl,
   updateTicketPortal,
   deduceTicketPortal,
+  resolveTicket,
 } from "@/lib/api";
 
 interface TicketDetailModalProps {
@@ -158,6 +159,23 @@ export function TicketDetailModal({
       alert("Error de conexión al descargar el comprobante fiscal.");
     } finally {
       setDownloading(null);
+    }
+  };
+
+  const [isAutoResolving, setIsAutoResolving] = useState(false);
+
+  const handleAutoResolve = async () => {
+    if (!tenantId) return;
+    setIsAutoResolving(true);
+    try {
+      const updated = await resolveTicket(tenantId, currentTicket.id);
+      setCurrentTicket(updated);
+      if (onTicketUpdated) onTicketUpdated(updated);
+      onClose();
+    } catch (err: any) {
+      alert(err?.message || "No se pudo resolver el ticket automáticamente.");
+    } finally {
+      setIsAutoResolving(false);
     }
   };
 
@@ -514,57 +532,58 @@ export function TicketDetailModal({
                 <AlertCircle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
                 <div className="flex-1">
                   <h4 className="text-sm font-bold text-ink">
-                    {isMissingPortal
-                      ? "Portal de facturación requerido"
-                      : isLiveCaptcha
+                    {isLiveCaptcha
                       ? "Se requiere resolver captcha en vivo"
-                      : "Verificación de portal o reintento requerido"}
+                      : "Resolución de facturación"}
                   </h4>
                   <p className="text-xs text-muted mt-0.5">
-                    {isMissingPortal
-                      ? "El comprobante impreso no contenía enlace web. Tu ticket está 100% resguardado y la imagen no se elimina. Ingresa la URL o haz clic en 'Investigar con IA' en la sección de portal abajo."
-                      : isLiveCaptcha
+                    {isLiveCaptcha
                       ? "El portal del comercio abrió una sesión interactiva para resolver un desafío de seguridad o captcha."
-                      : (currentTicket.error_msg || "El portal tardó en responder o requiere verificar el enlace. Puedes reintentar la facturación.")}
+                      : "El sistema puede resolver este ticket automáticamente deduciendo el portal o reanudando el proceso."}
                   </p>
-                  {isLiveCaptcha && onOpenHandoff && (
-                    <button
-                      type="button"
-                      onClick={() => onOpenHandoff(currentTicket)}
-                      className="mt-3 flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-xs font-bold text-white shadow hover:brightness-105 active:scale-95"
-                    >
-                      <Zap className="h-4 w-4" />
-                      <span>Tomar control en vivo (Handoff)</span>
-                    </button>
-                  )}
-                  {isMissingPortal && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setIsEditingPortal(true);
-                        handleDeducePortal();
-                      }}
-                      disabled={isSearchingPortal}
-                      className="mt-3 flex items-center gap-1.5 rounded-xl bg-brand px-3.5 py-2 text-xs font-bold text-on-brand shadow hover:brightness-105 active:scale-95 disabled:opacity-50"
-                    >
-                      {isSearchingPortal ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <Sparkles className="h-3.5 w-3.5" />
-                      )}
-                      <span>Investigar portal con IA ahora</span>
-                    </button>
-                  )}
-                  {!isLiveCaptcha && !isMissingPortal && (
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    {isLiveCaptcha && onOpenHandoff ? (
+                      <button
+                        type="button"
+                        onClick={() => onOpenHandoff(currentTicket)}
+                        className="flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-xs font-bold text-white shadow hover:brightness-105 active:scale-95"
+                      >
+                        <Zap className="h-4 w-4" />
+                        <span>Resolver captcha en vivo</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={handleAutoResolve}
+                        disabled={isAutoResolving}
+                        className="flex items-center gap-2 rounded-xl bg-brand px-4 py-2 text-xs font-bold text-on-brand shadow hover:brightness-105 active:scale-95 disabled:opacity-50"
+                      >
+                        {isAutoResolving ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Zap className="h-4 w-4" />
+                        )}
+                        <span>Resolver ticket ahora</span>
+                      </button>
+                    )}
+
                     <button
                       type="button"
                       onClick={() => onRetry(currentTicket.id)}
-                      className="mt-3 flex items-center gap-2 rounded-xl bg-brand px-4 py-2 text-xs font-bold text-on-brand shadow hover:brightness-105 active:scale-95"
+                      className="flex items-center gap-2 rounded-xl border border-line-2 bg-panel px-3.5 py-2 text-xs font-semibold text-ink-2 hover:bg-line/20 transition active:scale-95"
                     >
                       <RefreshCw className="h-3.5 w-3.5" />
-                      <span>Reintentar facturación ahora</span>
+                      <span>Reintentar</span>
                     </button>
-                  )}
+
+                    <button
+                      type="button"
+                      onClick={() => setIsEditingPortal(!isEditingPortal)}
+                      className="text-xs font-medium text-muted hover:text-ink underline ml-1.5"
+                    >
+                      {isEditingPortal ? "Ocultar portal manual" : "Indicar portal manualmente"}
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>

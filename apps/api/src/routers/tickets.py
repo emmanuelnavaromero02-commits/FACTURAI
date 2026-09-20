@@ -900,6 +900,64 @@ async def deduce_ticket_portal_endpoint(
         }
 
 
+@router.post("/{ticket_id}/resolve", response_model=TicketResponse, status_code=status.HTTP_202_ACCEPTED)
+async def resolve_ticket(
+    ticket_id: uuid.UUID,
+    ctx: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Resuelve automáticamente un ticket que requiere atención:
+    Deduce portal oficial si falta o si falló, limpia estados de error,
+    resetea intentos a 0, y encola la facturación para ejecución inmediata.
+    """
+    from ..services.portal_searcher import deduce_portal_for_ticket
+    from ..services.queue import enqueue_ticket_facturacion, enqueue_ticket_extraction
+
+    async with tenant_session(ctx.tenant_id, user_id=ctx.user.id) as session:
+        res = await session.execute(
+            select(Ticket).where(Ticket.id == ticket_id, Ticket.tenant_id == ctx.tenant_id)
+        )
+        ticket = res.scalar_one_or_none()
+        if not ticket:
+            raise RecursoNoEncontradoException(f"Ticket {ticket_id} no encontrado.")
+
+        ext = ticket.extracted or {}
+        # Deducir o rescatar el portal oficial de mayor calidad (ej. Parrot POS o búsqueda autónoma)
+        deduced = await deduce_portal_for_ticket(
+            comercio=ext.get("comercio") or ticket.sucursal,
+            rfc_emisor=ticket.rfc_emisor or ext.get("rfc_emisor"),
+            sucursal=ticket.sucursal,
+            current_url=ticket.url_facturacion,
+            extracted_data=ext,
+        )
+        if deduced and deduced != ticket.url_facturacion:
+            ticket.url_facturacion = deduced
+
+        ticket.intentos = 0
+        ticket.error_code = None
+        ticket.error_msg = None
+
+        needs_extraction = not ticket.extracted and not ticket.folio
+        target_state = TicketEstado.RECIBIDO if needs_extraction else TicketEstado.ENCOLADO
+
+        await transition(
+            session,
+            ticket,
+            target_state,
+            "Resolución automática solicitada. Iniciando procesamiento autónomo.",
+            tipo="resolucion_automatica",
+        )
+        await session.flush()
+        response_data = TicketResponse.from_model(ticket)
+
+    if needs_extraction:
+        await enqueue_ticket_extraction(ctx.tenant_id, ticket_id)
+    else:
+        await enqueue_ticket_facturacion(ctx.tenant_id, ticket_id)
+
+    return response_data
+
+
 class TicketCredentialsRequest(BaseModel):
     usuario: str
     password: str

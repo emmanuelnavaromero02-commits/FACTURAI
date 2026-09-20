@@ -334,24 +334,45 @@ OFFICIAL_MERCHANTS: List[Dict[str, Any]] = [
         "activo": True,
         "entrega_esperada": "emisor",
     },
+    # Liverpool y Suburbia comparten portal, pero el parámetro uid elige la marca:
+    # sin él, el portal cae en una página de inicio sin formulario.
+    # (El slug "liverpool-suburbia" se conserva para no dejar huérfano el registro existente.)
     {
         "slug": "liverpool-suburbia",
-        "nombre": "Liverpool / Suburbia",
+        "nombre": "Liverpool",
         "patrones": [
             "liverpool",
             "el puerto de liverpool",
-            "suburbia",
             "EPL820616G69",
-            "SUB9106045E6",
             "liverpool.com.mx",
+        ],
+        "tipo_motor": "web",
+        "engine_slug": "generico-web",
+        "config": {
+            "url_facturacion": "https://facturacionclientes.liverpool.com.mx/generarFactura/&uid=liverpool",
+            "portal_nombre": "Facturación Electrónica Liverpool",
+            "campos_requeridos": ["codigo_facturacion", "total", "rfc"],
+        },
+        "requiere_captcha": False,
+        "activo": True,
+        "entrega_esperada": "emisor",
+    },
+    {
+        "slug": "suburbia",
+        "nombre": "Suburbia",
+        "patrones": [
+            "suburbia",
+            # RFC impreso en tickets reales de Suburbia
+            "SUB910603SB3",
+            "SUB9106045E6",
             "suburbia.com.mx",
         ],
         "tipo_motor": "web",
         "engine_slug": "generico-web",
         "config": {
-            "url_facturacion": "https://facturacion.liverpool.com.mx",
-            "portal_nombre": "Facturación Liverpool y Suburbia",
-            "campos_requeridos": ["codigo_facturacion", "rfc"],
+            "url_facturacion": "https://facturacionclientes.liverpool.com.mx/generarFactura/&uid=suburbia",
+            "portal_nombre": "Facturación Electrónica Suburbia",
+            "campos_requeridos": ["codigo_facturacion", "total", "rfc"],
         },
         "requiere_captcha": False,
         "activo": True,

@@ -31,7 +31,11 @@ from .vision.extractor import (
 )
 from .vision.merchant_matcher import match_merchant_cascade
 from .vision.normalizer import normalize_amount, normalize_date, normalize_time
-from .vision.url_sanitizer import choose_billing_url, sanitize_and_classify_billing_url
+from .vision.url_sanitizer import (
+    choose_billing_url,
+    filter_resolvable_urls,
+    sanitize_and_classify_billing_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -766,7 +770,16 @@ async def process_ticket_facturacion(
             if extracted_data and extracted_data.get("otros"):
                 is_gas = any(any(w in str(x.get("etiqueta", "")).lower() for w in ("cre", "estacion", "dispensario", "combustible")) for x in extracted_data["otros"])
 
-            if not url_facturacion or is_hub or is_gas:
+            # Prioridad absoluta a la URL directa extraída del comprobante físico (impreso/QR)
+            direct_ticket_url = extracted_data.get("url_facturacion") if extracted_data else None
+            needs_deduction = (
+                not url_facturacion
+                or is_hub
+                or is_gas
+                or (direct_ticket_url and url_facturacion != direct_ticket_url)
+            )
+
+            if needs_deduction:
                 # Intentar deducir o refinar portal en internet de forma autónoma antes de cualquier decisión
                 from .services.portal_searcher import deduce_portal_for_ticket
                 deduced_portal = await deduce_portal_for_ticket(
@@ -1139,7 +1152,8 @@ async def process_ticket_facturacion(
                 if url_facturacion:
                     tried_urls.add(url_facturacion)
 
-                alt_cands = [c for c in candidates if c not in tried_urls]
+                # Solo alternativas nuevas cuyo dominio existe: un portal muerto gasta un intento sin aportar nada
+                alt_cands = await filter_resolvable_urls(c for c in candidates if c not in tried_urls)
                 if alt_cands and intentos < 3:
                     next_url = alt_cands[0]
                     tried_urls.add(next_url)
@@ -1147,9 +1161,9 @@ async def process_ticket_facturacion(
                         t_res = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
                         t = t_res.scalar_one()
                         t.url_facturacion = next_url
-                        if t.extracted is None:
-                            t.extracted = {}
-                        t.extracted["_tried_portals"] = list(tried_urls)
+                        # Se reasigna el dict completo: SQLAlchemy no detecta cambios internos de un JSONB
+                        # y la lista de portales probados se perdía, repitiendo los mismos portales.
+                        t.extracted = {**(t.extracted or {}), "_tried_portals": sorted(tried_urls)}
                         await transition(
                             session,
                             t,

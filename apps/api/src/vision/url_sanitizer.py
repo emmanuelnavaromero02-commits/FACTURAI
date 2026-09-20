@@ -1,5 +1,8 @@
+import asyncio
+import ipaddress
 import re
-from typing import Optional
+import socket
+from typing import Iterable, List, Optional
 from urllib.parse import urlparse, urlunparse
 
 
@@ -119,3 +122,64 @@ def choose_billing_url(qr_url: Optional[str], printed_url: Optional[str]) -> Opt
     if printed_url and looks_like_billing_url(printed_url):
         return printed_url
     return qr_url or printed_url
+
+
+# Errores de DNS que significan "este dominio no existe" (no fallas temporales de red)
+_DNS_NO_EXISTE = {
+    code
+    for code in (getattr(socket, "EAI_NONAME", None), getattr(socket, "EAI_NODATA", None))
+    if code is not None
+}
+
+
+async def _getaddrinfo(host: str):
+    return await asyncio.get_running_loop().getaddrinfo(host, None)
+
+
+async def host_resolves(url: Optional[str], timeout: float = 3.0) -> bool:
+    """
+    True si el dominio de la URL existe en DNS.
+    Solo devuelve False cuando el DNS confirma que no existe; ante un timeout o una falla
+    temporal de red devuelve True para no descartar un portal bueno por un problema pasajero.
+    """
+    if not url:
+        return False
+    try:
+        host = urlparse(url if "://" in url else f"https://{url}").hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    try:
+        await asyncio.wait_for(_getaddrinfo(host), timeout)
+        return True
+    except socket.gaierror as exc:
+        return exc.errno not in _DNS_NO_EXISTE
+    except (asyncio.TimeoutError, OSError):
+        return True
+    except UnicodeError:
+        return False
+
+
+async def filter_resolvable_urls(urls: Iterable[str]) -> List[str]:
+    """Conserva, en orden, solo las URLs cuyo dominio existe."""
+    lista = [u for u in urls if u]
+    resultados = await asyncio.gather(*(host_resolves(u) for u in lista))
+    return [u for u, ok in zip(lista, resultados) if ok]
+
+
+async def choose_start_url(*candidates: Optional[str]) -> Optional[str]:
+    """
+    Elige la URL con la que arranca el motor: la primera cuyo dominio existe.
+    Si ninguna existe, devuelve la primera no vacía para que el motor busque el portal en internet.
+    """
+    opciones = [c for c in candidates if c]
+    for c in opciones:
+        if await host_resolves(c):
+            return c
+    return opciones[0] if opciones else None
