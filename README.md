@@ -69,7 +69,7 @@ node --check web/visor.js
 docker compose config
 ```
 
-Las pruebas reproducen lectura estructurada, inicio de sesión y renovación de ejemplo, cupo agotado, toma de control, deduplicación, confirmación e importación de CFDI con datos sintéticos. El flujo de CI prueba también el contenedor y un formulario interno de Chromium desde `tests/smoke_browser.py`.
+Las pruebas reproducen lectura estructurada, renovación de sesión, cupo agotado y deduplicación. GitHub Actions arranca el contenedor y usa el panel para verificar el teclado y la imagen en vivo de Chromium. Una segunda prueba recorre la cola, llena un formulario de comercio simulado, espera la aprobación, descarga un ZIP y coteja sus PDF y XML sintéticos.
 
 La conexión con una cuenta real se verifica desde **Ajustes** con autorización de su titular. Las facturas de ejemplo se usan para revisión sin abrir un portal comercial.
 

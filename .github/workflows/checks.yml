@@ -22,6 +22,10 @@ jobs:
         run: docker compose up -d --build --wait --wait-timeout 120
       - name: Probar el navegador interno desde el panel
         run: docker compose exec -T facturador python - < tests/smoke_browser.py
+      - name: Probar un trámite con descarga y cotejo de PDF y XML
+        run: |
+          docker compose cp tests facturador:/tmp/pruebas-facturador
+          docker compose exec -T -e PYTHONPATH=/app facturador python /tmp/pruebas-facturador/smoke_invoice.py
       - if: failure()
         run: docker compose logs --no-color --tail=100 facturador
       - if: always()
