@@ -9,12 +9,14 @@ import secrets
 import threading
 import time
 from email import policy
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
 
 from .auth import read_json, write_private
+from .ingest import IMAGE_EXT, MAX_UPLOAD, save_inputs
 
 SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
 TOKEN = 'https://oauth2.googleapis.com/token'
@@ -117,27 +119,117 @@ def access_token(root: Path) -> str:
         return record['token']
 
 
+def _ids(client, query: str, limit: int) -> list[str]:
+    response = client.get(GMAIL, params={'q': query, 'maxResults': limit})
+    response.raise_for_status()
+    return [item['id'] for item in response.json().get('messages', [])[:limit]
+            if re.fullmatch(r'[A-Za-z0-9_-]{1,200}', item.get('id', ''))]
+
+
+def _raw_message(client, message_id: str):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,200}', message_id):
+        raise ValueError('Mensaje de Gmail desconocido.')
+    payload = client.get(GMAIL + '/' + message_id, params={'format': 'raw'})
+    payload.raise_for_status()
+    raw = payload.json()['raw']
+    if len(raw) > 50 * 1024 * 1024:
+        return None
+    return email.message_from_bytes(base64.urlsafe_b64decode(raw + '=' * (-len(raw) % 4)), policy=policy.default)
+
+
+def search_tickets(root: Path, query: str) -> list[dict]:
+    if not query.strip():
+        raise ValueError('Escribe el comercio, remitente o reservación que quieres buscar.')
+    try:
+        with httpx.Client(headers={'Authorization': 'Bearer ' + access_token(root)}, timeout=30) as client:
+            results = []
+            for message_id in _ids(client, query.strip(), 10):
+                meta = client.get(GMAIL + '/' + message_id, params={'format': 'metadata',
+                                  'metadataHeaders': ['Subject', 'From', 'Date']})
+                meta.raise_for_status()
+                headers = {h['name'].lower(): h['value'] for h in meta.json().get('payload', {}).get('headers', [])}
+                results.append({'id': message_id, 'subject': headers.get('subject', '')[:250],
+                                'sender': headers.get('from', '')[:250], 'date': headers.get('date', '')[:150]})
+            return results
+    except httpx.HTTPError as exc:
+        raise ValueError('Gmail no completó la búsqueda. Revisa la conexión y vuelve a intentar.') from exc
+
+
+class _MailText(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+        self.hidden = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {'head', 'style', 'script'}:
+            self.hidden += 1
+        elif tag in {'br', 'tr', 'td', 'div', 'p', 'li'}:
+            self.lines.append('\n')
+
+    def handle_endtag(self, tag):
+        if tag in {'head', 'style', 'script'}:
+            self.hidden = max(0, self.hidden - 1)
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.lines.append(data)
+
+
+def ticket_parts(root: Path, message_id: str) -> dict:
+    try:
+        with httpx.Client(headers={'Authorization': 'Bearer ' + access_token(root)}, timeout=30) as client:
+            msg = _raw_message(client, message_id)
+    except httpx.HTTPError as exc:
+        raise ValueError('Gmail no pudo abrir el mensaje seleccionado.') from exc
+    if msg is None:
+        raise ValueError('El correo supera el límite de tamaño de importación.')
+    parts = {}
+    body = msg.get_body(preferencelist=('plain', 'html'))
+    if body:
+        try:
+            content = body.get_content()
+        except (LookupError, UnicodeError):
+            content = (body.get_payload(decode=True) or b'').decode('utf-8', errors='replace')
+        if body.get_content_type() == 'text/html':
+            parser = _MailText()
+            parser.feed(content)
+            content = ''.join(parser.lines)
+        text = '\n'.join(line.strip() for line in content.splitlines() if line.strip())[:40_000]
+        if text:
+            parts['body'] = ('correo-' + message_id + '.txt', text.encode('utf-8'))
+    for index, part in enumerate(msg.walk()):
+        filename = Path((part.get_filename() or '').replace('\\', '/')).name
+        if Path(filename).suffix.lower() not in IMAGE_EXT | {'.pdf'}:
+            continue
+        data = part.get_payload(decode=True)
+        if data and len(data) <= MAX_UPLOAD:
+            parts[str(index)] = (filename, data)
+    return parts
+
+
+def import_tickets(store, message_id: str, selected: list[str]) -> list[dict]:
+    parts = ticket_parts(store.root, message_id)
+    keys = list(dict.fromkeys(selected))
+    if not keys or any(key not in parts for key in keys):
+        raise ValueError('Elige el texto o los adjuntos que quieres importar.')
+    return save_inputs(store, [parts[key] for key in keys], 'Gmail')
+
+
 def recover_attachments(root: Path, key: str, query: str) -> list[Path]:
     """Read attached PDF/XML/ZIP files. The Gmail methods in use are GET only."""
     headers = {'Authorization': 'Bearer ' + access_token(root)}
     try:
         with httpx.Client(headers=headers, timeout=30, follow_redirects=False) as client:
-            response = client.get(GMAIL, params={'q': query, 'maxResults': 20})
-            response.raise_for_status()
-            ids = [item['id'] for item in response.json().get('messages', [])][:20]
+            ids = _ids(client, query, 20)
             target = root / 'downloads' / key / 'gmail'
             target.mkdir(parents=True, exist_ok=True, mode=0o700)
             result = []
             total = 0
             for message_id in ids:
-                if not re.fullmatch('[A-Za-z0-9_-]+', message_id):
+                msg = _raw_message(client, message_id)
+                if msg is None:
                     continue
-                payload = client.get(GMAIL + '/' + message_id, params={'format': 'raw'})
-                payload.raise_for_status()
-                raw = payload.json()['raw']
-                if len(raw) > 50 * 1024 * 1024:
-                    continue
-                msg = email.message_from_bytes(base64.urlsafe_b64decode(raw + '=' * (-len(raw) % 4)), policy=policy.default)
                 for index, part in enumerate(msg.walk()):
                     filename = part.get_filename() or ''
                     suffix = Path(filename).suffix.lower()

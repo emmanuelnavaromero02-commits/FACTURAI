@@ -9,6 +9,8 @@ export function installViewer({api, token, showError, perform}) {
   let dragging = false;
   let lastMove = 0;
   let updating = false;
+  let jobActive = false;
+  let uploadId = '';
 
   function releaseFrame() {
     if (frameUrl) URL.revokeObjectURL(frameUrl);
@@ -21,11 +23,20 @@ export function installViewer({api, token, showError, perform}) {
     take.textContent = channel ? 'Devolver control' : 'Tomar control';
     image.classList.toggle('controlling', Boolean(channel));
     byId('paste-form').hidden = !channel;
+    byId('browser-tools').hidden = !channel;
+    byId('page-back').disabled = byId('page-forward').disabled = jobActive;
+    const currentUpload = channel ? (browser.upload?.id || '') : '';
+    if (uploadId !== currentUpload) byId('portal-file').value = '';
+    uploadId = currentUpload;
+    byId('portal-upload').hidden = !uploadId;
+    byId('upload-origin').textContent = uploadId ? browser.upload.origin : '';
+    byId('upload-send').disabled = !uploadId || !byId('portal-file').files.length;
     byId('browser-hint').textContent = channel ? 'Haz clic en la página y usa el teclado.' :
       browser.manual ? 'Toma el control para completar el paso.' : 'Vista en vivo de la sesión del facturador.';
   }
 
   function update(value, active) {
+    jobActive = active;
     if (value.revision !== browser.revision) {
       channel = '';
       dragging = false;
@@ -154,6 +165,54 @@ export function installViewer({api, token, showError, perform}) {
     }
     syncControls();
   }));
+  for (const [id, direction] of [['page-back', 'back'], ['page-forward', 'forward']]) {
+    byId(id).onclick = () => perform(() => api('/api/browser/history', 'POST', {channel, direction}));
+  }
+  byId('page-png').onclick = () => perform(async () => {
+    const blob = await api('/api/browser/screenshot', 'POST', {channel});
+    const url = URL.createObjectURL(blob);
+    const save = document.createElement('a');
+    save.href = url;
+    save.download = 'captura-portal.png';
+    save.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  });
+  byId('page-text').onclick = () => perform(async () => {
+    const {text} = await api('/api/browser/text', 'POST', {channel});
+    byId('page-content').value = text;
+    byId('page-content').setSelectionRange(0, 0);
+    byId('find-query').value = '';
+    byId('find-status').textContent = text ? '' : 'La página no contiene texto visible.';
+    byId('page-dialog').showModal();
+  });
+  byId('find-text').onsubmit = event => {
+    event.preventDefault();
+    const field = byId('page-content');
+    const query = byId('find-query').value.toLocaleLowerCase();
+    const haystack = field.value.toLocaleLowerCase();
+    let index = haystack.indexOf(query, field.selectionEnd);
+    if (index < 0) index = haystack.indexOf(query);
+    byId('find-status').textContent = index < 0 ? 'Sin coincidencias.' : 'Coincidencia seleccionada.';
+    if (index >= 0) {
+      field.focus();
+      field.setSelectionRange(index, index + query.length);
+    }
+  };
+  byId('portal-file').onchange = syncControls;
+  for (const [id, attach] of [['upload-send', true], ['upload-dismiss', false]]) {
+    byId(id).onclick = () => perform(async () => {
+      const form = new FormData();
+      form.set('channel', channel);
+      form.set('request_id', uploadId);
+      if (attach) {
+        const file = byId('portal-file').files[0];
+        if (!file) return;
+        form.set('file', file);
+      }
+      await api('/api/browser/upload', 'POST', form);
+      return attach ? 'Archivo adjuntado en el portal.' : '';
+    });
+  }
   for (const [id, accept] of [['native-yes', true], ['native-no', false]]) {
     byId(id).addEventListener('click', () => perform(() => api('/api/browser/dialog', 'POST', {dialog_id: browser.dialog.id, accept})));
   }

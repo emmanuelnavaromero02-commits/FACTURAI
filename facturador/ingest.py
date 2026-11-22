@@ -4,6 +4,7 @@ import hashlib
 import io
 import zipfile
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 from PIL import Image
 from pypdf import PdfReader
@@ -15,29 +16,55 @@ IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 Image.MAX_IMAGE_PIXELS = 40_000_000
 
 
-def save_input(store: Store, name: str, data: bytes, source: str = "archivo") -> dict:
-    if len(data) > MAX_UPLOAD:
-        raise ValueError("Límite de 25 MB por archivo")
+def validate_document(name: str, data: bytes) -> str:
+    if not data or len(data) > MAX_UPLOAD:
+        raise ValueError("Elige un documento de hasta 25 MB")
     suffix = Path(name).suffix.lower()
     if suffix in IMAGE_EXT:
         with Image.open(io.BytesIO(data)) as img:
             if img.width * img.height > 40_000_000:
                 raise ValueError("Imagen demasiado grande")
+            mime = Image.MIME.get(img.format)
             img.verify()
     elif suffix == ".pdf":
         if not data.startswith(b"%PDF"):
             raise ValueError("PDF inválido")
         if len(PdfReader(io.BytesIO(data)).pages) > 20:
             raise ValueError("Límite de 20 páginas")
+        mime = 'application/pdf'
     else:
         raise ValueError("Sube JPG, PNG, WEBP o PDF; ZIP de exportación de WhatsApp también está admitido")
+    return mime
+
+
+def save_input(store: Store, name: str, data: bytes, source: str = "archivo") -> dict:
+    return save_inputs(store, [(name, data)], source)[0]
+
+
+def save_inputs(store: Store, items: list[tuple[str, bytes]], source: str) -> list[dict]:
+    for name, data in items:
+        if Path(name).suffix.lower() == '.txt' and source == 'Gmail':
+            if not data.strip() or len(data) > 256_000:
+                raise ValueError('El texto elegido está vacío o supera el límite.')
+        else:
+            validate_document(name, data)
+    return [_store_original(store, name, data, source) for name, data in items]
+
+
+def _store_original(store: Store, name: str, data: bytes, source: str) -> dict:
+    suffix = Path(name).suffix.lower()
     sha = hashlib.sha256(data).hexdigest()
     directory = store.root / "originales"
     directory.mkdir(exist_ok=True, mode=0o700)
     path = directory / (sha + suffix)
     if not path.exists():
-        path.write_bytes(data)
-        path.chmod(0o600)
+        with NamedTemporaryFile(dir=directory, prefix='pending_', delete=False) as output:
+            temp = Path(output.name)
+        try:
+            temp.write_bytes(data)
+            temp.replace(path)
+        finally:
+            temp.unlink(missing_ok=True)
     row, created = store.add(str(path), sha, source + ": " + Path(name).name[:100])
     return {"id": row["id"], "created": created, "status": row["status"]}
 

@@ -60,3 +60,11 @@ class PortalBrowserTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await self.runner.open_portal('capufe')
         self.runner.start_browser.assert_not_awaited()
+
+    async def test_printed_qr_preserves_the_original_query_and_rejects_other_origins(self):
+        url = CATALOG['capufe']['url'] + '?folio=O0-I1'
+        await self.runner.open_portal(url=url)
+        self.assertEqual(self.page.goto.await_args.args[0], url)
+        with self.assertRaises(ValueError):
+            await self.runner.open_portal(url='https://ejemplo.test/?folio=O0-I1')
+        self.assertEqual(self.page.goto.await_count, 1)

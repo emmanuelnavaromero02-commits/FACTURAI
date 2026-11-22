@@ -5,6 +5,7 @@ import csv
 import hashlib
 import io
 import json
+import mimetypes
 import os
 import secrets
 import sqlite3
@@ -12,9 +13,10 @@ import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Literal
 
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field, ValidationError
 from PIL import UnidentifiedImageError
@@ -23,11 +25,12 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .ai import AI
 from .auth import CALLBACK, ChatGPTPlan, PlanError, read_json, write_private
-from .catalog import CATALOG
+from .catalog import CATALOG, provider_for_url
 from .db import EDITABLE, Store
-from .documents import reconcile
-from .gmail import GmailConnection, recover_attachments
-from .ingest import IMAGE_EXT, MAX_UPLOAD, save_input, save_upload
+from .documents import browser_file, browser_files, reconcile
+from .gmail import GmailConnection, import_tickets, recover_attachments, search_tickets, ticket_parts
+from .ingest import IMAGE_EXT, MAX_UPLOAD, save_input, save_upload, validate_document
+from .local_reader import read_local_page
 from .models import Profile, Receipt
 from .runner import Runner
 from .viewer import ViewerInput
@@ -135,6 +138,10 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     def viewer_script():
         return FileResponse(BASE / 'web' / 'visor.js', media_type='application/javascript')
 
+    @app.get('/herramientas.js')
+    def receipt_tools_script():
+        return FileResponse(BASE / 'web' / 'herramientas.js', media_type='application/javascript')
+
     @app.get('/healthz')
     async def health():
         if container_browser and runner.context is None:
@@ -198,9 +205,23 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         gmail_connection.disconnect()
         return gmail_connection.status()
 
+    @app.post('/api/gmail/receipts/search')
+    def gmail_search(query: str = Body(embed=True, min_length=1, max_length=400)):
+        return search_tickets(root, query)
+
+    @app.post('/api/gmail/receipts/{message_id}/parts')
+    def gmail_parts(message_id: str):
+        return [{'id': part, 'name': 'Texto del correo' if part == 'body' else name, 'size': len(data)}
+                for part, (name, data) in ticket_parts(root, message_id).items()]
+
+    @app.post('/api/gmail/receipts/{message_id}/import')
+    def gmail_import(message_id: str, selected: list[str] = Body(embed=True, min_length=1, max_length=60)):
+        return import_tickets(store, message_id, selected)
+
     @app.post('/api/browser/open')
-    async def open_browser(provider: str | None = Body(default=None, embed=True, max_length=64)):
-        await runner.open_portal(provider)
+    async def open_browser(provider: str | None = Body(default=None, max_length=64),
+                           url: str | None = Body(default=None, max_length=2048)):
+        await runner.open_portal(provider, url)
         return runner.viewer.state()
 
     @app.get('/api/browser/frame')
@@ -226,6 +247,45 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     async def browser_dialog(dialog_id: str = Body(embed=True), accept: bool = Body(embed=True)):
         await runner.viewer.answer(dialog_id, accept)
         return {'answered': True}
+
+    @app.post('/api/browser/text')
+    async def browser_text(channel: str = Body(embed=True, max_length=64)):
+        return {'text': await runner.viewer.visible_text(channel)}
+
+    @app.post('/api/browser/screenshot')
+    async def browser_screenshot(channel: str = Body(embed=True, max_length=64)):
+        return Response(content=await runner.viewer.screenshot(channel), media_type='image/png',
+                        headers={'Content-Disposition': 'attachment; filename="captura-portal.png"'})
+
+    @app.post('/api/browser/history')
+    async def browser_history(channel: str = Body(max_length=64), direction: Literal['back', 'forward'] = Body()):
+        if runner.has_active_jobs():
+            raise ValueError('El historial está disponible al navegar por cuenta propia.')
+        await runner.viewer.history(channel, direction)
+        return runner.viewer.state()
+
+    @app.post('/api/browser/upload')
+    async def browser_upload(channel: str = Form(max_length=64), request_id: str = Form(max_length=64),
+                             file: UploadFile | None = File(default=None)):
+        payload = None
+        if file:
+            data = await file.read(MAX_UPLOAD + 1)
+            name = Path((file.filename or '').replace('\\', '/')).name
+            mime = await asyncio.to_thread(validate_document, name, data)
+            if mime != mimetypes.guess_type(name)[0]:
+                raise ValueError('La extensión no coincide con el contenido del documento.')
+            payload = {'name': name, 'buffer': data, 'mimeType': mime}
+        await runner.viewer.attach(channel, request_id, payload)
+        return {'attached': payload is not None}
+
+    @app.get('/api/browser/downloads')
+    def list_browser_files():
+        return {'files': browser_files(root), 'message': runner.manual_download_error}
+
+    @app.get('/api/browser/downloads/{file_id}')
+    def download_browser_file(file_id: str):
+        path = browser_file(root, file_id)
+        return FileResponse(path, filename=path.name[17:])
 
     @app.get("/api/state")
     def state():
@@ -339,15 +399,25 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         store.get(key)
         return store.events(key)
 
-    @app.get("/api/jobs/{key}/source")
-    def source(key: str):
+    def original_path(key: str) -> Path:
         row = store.get(key)
         if not row["source_path"]:
             raise HTTPException(404)
         path = Path(row["source_path"]).resolve()
         if not path.is_relative_to(root / "originales") or not path.is_file():
             raise HTTPException(404)
-        return FileResponse(path)
+        return path
+
+    @app.get("/api/jobs/{key}/source")
+    def source(key: str):
+        return FileResponse(original_path(key))
+
+    @app.post('/api/jobs/{key}/read-local')
+    def read_original(key: str, page: int = Body(default=1, ge=1, le=20),
+                      rotation: Literal[0, 90, 180, 270] = Body(default=0), force_ocr: bool = Body(default=False)):
+        result = read_local_page(original_path(key), page, rotation, force_ocr)
+        result['portal_links'] = [code for code in result['codes'] if provider_for_url(code)]
+        return result
 
     def recovery_profile(key: str) -> Profile:
         row = store.get(key)
@@ -389,6 +459,11 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         buyer = recovery_profile(key)
         paths = [p for p in (root / "downloads" / key).rglob("*") if p.is_file() and "extracted" not in p.parts]
         return await asyncio.to_thread(reconcile, store, key, buyer, paths)
+
+    @app.post('/api/jobs/{key}/recover-browser')
+    def recover_browser(key: str, files: list[str] = Body(embed=True, min_length=1, max_length=30)):
+        buyer = recovery_profile(key)
+        return reconcile(store, key, buyer, [browser_file(root, file_id) for file_id in dict.fromkeys(files)])
 
     @app.post("/api/jobs/{key}/gmail")
     async def gmail(key: str, query: str = Body(embed=True)):

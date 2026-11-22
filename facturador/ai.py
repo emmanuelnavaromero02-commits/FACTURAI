@@ -5,13 +5,11 @@ import io
 import json
 from pathlib import Path
 
-from PIL import Image, ImageOps
+from PIL import Image
 from pypdf import PdfReader
-import zxingcpp
-
-from apps.api.src.vision.receipt_scan import read_codes, remove_black_letterbox
 
 from .auth import ChatGPTPlan
+from .local_reader import ocr_languages, ocr_text, prepare_image, printed_codes, render_pdf_page
 from .models import Action, Extraction, TaxProfileExtraction
 
 
@@ -20,43 +18,36 @@ def image_part(data: bytes, mime: str = 'image/jpeg') -> dict:
     return {'type': 'input_image', 'image_url': f'data:{mime};base64,{encoded}', 'detail': 'high'}
 
 
-def receipt_image(image: Image.Image) -> list[dict]:
-    image = ImageOps.exif_transpose(image).convert('RGB')
-    image = remove_black_letterbox(image)
-    scan = image.copy()
-    scan.thumbnail((4500, 4500))
-    codes = [code[:400] for code in read_codes(scan, zxingcpp)[:12]]
+def receipt_image(image: Image.Image, native_text: str = '') -> list[dict]:
+    image = prepare_image(image)
+    codes = printed_codes(image)
+    text = native_text
+    if not text and ocr_languages():
+        try:
+            text = ocr_text(image)
+        except ValueError:
+            pass  # The model can still read the original pixels.
     image.thumbnail((2500, 2500))
     data = io.BytesIO()
     image.save(data, 'JPEG', quality=94)
     content = [image_part(data.getvalue())]
     if codes:
         content.append({'type': 'input_text', 'text': 'Códigos QR y de barras impresos: ' + json.dumps(codes, ensure_ascii=False)})
+    if text:
+        content.append({'type': 'input_text', 'text': 'Texto impreso para cotejar con la imagen: ' + text[:8000]})
     return content
 
 
 def read_receipt(path: Path) -> list[dict]:
+    if path.suffix.lower() == '.txt':
+        return [{'type': 'input_text', 'text': path.read_text(encoding='utf-8')[:40_000]}]
     if path.suffix.lower() != '.pdf':
         with Image.open(path) as image:
             return receipt_image(image)
     reader = PdfReader(path)
-    text = '\n'.join((page.extract_text() or '')[:8000] for page in reader.pages[:4])
-    if len(text.strip()) >= 60:
-        return [{'type': 'input_text', 'text': text[:24_000]}]
-    import pypdfium2 as pdfium
-
     result = []
-    with pdfium.PdfDocument(path) as pdf:
-        for index in range(min(len(pdf), 4)):
-            page = pdf[index]
-            width, height = page.get_size()
-            scale = min(2.6, 2500 / max(width, height))
-            bitmap = page.render(scale=scale)
-            try:
-                result.extend(receipt_image(bitmap.to_pil()))
-            finally:
-                bitmap.close()
-                page.close()
+    for index, page in enumerate(reader.pages[:4]):
+        result.extend(receipt_image(render_pdf_page(path, index), (page.extract_text() or '').strip()))
     return result
 
 

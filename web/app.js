@@ -1,4 +1,5 @@
 import {installViewer} from './visor.js';
+import {installReceiptTools} from './herramientas.js';
 
 const $ = id => document.getElementById(id);
 const sections = {bandeja: 'Bandeja', navegador: 'Navegador', comprobantes: 'Comprobantes', portales: 'Portales', ajustes: 'Ajustes'};
@@ -55,6 +56,7 @@ async function api(path, method = 'GET', payload) {
     }
     throw Error((await response.text()).slice(0, 450) || 'No se completó la solicitud.');
   }
+  if (response.headers.get('content-type') === 'image/png') return response.blob();
   return response.json();
 }
 
@@ -105,6 +107,11 @@ function openScreen() {
 }
 
 const viewer = installViewer({api, token: () => state.token, showError: error => notify(error, true), perform});
+const receiptTools = installReceiptTools({api, el, button, link, perform, currentTicket: () => editing,
+  gmailConnected: () => state.gmail === 'connected', openSettings: () => {
+    route('ajustes');
+    notify('Conecta Gmail para elegir el correo que contiene el ticket.');
+  }});
 
 function blank(title, description, mark = '▤') {
   const box = el('div', '', 'empty');
@@ -214,6 +221,9 @@ function rowActions(row) {
     original.target = '_blank';
     original.rel = 'noopener';
     panel.append(original);
+    if (!terminal.has(row.status) && !working.has(row.status)) {
+      panel.append(button('Usar descargas del navegador', () => perform(() => receiptTools.showDownloads(row)), 'plain'));
+    }
   }
   if (documents.has(row.status) || row.status === 'blocked') {
     panel.append(button('Recuperar de Gmail', () => recoverGmail(row), 'plain'),
@@ -445,13 +455,17 @@ $('prepare-form').onsubmit = event => {
     return 'Trámite en cola.';
   });
 };
-function openBrowser(provider = null) {
+function openBrowser(provider = null, url = null) {
   return perform(async () => {
     route('navegador');
-    await api('/api/browser/open', 'POST', {provider});
+    await api('/api/browser/open', 'POST', {provider, url});
   });
 }
 $('browser-open').onclick = () => openBrowser();
+$('portal-link-form').onsubmit = event => {
+  event.preventDefault();
+  openBrowser(null, $('ticket-url').value.trim());
+};
 $('wa-open').onclick = () => perform(async () => {await api('/api/whatsapp/open', 'POST'); return 'Elige el chat y abre una foto en WhatsApp.';});
 $('wa-capture').onclick = () => perform(async () => {
   await api('/api/whatsapp/capture', 'POST');

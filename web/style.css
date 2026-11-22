@@ -198,3 +198,9 @@ textarea { resize: vertical; }
   .notice { margin-inline: 14px; }
   .settings-grid, .side-cards, .portal-list { grid-template-columns: minmax(0, 1fr); }
 }
+.tool-strip { padding: 0 16px 12px; flex-wrap: wrap; }
+.tool-output { max-height: 38vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 0.9rem/1.5 ui-monospace, monospace; }
+.tool-list { display: grid; gap: 8px; }
+.tool-list label, .tool-list .tool-entry { display: flex; align-items: center; gap: 10px; overflow-wrap: anywhere; }
+.tool-list input[type=checkbox] { width: auto; }
+.tool-list .tool-entry span { flex: 1; }

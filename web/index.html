@@ -42,6 +42,7 @@
           <section class="card source-card" id="dropzone">
             <span class="source-icon mint" aria-hidden="true">↥</span><h2>Importar comprobantes</h2><p>Arrastra fotos, PDF o un ZIP de WhatsApp.</p>
             <button id="choose-file" class="secondary wide-button">Seleccionar archivos</button>
+            <button id="gmail-inbox" class="secondary wide-button">Importar desde Gmail</button>
             <button id="add-sample" class="plain wide-button">Cargar ticket de ejemplo</button>
           </section>
           <section class="card connection-card"><span class="source-icon sand" aria-hidden="true">✳</span><h2>Tu plan de ChatGPT</h2><p id="plan-card-description">Conecta tu suscripción para leer tickets y preparar los portales.</p><a class="inline-link" href="#ajustes" id="plan-card-link">Conectar ChatGPT <span aria-hidden="true">→</span></a></section>
@@ -60,10 +61,20 @@
             <div id="browser-loading" class="browser-loading" hidden>Abriendo la página…</div>
           </div>
           <div id="native-dialog" class="inline-panel" hidden><h3>Aviso del portal</h3><p id="native-text"></p><div class="buttons"><button id="native-yes" class="primary">Aceptar</button><button id="native-no" class="secondary">Cerrar aviso</button></div></div>
+          <div id="portal-upload" class="inline-panel" hidden>
+            <label>El portal solicita un archivo <strong id="upload-origin"></strong>
+              <input id="portal-file" type="file" accept=".pdf,.jpg,.jpeg,.png,.webp"></label>
+            <div class="buttons"><button id="upload-send" class="primary" disabled>Adjuntar al portal</button><button id="upload-dismiss" class="secondary">Cancelar</button></div>
+          </div>
           <div class="browser-controls"><button id="take-control" class="primary" disabled>Tomar control</button><button id="wa-capture" class="secondary" disabled>Importar foto abierta</button><span id="browser-hint">El panel muestra la misma sesión que usa el facturador.</span></div>
+          <div id="browser-tools" class="buttons tool-strip" hidden>
+            <button id="page-back" class="secondary">Atrás</button><button id="page-forward" class="secondary">Adelante</button>
+            <button id="page-text" class="secondary">Leer página</button><button id="page-png" class="secondary">Guardar captura PNG</button>
+          </div>
           <form id="paste-form" class="paste-form" hidden><label for="remote-text">Pegar texto en el campo activo</label><div class="buttons"><input id="remote-text" type="password" autocomplete="off" maxlength="2000" required><button class="secondary">Escribir</button></div></form>
         </section>
-        <section class="card task-card"><h2>Trámite actual</h2><div id="browser-task"><p class="muted">El resumen, la forma de pago y las intervenciones aparecen aquí.</p></div></section>
+        <section class="card task-card"><h2>Trámite actual</h2><div id="browser-task"><p class="muted">El resumen, la forma de pago y las intervenciones aparecen aquí.</p></div>
+          <button id="browser-downloads" class="secondary wide-button">Descargas manuales</button></section>
       </div>
     </section>
 
@@ -74,6 +85,7 @@
 
     <section class="screen" id="screen-portales" hidden aria-labelledby="portals-title">
       <header class="screen-header"><div><h1 id="portals-title">Portales</h1><p>Comercios disponibles para preparar una solicitud.</p></div><label class="search"><span aria-hidden="true">⌕</span><input id="portal-search" type="search" placeholder="Buscar comercio" aria-label="Buscar portal"></label></header>
+      <form id="portal-link-form" class="buttons tool-strip"><label>Enlace impreso en el ticket<input id="ticket-url" type="url" maxlength="2048" required></label><button class="secondary">Abrir enlace en Chromium</button></form>
       <div class="portal-list" id="portal-list"></div>
     </section>
 
@@ -108,6 +120,7 @@
 
   <dialog id="editor"><form id="receipt-form" class="dialog-body">
     <div class="dialog-heading"><div><h2>Revisar ticket</h2><p>Compara los campos con el original.</p></div><button type="button" class="icon-button" data-close="editor" aria-label="Cerrar revisión">×</button></div>
+    <button type="button" id="local-reader" class="secondary">Leer texto, QR y barras en el contenedor</button>
     <div class="fields">
       <label>Portal<select name="provider" required></select></label><label>Comercio<input name="merchant" required maxlength="180"></label>
       <label>Fecha<input name="date" type="date" required></label><label>Importe facturable<input name="amount" inputmode="decimal" required maxlength="20"></label>
@@ -118,6 +131,30 @@
     </div>
     <div class="dialog-actions"><a id="view-source" class="inline-link" target="_blank" rel="noopener">Ver original ↗</a><button class="primary">Guardar revisión</button></div>
   </form></dialog>
+
+  <dialog id="reader-dialog"><div class="dialog-body">
+    <div class="dialog-heading"><h2>Lectura local del ticket</h2><button class="icon-button" data-close="reader-dialog" aria-label="Cerrar lectura">×</button></div>
+    <div class="buttons"><label>Página<select id="reader-page"></select></label>
+      <label>Giro para OCR<select id="reader-rotation"><option value="0">0°</option><option value="90">90°</option><option value="180">180°</option><option value="270">270°</option></select></label>
+      <button id="reader-ocr" class="secondary">Leer como imagen</button></div>
+    <p id="reader-status" role="status"></p><pre id="reader-text" class="tool-output"></pre><div id="reader-codes" class="tool-list"></div>
+  </div></dialog>
+  <dialog id="page-dialog"><div class="dialog-body">
+    <div class="dialog-heading"><h2>Texto visible de la página</h2><button data-close="page-dialog" class="icon-button" aria-label="Cerrar texto">×</button></div>
+    <form id="find-text" class="buttons"><input id="find-query" type="search" aria-label="Buscar en la página" placeholder="Buscar en la página" required><button class="secondary">Buscar siguiente</button></form>
+    <p id="find-status" role="status"></p><textarea id="page-content" rows="13" readonly aria-label="Texto del portal"></textarea>
+  </div></dialog>
+  <dialog id="downloads-dialog"><div class="dialog-body">
+    <div class="dialog-heading"><h2>Descargas manuales</h2><button data-close="downloads-dialog" class="icon-button" aria-label="Cerrar descargas">×</button></div>
+    <p id="downloads-status" role="status"></p><div id="download-items" class="tool-list"></div>
+    <div class="dialog-actions"><button id="check-files" class="primary" hidden>Cotejar con el ticket</button></div>
+  </div></dialog>
+  <dialog id="mail-inbox-dialog"><div class="dialog-body">
+    <div class="dialog-heading"><h2>Importar tickets de Gmail</h2><button data-close="mail-inbox-dialog" class="icon-button" aria-label="Cerrar Gmail">×</button></div>
+    <form id="mail-search-form" class="buttons"><label>Comercio, remitente o reservación<input id="mail-query" type="search" maxlength="400" required></label><button class="secondary">Buscar en Gmail</button></form>
+    <p id="mail-status" role="status"></p><div id="mail-messages" class="tool-list"></div><div id="mail-parts" class="tool-list"></div>
+    <div class="dialog-actions"><button id="mail-import" class="primary" hidden>Importar selección</button></div>
+  </div></dialog>
 
   <dialog id="prepare-dialog"><form id="prepare-form" class="dialog-body">
     <div class="dialog-heading"><div><h2>Preparar factura</h2><p id="prepare-summary"></p></div><button type="button" class="icon-button" data-close="prepare-dialog" aria-label="Cerrar">×</button></div>

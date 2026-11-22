@@ -16,7 +16,7 @@ jobs:
           node-version: '24'
       - run: pip install -r requirements.txt
       - run: python -m unittest discover -s tests -v
-      - run: node --check web/app.js && node --check web/visor.js
+      - run: node --check web/app.js && node --check web/visor.js && node --check web/herramientas.js
       - run: docker compose config --quiet
       - name: Construir y arrancar la aplicación
         run: docker compose up -d --build --wait --wait-timeout 120
@@ -26,6 +26,8 @@ jobs:
         run: |
           docker compose cp tests facturador:/tmp/pruebas-facturador
           docker compose exec -T -e PYTHONPATH=/app facturador python /tmp/pruebas-facturador/smoke_invoice.py
+      - name: Probar adjuntos y descargas manuales en Chromium
+        run: docker compose exec -T -e PYTHONPATH=/app facturador python /tmp/pruebas-facturador/smoke_portal_tools.py
       - if: failure()
         run: docker compose logs --no-color --tail=100 facturador
       - if: always()

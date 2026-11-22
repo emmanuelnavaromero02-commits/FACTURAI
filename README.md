@@ -20,6 +20,20 @@ Abre [la bandeja](http://127.0.0.1:8765/#bandeja). En Windows también puedes de
 
 Docker comprueba que la aplicación y Chromium estén listos antes de dar por terminado el arranque. El volumen `expedientes` conserva la cola, los archivos y el perfil de Chromium al reiniciar. El puerto 8765 se publica en el equipo local. Para detenerlo ejecuta `docker compose stop`; para reanudarlo, `docker compose up -d`.
 
+## Herramientas del contenedor
+
+| En el panel | Qué puedes hacer |
+| --- | --- |
+| Bandeja → Revisar → Leer texto, QR y barras en el contenedor | Leer una foto con Tesseract en español e inglés, girar una imagen y elegir la página de un PDF. El lector distingue texto digital y escaneos. Puedes agregar un código a los campos del ticket o cargar en Chromium una liga de un portal del catálogo. Funciona sin conectar cuentas. |
+| Portales → Enlace impreso en el ticket | Abrir la dirección HTTPS exacta del recibo, con su folio y parámetros, en un dominio del catálogo. |
+| Navegador → Tomar control | Usar el mouse, teclado y portapapeles de entrada. Puedes buscar en el texto visible y guardar una captura PNG. Al navegar por cuenta propia también están disponibles Atrás y Adelante. |
+| Selector de archivos del portal | En Chromium haz clic en el campo del comercio. El panel muestra el dominio que recibirá el archivo. Elige tu constancia o ticket en PDF o foto y pulsa **Adjuntar al portal**. |
+| Navegador → Descargas manuales | Descargar los PDF, XML y ZIP que el navegador recogió mientras tenías el control de un portal. Desde el menú del ticket, **Usar descargas del navegador** permite elegir los archivos y cotejarlos con ese expediente. Los archivos obtenidos en un trámite de la cola se asocian directamente con él. |
+| Bandeja → Importar desde Gmail | Buscar por comercio, remitente o reservación. Abre el mensaje y marca el texto o los adjuntos concretos que contienen el ticket. Sirve también para vuelos con los datos en el cuerpo del correo. Requiere la conexión de lectura de Gmail. |
+| Navegador → Abrir WhatsApp Web | Vincular el dispositivo, abrir la foto del ticket y llevarla a la bandeja. |
+
+ChatGPT recibe imágenes y texto para las operaciones de IA que elijas. El OCR, lector PDF, decodificador de QR y barras, controles de Playwright, descargas y cotejo se ejecutan en el contenedor. Las verificaciones interactivas del comercio se completan en la vista en vivo.
+
 ### Código de este repositorio
 
 El Compose de la raíz inicia la aplicación personal. La API y el frontend multicuenta previos están en `apps/api` y `apps/web`, con su infraestructura de desarrollo en `infra`. Las dos aplicaciones comparten la preparación de fotos y la lectura de QR y códigos de barras. Los originales de los tickets se guardan intactos.
@@ -66,10 +80,11 @@ El alcance de esta entrega es una instancia privada para una persona. La modalid
 python -m unittest discover -s tests -v
 node --check web/app.js
 node --check web/visor.js
+node --check web/herramientas.js
 docker compose config
 ```
 
-Las pruebas reproducen lectura estructurada, renovación de sesión, cupo agotado y deduplicación. GitHub Actions arranca el contenedor y usa el panel para verificar el teclado y la imagen en vivo de Chromium. Una segunda prueba recorre la cola, llena un formulario de comercio simulado, espera la aprobación, descarga un ZIP y coteja sus PDF y XML sintéticos.
+Las pruebas cubren lectura local, importación selectiva de mensajes, deduplicación y recuperación de sesión. GitHub Actions construye la imagen y recorre tres flujos en Chromium. El primero verifica OCR, teclado, lectura de página y captura PNG. El segundo usa un comercio simulado para aprobar un trámite y cotejar el PDF y XML. El tercero usa el panel para navegar por el historial, adjuntar un documento y descargarlo de un portal simulado. Se comprueban los bytes entregados en ambos sentidos.
 
 La conexión con una cuenta real se verifica desde **Ajustes** con autorización de su titular. Las facturas de ejemplo se usan para revisión sin abrir un portal comercial.
 
