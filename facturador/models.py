@@ -165,6 +165,12 @@ class Extraction(BaseModel):
     uncertainties: list[str]
 
 
+class PortalSearch(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    billing_url: str | None
+    evidence_url: str | None
+
+
 class TaxProfileExtraction(BaseModel):
     model_config = ConfigDict(extra='forbid')
     is_constancia: bool

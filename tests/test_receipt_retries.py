@@ -106,7 +106,8 @@ class ReceiptRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_unprinted_and_ambiguous_links_cannot_schedule_a_portal(self):
         for name, content in [('one', 'Tienda\nWeb: venta.com.mx\n'), ('two', 'Facturar en uno.com.mx o dos.com.mx/factura')]:
             key = self.ticket(name+'.txt', content)
-            with patch('facturador.automation.AI.extract', return_value=extracted(provider='unknown', billing_url='https://no-impreso.com/facturar')):
+            with patch('facturador.automation.AI.extract', return_value=extracted(provider='unknown', billing_url='https://no-impreso.com/facturar')), \
+                 patch('facturador.automation.AI.discover_portal', return_value=('', '')):
                 await self.worker.step()
             self.assertEqual(self.store.get(key)['receipt']['portal_url'], '')
             self.assertIn(self.store.get(key)['status'], ('review', 'duplicate'))

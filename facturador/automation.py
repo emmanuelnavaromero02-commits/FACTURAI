@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -17,6 +18,8 @@ from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, portal_suggestions, pu
 from .db import READ_DELAYS
 from .local_reader import read_local_page
 from .models import Receipt
+from .portal_discovery import (merchant_matches_source, public_page_links_to, save_search_proof,
+                               trusted_search_proof)
 from .read_http import ServiceWait, retry_seconds
 from .receipt_evidence import local_ticket, portal_evidence, printed_payment
 
@@ -60,16 +63,21 @@ def printed_portal_confirmed(row, receipt: Receipt) -> bool:
     return marked == [receipt.portal_url]
 
 
+def portal_confirmed(root, row, receipt: Receipt) -> bool:
+    return printed_portal_confirmed(row, receipt) or (
+        receipt.provider == CUSTOM_PORTAL and trusted_search_proof(root, row, receipt.portal_url))
+
+
 def plain_words(value: str) -> str:
     plain = unicodedata.normalize('NFKD', value.casefold())
     return ' '.join(re.findall(r'[a-z0-9]+', ''.join(c for c in plain if not unicodedata.combining(c))))
 
 
-def read_ticket(plan, row, automatic):
+def read_ticket(plan, row, automatic, root):
     path = Path(row['source_path'])
     result = AI(plan).extract(path, {k: v['name'] for k, v in CATALOG.items()})
     if not result.is_receipt:
-        return None, False, 'El documento no se identificó como ticket de compra. ' + result.details
+        return None, False, 'El documento no se identificó como ticket de compra. ' + result.details, {}
 
     try:
         date = Receipt.valid_date((result.date or '').strip())
@@ -91,25 +99,55 @@ def read_ticket(plan, row, automatic):
                       date=date, ticket_number=(result.ticket_number or '').strip(),
                       billing_codes=[code.strip() for code in result.billing_codes if code.strip()],
                       payment_code=payment, details=result.details, source=row['receipt']['source'])
+    sources = {field:'vision_modelo' for field in ('provider','merchant','amount','date','ticket_number',
+               'billing_codes','details') if getattr(receipt, field)}
+    tools = ['vision_modelo']
+    if row.get('confirmed_payment'):
+        sources['payment_code'] = 'correccion_usuario'
+    elif payment and printed_payment(result.payment_evidence or '') == payment:
+        sources['payment_code'] = 'vision_modelo_linea_pago'
+    elif payment:
+        sources['payment_code'] = 'lector_local'
     try:
         page = page or read_local_page(path)
         marked, other = portal_evidence(path, page)
     except (OSError, ValueError, RuntimeError, PyPdfError):
         marked, other = [], []
+    if page.get('method'):
+        tools.append(page['method'])
     reported = getattr(result, 'billing_url', None)
     choices = marked or ([reported] if reported in other else [])
     billing_url = choices[0] if len(choices) == 1 else ''
     known = receipt.provider in CATALOG
     if billing_url and (not known or not allowed_url(billing_url, receipt.provider)):
         receipt.provider, receipt.portal_url = CUSTOM_PORTAL, billing_url
+        sources['provider'] = sources['portal_url'] = 'texto_o_codigo_del_original'
         known = False
+    searched_and_verified = False
+    if not marked and not billing_url and not known and result.merchant.strip():
+        tools.append('busqueda_web')
+        try:
+            suggested, evidence = AI(plan).discover_portal(result.merchant.strip())
+            if suggested:
+                receipt.provider, receipt.portal_url = CUSTOM_PORTAL, suggested
+                sources['provider'] = sources['portal_url'] = 'busqueda_web'
+                searched_and_verified = (merchant_matches_source(result.merchant.strip(), evidence)
+                                        and asyncio.run(public_page_links_to(evidence, suggested)))
+                if searched_and_verified:
+                    tools.append('enlace_publico_comprobado')
+                    save_search_proof(root, row, suggested, evidence)
+        except (PlanError, httpx.HTTPError, OSError, ValueError, asyncio.TimeoutError):
+            pass  # Keep the extracted ticket; a failed public search must not lose it.
     if row.get('auto_stage') in {'offline', 'retry_read'}:
         old = Receipt.model_validate(row['receipt'])
         for field in ('amount', 'date', 'merchant', 'billing_codes', 'ticket_number', 'payment_code'):
             if not getattr(receipt, field):
                 setattr(receipt, field, getattr(old, field))
+                if getattr(old, field):
+                    sources[field] = 'lectura_previa'
         if receipt.provider == 'unknown' and old.provider != 'unknown':
             receipt.provider, receipt.portal_url = old.provider, old.portal_url
+            sources['provider'] = sources['portal_url'] = 'lectura_previa'
             known = receipt.provider in CATALOG
         if old.payment_code and payment and old.payment_code != payment and not row.get('confirmed_payment'):
             receipt.payment_code = ''
@@ -117,15 +155,18 @@ def read_ticket(plan, row, automatic):
     uncertainties = list(result.uncertainties)
     if len(choices) > 1:
         uncertainties.append('Se encontraron varios enlaces fiscales impresos. Revisa los destinos en Leer texto, QR y barras.')
-    elif not billing_url and not known and (other or reported):
+    elif not billing_url and not known and not searched_and_verified and (other or reported):
         uncertainties.append('Comprueba el sitio del comercio en el original. El destino para facturar sigue sin confirmar.')
     if payment:
         # Drop an uncertainty solely about an absent payment when the original or owner resolved it.
         uncertainties = [msg for msg in uncertainties if not re.fullmatch(
             r'(?:el ticket no (?:indica|especifica|muestra)|falta(?: confirmar)?|no (?:consta|se indica))\s+'
             r'(?:la )?forma de pago(?: confirmada)?[.!]?', msg.strip(), re.I)]
-    confirmed_portal = (receipt.provider == CUSTOM_PORTAL and len(marked) == 1 and
-                        marked[0] == receipt.portal_url and reported == receipt.portal_url)
+    confirmed_portal = searched_and_verified or (receipt.provider == CUSTOM_PORTAL and len(marked) == 1 and
+                                                  marked[0] == receipt.portal_url and reported == receipt.portal_url)
+    if confirmed_portal:
+        uncertainties = [message for message in uncertainties if not re.search(
+            r'\b(?:portal|liga|enlace|direcci[oó]n|sitio de facturaci[oó]n)\b', message, re.I)]
     questions = [*review_questions(receipt, confirmed_portal=confirmed_portal), *uncertainties]
 
     if automatic and known and not questions:
@@ -144,8 +185,10 @@ def read_ticket(plan, row, automatic):
             questions.append('Confirma que el comercio del ticket corresponde a ' + item['name'] + '.')
     ready = bool(automatic and (known or confirmed_portal) and not questions)
     note = ' '.join(dict.fromkeys(questions)) if questions else (
+        'Portal localizado por búsqueda web y enlazado desde una fuente pública. Listo para preparar.'
+        if ready and searched_and_verified else
         'Datos completos. Listo para preparar el portal.' if ready else 'Revisa los datos y guarda la revisión.')
-    return receipt, ready, note
+    return receipt, ready, note, {'fields':sources, 'tools':list(dict.fromkeys(tools))}
 
 
 class TicketAutomation:
@@ -194,14 +237,19 @@ class TicketAutomation:
 
     async def read_offline(self, row, claim, *, reason, stage='review', read_after=0):
         try:
-            receipt, warning = await asyncio.to_thread(local_ticket, row)
+            receipt, warning, method = await asyncio.to_thread(local_ticket, row)
         except Exception:
             # A broken document must release its read claim so other uploads keep moving.
-            receipt, warning = Receipt.model_validate(row['receipt']), 'El lector local no encontró texto legible.'
+            receipt, warning, method = Receipt.model_validate(row['receipt']), 'El lector local no encontró texto legible.', 'error'
         notes = [reason, warning, *review_questions(receipt)]
         note = ' '.join(s.rstrip('.') + '.' for s in notes if s)
-        return self.store.save_receipt(row['id'], receipt, claim=claim, note=note,
-                                       read_stage=stage, read_after=read_after)
+        saved = self.store.save_receipt(row['id'], receipt, claim=claim, note=note,
+                                        read_stage=stage, read_after=read_after)
+        if saved['receipt'] == receipt.model_dump():
+            changed = {field:method for field in ('provider','merchant','amount','date','ticket_number',
+                       'billing_codes','payment_code','portal_url') if getattr(receipt, field) != row['receipt'].get(field)}
+            self.store.event(row['id'], 'fuentes_de_campos', json.dumps({'fields':changed,'tools':[method]}, ensure_ascii=False))
+        return saved
 
     async def analyze(self, key: str, automatic=False, offline=False):
         if not offline and self.plan_read_after > time.time():
@@ -214,10 +262,13 @@ class TicketAutomation:
             if offline:
                 return await self.read_offline(row, claim, reason='Lectura local',
                                                stage='offline' if automatic else 'review')
-            receipt, ready, note = await asyncio.to_thread(read_ticket, self.plan, row, automatic)
+            receipt, ready, note, provenance = await asyncio.to_thread(read_ticket, self.plan, row, automatic, self.store.root)
             if receipt is None:
                 return self.store.finish_read(key, claim, 'blocked', note)
-            return self.store.save_receipt(key, receipt, ready, claim=claim, note=note)
+            saved = self.store.save_receipt(key, receipt, ready, claim=claim, note=note)
+            if saved['receipt'] == receipt.model_dump():
+                self.store.event(key, 'fuentes_de_campos', json.dumps(provenance, ensure_ascii=False))
+            return saved
         except Exception as exc:
             note = str(exc) if isinstance(exc, PlanError) else 'No se pudo completar la lectura. Revisa el original o vuelve a leerlo.'
             stage, due = 'review', 0
@@ -251,7 +302,7 @@ class TicketAutomation:
     def _prepare(self, row):
         key = row['id']
         receipt = Receipt.model_validate(row['receipt'])
-        confirmed_portal = printed_portal_confirmed(row, receipt)
+        confirmed_portal = portal_confirmed(self.store.root, row, receipt)
         questions = review_questions(receipt, confirmed_portal=confirmed_portal)
         if questions:
             message = ' '.join(questions)
@@ -284,7 +335,7 @@ class TicketAutomation:
         previous = self.store.auto_candidates('review')
         if previous:
             receipt = Receipt.model_validate(previous['receipt'])
-            questions = review_questions(receipt, confirmed_portal=printed_portal_confirmed(previous, receipt))
+            questions = review_questions(receipt, confirmed_portal=portal_confirmed(self.store.root, previous, receipt))
             old_note = previous['message']
             if old_note and old_note not in ('Revisar datos extraídos', 'Datos extraídos; revisar antes de emitir'):
                 questions.append(old_note)

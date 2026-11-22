@@ -15,7 +15,7 @@ import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from facturador.auth import AUTHORIZATION, ISSUER, JWKS, PLAN_SCOPES, RESOURCE, TOKEN, ChatGPTPlan, PlanError, read_json, write_private
-from facturador.models import Extraction
+from facturador.models import Extraction, PortalSearch
 
 
 REPLY = {'is_receipt': True, 'provider': 'capufe', 'merchant': 'CAPUFE', 'amount': '50.00', 'date': '2026-11-21',
@@ -164,3 +164,27 @@ class SubscriptionTests(unittest.TestCase):
         partial = self.new_plan(lambda _: httpx.Response(200, text='data: {"type":"response.output_text.delta","delta":"{}"}\n\n'))
         with self.assertRaisesRegex(PlanError, 'confirmarse'):
             partial.infer('Flujo incompleto', [], Extraction)
+
+    def test_web_search_collects_streamed_answer_and_sources(self):
+        self.finish()
+        billing = 'https://facturas.example.org/emitir'
+        evidence = 'https://cafeteria.example.org/facturacion'
+        def searched(request):
+            body = json.loads(request.content)
+            self.assertEqual(body['tools'], [{'type':'web_search','search_context_size':'low'}])
+            self.assertEqual(body['include'], ['web_search_call.action.sources'])
+            events = [
+                {'type':'response.output_item.done','item':{'type':'web_search_call',
+                    'action':{'sources':[{'url':evidence}]}}},
+                {'type':'response.output_item.done','item':{'type':'message','content':[
+                    {'type':'output_text','text':json.dumps({'billing_url':billing,'evidence_url':evidence})}]}},
+                {'type':'response.completed','response':{'output':[
+                    {'type':'message','content':[{'type':'output_text','text':json.dumps(
+                        {'billing_url':billing,'evidence_url':evidence})}]}]}},
+            ]
+            return httpx.Response(200, text=''.join('data: '+json.dumps(event)+'\n\n' for event in events),
+                                  headers={'Content-Type':'text/event-stream'})
+        plan = self.new_plan(searched)
+        result, sources = plan.infer('Busca el portal', [{'type':'input_text','text':'Cafetería'}],
+                                     PortalSearch, web_search=True)
+        self.assertEqual((result.billing_url, result.evidence_url, sources), (billing,evidence,[evidence]))

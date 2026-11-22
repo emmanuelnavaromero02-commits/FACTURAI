@@ -197,7 +197,15 @@ async function logs(row) {
   $('logs-label').textContent = row.receipt.merchant || 'Ticket por identificar';
   const values = events.toReversed().map(event => {
     const item = el('div', '', 'log-item');
-    item.append(el('strong', event.kind.replaceAll('_', ' ')), el('p', event.detail),
+    let detail = event.detail;
+    if (event.kind === 'fuentes_de_campos') {
+      try {
+        const record = JSON.parse(detail);
+        const fields = Object.entries(record.fields || {}).map(([field, source]) => `${field}: ${source}`);
+        detail = `Campos: ${fields.join(', ') || 'sin cambios'}. Herramientas: ${(record.tools || []).join(', ') || 'ninguna'}.`;
+      } catch { /* Preserve the original event if it predates this format. */ }
+    }
+    item.append(el('strong', event.kind === 'fuentes_de_campos' ? 'Origen de datos' : event.kind.replaceAll('_', ' ')), el('p', detail),
       el('small', new Date(event.at).toLocaleString('es-MX')));
     return item;
   });

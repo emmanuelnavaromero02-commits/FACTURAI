@@ -88,7 +88,7 @@ def local_ticket(row):
     plain = folded(text)
     if re.search(r'CONSTANCIA DE SITUACION FISCAL|TIMBRE FISCAL DIGITAL|SELLO DIGITAL DEL CFDI|'
                  r'COMPROBANTE DE TRANSFERENCIA|ESTADO DE CUENTA', plain):
-        return old, 'Verifica el tipo de documento y sube el ticket de compra para facturar.'
+        return old, 'Verifica el tipo de documento y sube el ticket de compra para facturar.', page['method']
     words = ' ' + ' '.join(re.findall(r'[A-Z0-9]+', plain)) + ' '
     recognized = [key for key, item in CATALOG.items() if any(
         ' ' + ' '.join(re.findall(r'[A-Z0-9]+', folded(s))) + ' ' in words
@@ -129,4 +129,4 @@ def local_ticket(row):
     if codes:
         values['billing_codes'] = list(dict.fromkeys(codes))
     values['payment_code'] = row.get('confirmed_payment') or old.payment_code or printed_payment(text)
-    return Receipt.model_validate(values), warning
+    return Receipt.model_validate(values), warning, page['method']

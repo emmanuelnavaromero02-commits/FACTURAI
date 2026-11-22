@@ -326,12 +326,15 @@ class ChatGPTPlan:
             record['model'] = model
             write_private(self.session_path, record)
 
-    def infer(self, instructions, content, output_type, *, effort='medium'):
+    def infer(self, instructions, content, output_type, *, effort='medium', web_search=False):
         access, model = self._credentials()
         request = {'model': model, 'reasoning': {'effort': effort}, 'store': False, 'stream': True,
                    'instructions': instructions, 'input': [{'role': 'user', 'content': content}],
                    'text': {'format': {'type': 'json_schema', 'name': output_type.__name__.lower(),
                                        'strict': True, 'schema': output_type.model_json_schema()}}}
+        if web_search:
+            request.update(tools=[{'type':'web_search', 'search_context_size':'low'}],
+                           include=['web_search_call.action.sources'])
         try:
             with self.client.stream('POST', RESOURCE + '/responses', json=request,
                                     headers={'Authorization': 'Bearer ' + access}) as response:
@@ -339,19 +342,29 @@ class ChatGPTPlan:
                     response.read()
                     raise self._error(self._body(response), response.status_code, access,
                                       retry_seconds(response.headers.get('retry-after')))
+                streamed_items = []
                 for event in decode_event_stream(response.iter_lines()):
                     kind = event.get('type')
                     if kind in {'error', 'response.failed', 'response.incomplete'}:
                         raise self._error(event.get('response') or event, access=access)
+                    if web_search and kind == 'response.output_item.done':
+                        streamed_items.append(event['item'])
                     if kind == 'response.completed':
-                        parts = [part for item in event['response'].get('output', [])
+                        items = event['response'].get('output') or streamed_items
+                        parts = [part for item in items
                                  if item.get('type') == 'message' for part in item.get('content', [])]
                         if any(p.get('type') == 'refusal' for p in parts):
                             raise PlanError('ChatGPT pidió que revises este ticket manualmente.')
                         answer = ''.join(part['text'] for part in parts if part.get('type') == 'output_text')
                         if not answer or len(answer) > 30_000:
                             raise PlanError('ChatGPT no devolvió una respuesta utilizable.')
-                        return output_type.model_validate_json(answer)
+                        parsed = output_type.model_validate_json(answer)
+                        if web_search:
+                            sources = [source.get('url') for item in [*items, *streamed_items]
+                                       if item.get('type') == 'web_search_call'
+                                       for source in item.get('action', {}).get('sources', [])]
+                            return parsed, list(dict.fromkeys(url for url in sources if isinstance(url, str)))
+                        return parsed
         except httpx.HTTPError as exc:
             raise PlanError('Se interrumpió la conexión con ChatGPT.', 'transient') from exc
         except (TypeError, KeyError, ValueError) as exc:

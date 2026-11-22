@@ -1,6 +1,8 @@
 import os
 import tempfile
 import unittest
+import httpcore
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -10,7 +12,8 @@ from playwright.async_api import async_playwright
 
 from facturador.catalog import CUSTOM_PORTAL
 from facturador.models import Receipt
-from facturador.portal_discovery import fetch_home, review_links, review_missing_portal, visible_links
+from facturador.portal_discovery import (fetch_home, merchant_matches_source, public_page_links_to, review_links,
+                                         review_missing_portal, visible_links)
 from facturador.ticket_retry import open_ticket_portal
 
 
@@ -24,6 +27,12 @@ HTML = """<style>.oculto{display:none}</style><h1>Cafetería y bar</h1>
 
 
 class MerchantDiscoveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_auto_search_requires_brand_domain(self):
+        self.assertTrue(merchant_matches_source('Café Estrella', 'https://cafeestrella.mx/facturacion'))
+        self.assertTrue(merchant_matches_source('Starbucks', 'https://rewards.starbucks.com.mx/facturacion'))
+        self.assertFalse(merchant_matches_source('Café Estrella', 'https://directorio.example.org/cafeestrella'))
+        self.assertFalse(merchant_matches_source('Starbucks', 'https://starbucks.falso.example.org/portal'))
+
     def setUp(self):
         folder = self.enterContext(tempfile.TemporaryDirectory())
         self.store = SimpleNamespace(root=Path(folder))
@@ -54,6 +63,47 @@ class MerchantDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse({'authorization','cookie','referer'} & set(request.headers))
         with patch('facturador.portal_discovery.public_addresses', AsyncMock(return_value=[])):
             self.assertEqual(await fetch_home(ORIGIN), ('',0))
+
+    async def test_researched_link_must_be_visible_on_public_source_page(self):
+        source = ORIGIN + '/facturacion'
+        form = 'https://facturas.example.org/ticket'
+        seen = []
+        class Response:
+            status = 200
+            headers = [(b'content-type', b'text/html')]
+            async def body(self):
+                yield f'<a href="{form}">Facturar compra</a>'.encode()
+            stream = property(lambda self: self.body())
+        class Pool:
+            def __init__(self, *, network_backend, **_):
+                self.address = network_backend.address
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_):
+                return None
+            @asynccontextmanager
+            async def stream(self, method, url, *, headers):
+                seen.append((self.address, method, url, headers))
+                yield Response()
+        with patch('facturador.portal_discovery.public_addresses', AsyncMock(return_value=['1.1.1.1'])), \
+             patch('facturador.portal_discovery.httpcore.AsyncConnectionPool', Pool):
+            self.assertTrue(await public_page_links_to(source, form))
+            self.assertFalse(await public_page_links_to(source, 'https://otro.example.org/robo'))
+        address, method, url, headers = seen[0]
+        self.assertEqual((address,method,url), ('1.1.1.1','GET',source))
+        self.assertFalse({b'authorization',b'cookie',b'referer'} & {name for name,_ in headers})
+
+    async def test_public_search_network_failure_returns_unverified(self):
+        class BrokenPool:
+            def __init__(self, **_):
+                pass
+            async def __aenter__(self):
+                raise httpcore.ConnectError('Offline')
+            async def __aexit__(self, *_):
+                return None
+        with patch('facturador.portal_discovery.public_addresses', AsyncMock(return_value=['1.1.1.1'])), \
+             patch('facturador.portal_discovery.httpcore.AsyncConnectionPool', BrokenPool):
+            self.assertFalse(await public_page_links_to(ORIGIN+'/facturacion', ORIGIN+'/formulario'))
 
     async def test_returns_proposals_only_for_original_approved_url_and_respects_cooldown(self):
         links = [ORIGIN+'/facturas']

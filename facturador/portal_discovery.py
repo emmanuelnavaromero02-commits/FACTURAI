@@ -1,9 +1,13 @@
 """Suggest static billing links from a previously authorized merchant's public homepage."""
 import asyncio
 from hashlib import sha256
+from html.parser import HTMLParser
+import re
 import time
+import unicodedata
 from urllib.parse import urljoin, urlsplit
 
+import httpcore
 import httpx
 from playwright.async_api import Error as BrowserError
 
@@ -14,6 +18,102 @@ from .read_http import retry_seconds
 
 def digest(value):
     return sha256(value.encode()).hexdigest()
+
+
+class BillingAnchors(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'a':
+            self.links.extend(value for name, value in attrs if name == 'href' and value)
+
+
+class PinnedBackend(httpcore.AsyncNetworkBackend):
+    """Keep the merchant hostname in TLS and HTTP while connecting only to a checked public IP."""
+    def __init__(self, address):
+        self.address = address
+        self.delegate = httpcore.AnyIOBackend()
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        return await self.delegate.connect_tcp(self.address, port, timeout, local_address, socket_options)
+
+    async def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        raise OSError('Las páginas públicas no usan sockets locales.')
+
+    async def sleep(self, seconds):
+        await self.delegate.sleep(seconds)
+
+
+def merchant_matches_source(merchant: str, evidence_url: str) -> bool:
+    """Auto-use only a brand's own registrable domain; other sources need review."""
+    host = (urlsplit(evidence_url).hostname or '').lower().rstrip('.')
+    labels = host.split('.')
+    if len(labels) < 2 or not public_portal_origin(evidence_url):
+        return False
+    # Common Mexican second-level domains such as com.mx retain the brand one label earlier.
+    brand = labels[-3] if len(labels) >= 3 and labels[-2:] in (
+        ['com','mx'], ['org','mx'], ['net','mx'], ['edu','mx']) else labels[-2]
+    normalized = unicodedata.normalize('NFKD', merchant.casefold())
+    words = re.findall(r'[a-z0-9]+', ''.join(c for c in normalized if not unicodedata.combining(c)))
+    name = ''.join(words)
+    significant = [word for word in words if len(word) >= 5 and word not in {
+        'cafeteria','restaurante','restaurant','sucursal','gasolinera','estacion','servicio',
+        'tienda','factura','facturacion'}]
+    return bool(brand == name and significant or brand in significant)
+
+
+async def public_page_links_to(evidence_url: str, billing_url: str) -> bool:
+    """Check an actual public merchant page for a hyperlink to the proposed billing form."""
+    try:
+        return await asyncio.wait_for(_public_page_links_to(evidence_url, billing_url), 8)
+    except (httpcore.NetworkError, httpcore.TimeoutException, httpcore.ProtocolError,
+            OSError, asyncio.TimeoutError):
+        return False
+
+
+async def _public_page_links_to(evidence_url: str, billing_url: str) -> bool:
+    if (not public_portal_origin(evidence_url) or not public_portal_origin(billing_url)
+            or len(evidence_url) > 2048 or len(billing_url) > 2048):
+        return False
+    addresses = await public_addresses(evidence_url)
+    if not addresses:
+        return False
+    async with httpcore.AsyncConnectionPool(network_backend=PinnedBackend(addresses[0]),
+                                            max_connections=1) as pool:
+        async with pool.stream('GET', evidence_url, headers=[(b'accept', b'text/html'),
+                                                           (b'accept-encoding', b'identity')]) as response:
+            headers = {name.lower(): value.decode('latin1') for name, value in response.headers}
+            if (response.status != 200 or headers.get(b'content-encoding','identity') != 'identity'
+                    or headers.get(b'content-type','').split(';')[0].strip().lower() != 'text/html'):
+                return False
+            body = bytearray()
+            async for chunk in response.stream:
+                if len(body) + len(chunk) > 512 * 1024:
+                    return False
+                body.extend(chunk)
+    parser = BillingAnchors()
+    parser.feed(body.decode('utf-8', errors='replace'))
+    return any(urljoin(evidence_url, href) == billing_url for href in parser.links)
+
+
+def save_search_proof(root, row, billing_url: str, evidence_url: str):
+    path = root/'portal_discovery'/'web_search'/digest(row['id'])
+    write_private(path, {'source_hash':row['source_hash'], 'billing_url':billing_url,
+                         'evidence_url':evidence_url, 'checked_at':time.time()})
+
+
+def trusted_search_proof(root, row, billing_url: str) -> bool:
+    path = root/'portal_discovery'/'web_search'/digest(row['id'])
+    try:
+        proof = read_json(path, {})
+    except (OSError, ValueError):
+        return False
+    checked_at = proof.get('checked_at')
+    return (isinstance(checked_at, (int, float)) and 0 <= time.time() - checked_at < 7 * 86400
+            and proof.get('source_hash') == row.get('source_hash') and proof.get('billing_url') == billing_url
+            and public_portal_origin(proof.get('evidence_url')) is not None)
 
 
 def review_links(root, key, receipt):

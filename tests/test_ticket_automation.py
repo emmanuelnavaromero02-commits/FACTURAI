@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import threading
 import time
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi.testclient import TestClient
 
 from facturador.app import create_app
+from facturador.ai import AI
 from facturador.auth import PlanError
 from facturador.automation import TicketAutomation
 from facturador.db import Store
@@ -55,6 +57,9 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
         with patch('facturador.automation.AI.extract', return_value=extracted()) as extract:
             await self.worker.step()
             self.assertEqual(self.store.get(key)['status'], 'ready')
+            source_event = next(event for event in self.store.events(key) if event['kind'] == 'fuentes_de_campos')
+            self.assertEqual(json.loads(source_event['detail'])['fields']['payment_code'],
+                             'vision_modelo_linea_pago')
             with patch.object(self.runner, 'run', new_callable=AsyncMock) as run:
                 await self.worker.step()
                 await asyncio.gather(*self.runner.job_tasks.values())
@@ -104,7 +109,8 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
     async def test_unprinted_domain_still_needs_review(self):
         link = 'https://facturas.example.org/mi-ticket'
         key = self.add(source='WhatsApp: ticket.txt', text='Compra pagada sin dirección de facturación')
-        with patch('facturador.automation.AI.extract', return_value=extracted(provider='unknown', billing_url=None)):
+        with patch('facturador.automation.AI.extract', return_value=extracted(provider='unknown', billing_url=None)), \
+             patch('facturador.automation.AI.discover_portal', return_value=('', '')):
             await self.worker.step()
         row = self.store.get(key)
         self.assertEqual(row['status'], 'review')
@@ -114,6 +120,41 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get(key)['status'], 'ready')
         self.assertIn('Confirma el dominio', self.store.get(key)['message'])
         self.assertFalse(self.runner.has_active_jobs())
+
+    async def test_verified_public_research_prepares_unfamiliar_portal(self):
+        billing = 'https://facturas.cafeteria.example.org/emitir'
+        evidence = 'https://cafeestrella.mx/facturacion'
+        key = self.add(source='archivo: consumo.txt', text='CAFETERIA\nTOTAL: 40.50\nFOLIO PRUEBA-A')
+        with patch('facturador.automation.AI.extract', return_value=extracted(
+                provider='unknown', merchant='Café Estrella', billing_url=None,
+                uncertainties=['No aparece una liga de facturación.'])), \
+             patch('facturador.automation.AI.discover_portal', return_value=(billing, evidence)) as search, \
+             patch('facturador.automation.public_page_links_to', new_callable=AsyncMock, return_value=True) as linked:
+            await self.worker.step()
+        search.assert_called_once_with('Café Estrella')
+        linked.assert_awaited_once_with(evidence, billing)
+        row = self.store.get(key)
+        self.assertEqual((row['status'], row['receipt']['portal_url']), ('ready', billing))
+        with patch.object(self.runner, 'run', new_callable=AsyncMock) as run:
+            await self.worker.step()
+            await asyncio.gather(*self.runner.job_tasks.values())
+            run.assert_awaited_once_with(key, PROFILE, False, False)
+        self.assertEqual(self.store.get(key)['status'], 'queued')
+
+    async def test_unrelated_search_source_needs_domain_review(self):
+        billing = 'https://facturas.example.org/emitir'
+        evidence = 'https://directorio.example.org/cafe-estrella'
+        key = self.add(source='archivo: consumo.txt', text='CAFE ESTRELLA\nTOTAL: 40.50')
+        with patch('facturador.automation.AI.extract', return_value=extracted(
+                provider='unknown', merchant='Café Estrella', billing_url=None)), \
+             patch('facturador.automation.AI.discover_portal', return_value=(billing, evidence)), \
+             patch('facturador.automation.public_page_links_to', new_callable=AsyncMock) as linked:
+            await self.worker.step()
+        linked.assert_not_awaited()
+        row = self.store.get(key)
+        self.assertEqual(row['status'], 'review')
+        self.assertEqual(row['receipt']['portal_url'], billing)
+
 
     async def test_bad_date_and_payment_do_not_discard_legible_ticket_fields(self):
         key = self.add()
@@ -179,6 +220,16 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AutomationAPITests(unittest.TestCase):
+    def test_web_research_rejects_uncited_portal(self):
+        candidate = 'https://facturas.example.org/emitir'
+        source = 'https://cafeteria.example.org/facturacion'
+        plan = Mock()
+        plan.infer.return_value = (SimpleNamespace(billing_url=candidate, evidence_url=source),
+                                   ['https://directorio.example.org/lista'])
+        self.assertEqual(AI(plan).discover_portal('Cafetería Prueba'), ('', ''))
+        plan.infer.return_value = (SimpleNamespace(billing_url=candidate, evidence_url=source), [source])
+        self.assertEqual(AI(plan).discover_portal('Cafetería Prueba'), (candidate, source))
+
     def test_uploaded_ticket_is_read_by_background_worker(self):
         from PIL import Image
         from io import BytesIO

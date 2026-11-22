@@ -494,7 +494,14 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
             errors.append("Indica el portal de facturación del comercio")
         if errors:
             raise ValueError("; ".join(errors))
+        corrected = [field for field in ('provider','portal_url','merchant','amount','date','ticket_number',
+                     'billing_codes','payment_code','details')
+                     if row['receipt'].get(field) != getattr(receipt, field)]
         saved = store.save_receipt(key, receipt, ready=True)
+        if corrected:
+            store.event(key, 'fuentes_de_campos', json.dumps(
+                {'fields':{field:'correccion_usuario' for field in corrected}, 'tools':['correccion_usuario']},
+                ensure_ascii=False))
         automation.wake.set()
         return saved
 
