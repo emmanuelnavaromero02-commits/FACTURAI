@@ -22,6 +22,7 @@ READ_DELAYS = (30, 120, 600)
 AUTO_ELIGIBLE = """historical=0 AND source_path IS NOT NULL AND billing_profile IS NULL
     AND issue_attempted=0 AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL
     AND COALESCE(json_extract(receipt,'$.source'),'') NOT LIKE 'Ejemplo:%'"""
+ARCHIVED_TOLL = 'Este código de peaje figura en un CFDI guardado. Recupera sus comprobantes para cotejar el ticket.'
 
 
 class Store:
@@ -40,6 +41,17 @@ class Store:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS one_identity ON jobs(identity) WHERE identity IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS one_uuid ON jobs(uuid) WHERE uuid IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS invoice_matches(
+              job_id TEXT PRIMARY KEY, invoice_uuid TEXT NOT NULL, invoice_total TEXT NOT NULL,
+              ticket_total TEXT NOT NULL, match_type TEXT NOT NULL, concept_count INTEGER NOT NULL,
+              xml_sha256 TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS observed_shared_invoices(job_id TEXT PRIMARY KEY, invoice_uuid TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS invoice_match_uuid ON invoice_matches(invoice_uuid);
+            CREATE TABLE IF NOT EXISTS invoice_items(
+              invoice_uuid TEXT NOT NULL, concept INTEGER NOT NULL, code TEXT NOT NULL, job_id TEXT,
+              PRIMARY KEY(invoice_uuid,concept), UNIQUE(invoice_uuid,code));
+            CREATE INDEX IF NOT EXISTS invoice_item_code ON invoice_items(code);
+            CREATE UNIQUE INDEX IF NOT EXISTS invoice_item_claim ON invoice_items(code) WHERE job_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS events(
               id INTEGER PRIMARY KEY, job_id TEXT, at TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL
             );
@@ -94,20 +106,55 @@ class Store:
             raise KeyError("Ticket inexistente")
         result = dict(row)
         result["receipt"] = json.loads(result["receipt"])
+        observed_uuid = result.pop('observed_uuid', None)
+        invoice_uuid = result.pop('matched_uuid', None) or observed_uuid
+        if invoice_uuid:
+            result['uuid'] = invoice_uuid
         return result
+
+    _job_select = """SELECT j.*, m.invoice_uuid AS matched_uuid, s.invoice_uuid AS observed_uuid, m.invoice_total, m.ticket_total,
+                     m.match_type, m.concept_count FROM jobs j LEFT JOIN invoice_matches m ON m.job_id=j.id
+                     LEFT JOIN observed_shared_invoices s ON s.job_id=j.id"""
 
     def get(self, job_id: str):
         with self.connect() as db:
-            return self.decode(db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+            return self.decode(db.execute(self._job_select + " WHERE j.id=?", (job_id,)).fetchone())
 
     def list(self):
         with self.connect() as db:
-            return [self.decode(x) for x in db.execute("SELECT * FROM jobs ORDER BY created DESC")]
+            return [self.decode(x) for x in db.execute(self._job_select + " ORDER BY j.created DESC")]
+
+    @staticmethod
+    def invoice_candidates(db, receipt):
+        if receipt.provider != 'capufe' or not receipt.billing_codes:
+            return []
+        from .cfdi import normalize_capufe_code
+        codes = set()
+        for value in receipt.billing_codes:
+            try:
+                codes.add(normalize_capufe_code(value))
+            except ValueError:
+                continue
+        if not codes:
+            return []
+        return [r[0] for r in db.execute("""SELECT DISTINCT invoice_uuid FROM invoice_items
+                   WHERE code IN (SELECT value FROM json_each(?)) ORDER BY invoice_uuid""", (json.dumps(sorted(codes)),))]
+
+    def hold_archived_ticket(self, db, key):
+        row = db.execute("""SELECT receipt,status FROM jobs WHERE id=? AND status IN ('ready','review','blocked','queued','running')
+                         AND historical=0 AND json_extract(receipt,'$.provider')='capufe'""", (key,)).fetchone()
+        if not row:
+            return False
+        receipt = Receipt.model_validate_json(row['receipt'])
+        if (row['status'] == 'review' and receipt.ready_errors()) or not self.invoice_candidates(db, receipt):
+            return False
+        db.execute("UPDATE jobs SET status='issued_waiting_files',issuance_seen=1,message=?,updated=? WHERE id=?", (ARCHIVED_TOLL, now(), key))
+        return True
 
     def add(self, path: str, sha: str, source: str = "archivo"):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            existing = db.execute("SELECT * FROM jobs WHERE source_hash=?", (sha,)).fetchone()
+            existing = db.execute(self._job_select + " WHERE j.source_hash=?", (sha,)).fetchone()
             if existing:
                 return self.decode(existing), False
             key = uuid.uuid4().hex
@@ -135,6 +182,15 @@ class Store:
             fields["uuid"] = fields["uuid"].upper()
         fields["updated"] = now()
         with self.connect() as db:
+            if fields.get('uuid'):
+                db.execute('BEGIN IMMEDIATE')
+                row = self.decode(db.execute(self._job_select + ' WHERE j.id=?', (key,)).fetchone())
+                if row['uuid'] and row['uuid'] != fields['uuid']:
+                    raise ValueError('El UUID observado difiere del que ya está registrado para este ticket.')
+                owner = db.execute("SELECT id,receipt FROM jobs WHERE uuid=? AND id<>?", (fields['uuid'],key)).fetchone()
+                if owner and row['receipt']['provider'] == 'capufe' and json.loads(owner['receipt'])['provider'] == 'capufe':
+                    observed = fields.pop('uuid')
+                    db.execute('INSERT OR IGNORE INTO observed_shared_invoices VALUES(?,?)', (key, observed))
             db.execute("UPDATE jobs SET " + ",".join(f"{x}=?" for x in fields) + " WHERE id=?", (*fields.values(), key))
 
     def auto_candidates(self, status: str, *, stage: str = '', due_only: bool = False):
@@ -201,18 +257,23 @@ class Store:
                 if (identity and other['identity'] == identity) or same_codes:
                     status, message, identity = 'duplicate', f"Ya registrado en {other['id']}", None
                     break
+            if status in {'ready', 'review'} and not receipt.ready_errors() and self.invoice_candidates(db, receipt):
+                status = 'issued_waiting_files'
+                message = ARCHIVED_TOLL
             stage = read_stage if status == 'review' and claim else ''
             confirmed_payment = receipt.payment_code if ready and not claim else row['confirmed_payment']
             db.execute('UPDATE jobs SET receipt=?, identity=?, status=?, message=?, auto_stage=?, confirmed_payment=?, '
-                       'updated=?,read_attempts=?,read_after=? WHERE id=?',
+                       "updated=?,read_attempts=?,read_after=?,issuance_seen=? WHERE id=?",
                        (receipt.model_dump_json(), identity, status, message, stage, confirmed_payment, now(),
                         row['read_attempts'] if stage == 'retry_read' else 0,
-                        read_after if stage == 'retry_read' else 0, key))
+                        read_after if stage == 'retry_read' else 0, int(status == 'issued_waiting_files'), key))
         return self.get(key)
 
     def claim(self, key: str) -> bool:
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            if self.hold_archived_ticket(db, key):
+                return False
             count = db.execute("UPDATE jobs SET status='running',updated=? WHERE id=? AND status IN ('ready','queued') "
                                "AND issue_attempted=0 AND issuance_seen=0 AND uuid IS NULL AND (human_exposed=0 OR EXISTS("
                                "SELECT 1 FROM negative_billing_checks WHERE job_id=jobs.id AND preparing=1 AND checked_at>=unixepoch()-300))",
@@ -270,6 +331,9 @@ class Store:
 
     def queue(self, key: str, profile=None, confirmed_url: str = '') -> bool:
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if self.hold_archived_ticket(db, key):
+                return False
             return db.execute("UPDATE jobs SET status='queued',auto_stage='scheduled',message='En cola',updated=?,billing_profile=? WHERE id=? "
                               "AND (status='ready' OR (status='blocked' AND billing_profile IS NOT NULL)) "
                               "AND auto_stage NOT LIKE 'reading:%' "

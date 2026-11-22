@@ -128,7 +128,7 @@ async def recover_ticket(runner, key, profile):
         report = await recover_capufe(store, key, receipt, profile)
         if report:
             notes.append(report)
-        if await runner.recover(key, profile):
+        if await runner.recover(key, profile, notes=notes):
             return
     query = mail_query(store.get(key), receipt)
     if GmailConnection(store.root).status() == 'connected' and query:

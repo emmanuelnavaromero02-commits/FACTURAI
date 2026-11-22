@@ -634,10 +634,10 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     def export():
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["id", "estado", "comercio", "importe", "fecha", "pago", "ticket", "uuid", "nota"])
+        writer.writerow(["id", "estado", "comercio", "importe", "fecha", "pago", "ticket", "uuid", "nota", "importe_imputado_al_ticket", "total_del_cfdi"])
         for row in store.list():
             r = row["receipt"]
-            values = [row["id"], row["status"], r["merchant"], r["amount"], r["date"], r["payment_code"], r["ticket_number"], row["uuid"], row["message"]]
+            values = [row["id"], row["status"], r["merchant"], r["amount"], r["date"], r["payment_code"], r["ticket_number"], row["uuid"], row["message"], row["ticket_total"], row["invoice_total"]]
             # Evitar fórmulas al abrir un campo procedente de OCR en Excel.
             writer.writerow(["'" + str(x) if str(x).lstrip(" \t\r\n").startswith(("=", "+", "-", "@")) else x for x in values])
         return PlainTextResponse("\ufeff" + output.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=registro_facturas.csv"})

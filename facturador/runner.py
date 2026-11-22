@@ -796,13 +796,25 @@ class Runner:
         else:
             raise ValueError('Tipo de acción o tecla no admitida.')
 
-    async def recover(self, key: str, profile: Profile) -> bool:
+    async def recover(self, key: str, profile: Profile, *, notes=None) -> bool:
         files = job_candidates(self.store, key)
         if not files:
             return False
         try:
             await asyncio.to_thread(reconcile, self.store, key, profile, files)
-        except ValueError:
+        except ValueError as exc:
+            if notes is not None:
+                # Return a fixed explanation. The original parser errors may contain
+                # text supplied by a merchant or values taken from private documents.
+                reason = str(exc)
+                if 'importe facturable' in reason:
+                    notes.append('El importe del CFDI recibido no coincide con el ticket.')
+                elif 'CFDI no coincide en' in reason:
+                    notes.append('Los datos fiscales del receptor en el XML difieren del perfil del expediente.')
+                elif 'forma de pago confirmada' in reason:
+                    notes.append('La forma de pago del CFDI difiere de la guardada en el ticket.')
+                elif 'RFC emisor no corresponde' in reason:
+                    notes.append('El emisor del CFDI difiere del registrado para el comercio.')
             return False
         return True
 

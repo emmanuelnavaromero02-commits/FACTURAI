@@ -526,7 +526,12 @@ function table(container, rows, isDocs = false) {
     const actions = el('td');
     actions.append(rowActions(row));
     const tr = el('tr');
-    tr.append(info, el('td', currency(receipt.amount), 'ticket-amount'), stateCell, actions);
+    const amountCell = el('td', currency(receipt.amount), 'ticket-amount');
+    if (row.match_type === 'agrupado') {
+      amountCell.replaceChildren(el('strong', currency(row.ticket_total)),
+        el('span', 'De este ticket', 'ticket-meta'), el('span', 'Total del CFDI ' + currency(row.invoice_total), 'ticket-meta'));
+    }
+    tr.append(info, amountCell, stateCell, actions);
     body.append(tr);
   }
   content.append(head, body);
@@ -552,7 +557,7 @@ function renderTickets(force = false) {
     row.status === 'external' && row.issue_attempted), true);
   $('count-total').textContent = state.jobs.length;
   $('count-pending').textContent = state.jobs.filter(row => !terminal.has(row.status)).length;
-  $('count-verified').textContent = state.jobs.filter(row => row.status === 'verified').length;
+  $('count-verified').textContent = new Set(state.jobs.filter(row => row.status === 'verified').map(row => row.uuid || row.id)).size;
   $('batch').disabled = !state.jobs.some(row => row.status === 'ready' && !row.receipt.source.startsWith('Ejemplo:'));
 }
 
@@ -577,7 +582,8 @@ function renderBrowser() {
     return;
   }
   const detail = el('dl');
-  for (const [label, value] of [['Comercio', row.receipt.merchant], ['Total', currency(row.receipt.amount)],
+  for (const [label, value] of [['Comercio', row.receipt.merchant], ['Importe del ticket', currency(row.ticket_total || row.receipt.amount)],
+    ['Total del CFDI agrupado', row.match_type === 'agrupado' ? currency(row.invoice_total) : ''],
     ['Fecha', row.receipt.date], ['Folio', row.receipt.ticket_number || row.receipt.billing_codes.join(' · ')],
     ['Forma de pago', payments[row.receipt.payment_code]], ['RFC receptor', state.profile?.rfc]]) {
     if (!value) continue;
