@@ -18,7 +18,7 @@ Abre [la bandeja](http://127.0.0.1:8765/#bandeja). En Windows también puedes de
 2. Para probar la bandeja, pulsa **Cargar ticket de ejemplo** y **Revisar**. El ejemplo usa datos ficticios y queda fuera de la cola de emisión.
 3. Para procesar compras, guarda tu perfil fiscal en **Ajustes**, vincula tu plan y sube un ticket. Las pantallas de acceso o verificación del comercio se atienden en ese mismo navegador.
 
-El volumen `expedientes` conserva la cola, los archivos y el perfil de Chromium al reiniciar. El puerto 8765 se publica en el equipo local. Para detenerlo ejecuta `docker compose stop`; para reanudarlo, `docker compose up -d`.
+Docker comprueba que la aplicación y Chromium estén listos antes de dar por terminado el arranque. El volumen `expedientes` conserva la cola, los archivos y el perfil de Chromium al reiniciar. El puerto 8765 se publica en el equipo local. Para detenerlo ejecuta `docker compose stop`; para reanudarlo, `docker compose up -d`.
 
 ### Código de este repositorio
 

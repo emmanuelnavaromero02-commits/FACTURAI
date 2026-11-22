@@ -51,8 +51,9 @@
 	],
 	"syscalls": [
 		{
-			"comment": "Allow create user namespaces",
+			"comment": "Chromium creates a user namespace and chroots its sandboxed child inside that namespace",
 			"names": [
+				"chroot",
 				"clone",
 				"setns",
 				"unshare"

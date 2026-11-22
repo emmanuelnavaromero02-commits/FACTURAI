@@ -54,6 +54,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     plan = ChatGPTPlan(root, port)
     gmail_connection = GmailConnection(root, port)
     runner = Runner(store, plan)
+    container_browser = os.getenv("FACTURADOR_CONTAINER") == "1"
     token = secrets.token_urlsafe(32)
     permitted_origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}", "http://testserver"}
 
@@ -61,6 +62,8 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     async def lifespan(app):
         store.recover_after_restart()
         try:
+            if container_browser:
+                await runner.start_browser()
             yield
         finally:
             await runner.close()
@@ -133,7 +136,12 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         return FileResponse(BASE / 'web' / 'visor.js', media_type='application/javascript')
 
     @app.get('/healthz')
-    def health():
+    async def health():
+        if container_browser and runner.context is None:
+            try:
+                await runner.start_browser()
+            except ValueError:
+                return PlainTextResponse('Chromium no está disponible', status_code=503)
         return {'status': 'ok'}
 
     @app.post('/api/chatgpt/connect')

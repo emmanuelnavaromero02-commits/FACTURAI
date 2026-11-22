@@ -104,7 +104,9 @@ class Runner:
                 return
             from playwright.async_api import async_playwright
 
-            self.playwright = await async_playwright().start()
+            if self.playwright is not None:
+                await self.playwright.stop()
+                self.playwright = None
             settings = {'user_data_dir': str(self.store.root / 'browser_profile'), 'headless': True,
                         'accept_downloads': True, 'chromium_sandbox': True, 'service_workers': 'block',
                         'viewport': {'width': 1280, 'height': 850}, 'timeout': 15_000}
@@ -112,10 +114,12 @@ class Runner:
             if executable:
                 settings['executable_path'] = executable
             try:
+                self.playwright = await async_playwright().start()
                 self.context = await self.playwright.chromium.launch_persistent_context(**settings)
             except Exception as exc:
-                await self.playwright.stop()
-                self.playwright = None
+                if self.playwright is not None:
+                    await self.playwright.stop()
+                    self.playwright = None
                 raise ValueError('No se pudo iniciar Chromium con su aislamiento. Revisa la instalación o inicia con Docker Compose.') from exc
             self.context.set_default_timeout(7000)
             self.context.on('close', lambda _: setattr(self, 'context', None))
