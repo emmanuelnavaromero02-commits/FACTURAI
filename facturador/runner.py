@@ -10,7 +10,7 @@ import re
 import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
-from playwright.async_api import TimeoutError as BrowserTimeout
+from playwright.async_api import Error as BrowserError, TimeoutError as BrowserTimeout
 
 from .ai import AI
 from .auth import ChatGPTPlan, PlanError
@@ -109,9 +109,6 @@ class Runner:
                 return
             from playwright.async_api import async_playwright
 
-            if self.playwright is not None:
-                await self.playwright.stop()
-                self.playwright = None
             settings = {'user_data_dir': str(self.store.root / 'browser_profile'), 'headless': True,
                         'accept_downloads': True, 'chromium_sandbox': True, 'service_workers': 'block',
                         'viewport': {'width': 1280, 'height': 850}, 'timeout': 15_000}
@@ -119,12 +116,17 @@ class Runner:
             if executable:
                 settings['executable_path'] = executable
             try:
-                self.playwright = await async_playwright().start()
+                if self.playwright is None:
+                    self.playwright = await async_playwright().start()
                 self.context = await self.playwright.chromium.launch_persistent_context(**settings)
             except Exception as exc:
                 if self.playwright is not None:
-                    await self.playwright.stop()
-                    self.playwright = None
+                    try:
+                        await self.playwright.stop()
+                    except BrowserError:
+                        pass
+                    finally:
+                        self.playwright = None
                 raise ValueError('No se pudo iniciar Chromium con su aislamiento. Revisa la instalación o inicia con Docker Compose.') from exc
             self.context.set_default_timeout(7000)
             def context_closed(context):
@@ -469,6 +471,8 @@ class Runner:
                         if failed_context:
                             try:
                                 await failed_context.close()
+                            except BrowserError:
+                                pass  # The close event may be in flight when the job wakes up.
                             finally:
                                 if self.context is failed_context:
                                     self.context = None
