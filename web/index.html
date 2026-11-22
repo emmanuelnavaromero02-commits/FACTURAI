@@ -105,7 +105,7 @@
             <label>Régimen fiscal<input name="regime" required inputmode="numeric" pattern="[0-9]{3}" maxlength="3" placeholder="612"></label>
             <label>Uso del CFDI<input name="cfdi_use" value="G03" required maxlength="5"></label>
             <label class="full">Correo de entrega<input name="email" type="email" required maxlength="200"></label>
-          </div><div class="buttons"><button class="primary">Guardar datos fiscales</button><button id="read-csf" class="secondary" type="button">Leer constancia</button></div></form>
+          </div><div class="buttons"><button class="primary">Guardar datos fiscales</button><button id="read-csf-local" class="secondary" type="button">Leer constancia localmente</button><button id="read-csf" class="secondary" type="button">Extraer datos con ChatGPT</button></div></form>
         </section>
         <section class="card settings-card"><div class="card-heading"><div><h2>Suscripción de ChatGPT</h2><p>Usa el cupo de la cuenta que autorices.</p></div><span class="pill" id="plan-status">Por conectar</span></div>
           <div class="settings-body"><p id="plan-email" class="muted"></p><p id="plan-message" class="muted"></p><div class="buttons"><button id="pod-connect" class="primary" data-oai-siwc-button>Continuar con ChatGPT</button><button id="pod-other" class="plain" hidden>Usar otra cuenta</button><button id="pod-disconnect" class="secondary" hidden>Desconectar</button><button id="pod-retry" class="secondary" hidden>Revisar cupo</button></div>
@@ -138,7 +138,7 @@
   </form></dialog>
 
   <dialog id="reader-dialog"><div class="dialog-body">
-    <div class="dialog-heading"><h2>Lectura local del ticket</h2><button class="icon-button" data-close="reader-dialog" aria-label="Cerrar lectura">×</button></div>
+    <div class="dialog-heading"><h2 id="reader-title">Lectura local del ticket</h2><button class="icon-button" data-close="reader-dialog" aria-label="Cerrar lectura">×</button></div>
     <div class="buttons"><label>Página<select id="reader-page"></select></label>
       <label>Giro para OCR<select id="reader-rotation"><option value="0">0°</option><option value="90">90°</option><option value="180">180°</option><option value="270">270°</option></select></label>
       <button id="reader-ocr" class="secondary">Leer como imagen</button></div>

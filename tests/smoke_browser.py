@@ -86,6 +86,15 @@ async def smoke():
             await page.get_by_role('button', name='Devolver control').click()
             await expect(page.get_by_role('button', name='Tomar control')).to_be_visible()
             await page.get_by_role('link', name='Ajustes', exact=True).click()
+            sample = await operator.new_page()
+            await sample.set_content('<p>Constancia de prueba para el lector local</p><p>RFC XAXX010101000</p>')
+            fiscal_pdf = await sample.pdf()
+            await sample.close()
+            async with page.expect_file_chooser() as upload:
+                await page.get_by_role('button', name='Leer constancia localmente').click()
+            await (await upload.value).set_files({'name': 'constancia.pdf', 'mimeType': 'application/pdf', 'buffer': fiscal_pdf})
+            await expect(page.locator('#reader-text')).to_contain_text('XAXX010101000')
+            await page.get_by_role('button', name='Cerrar lectura').click()
             await page.get_by_role('button', name='Comprobar herramientas').click()
             await expect(page.locator('#tools-status')).to_have_text('Comprobación terminada.', timeout=30_000)
             for name in ('OCR local', 'QR y códigos de barras', 'Chromium y Playwright', 'Expedientes y almacenamiento', 'PDF y ZIP', 'Datos del CFDI 4.0'):

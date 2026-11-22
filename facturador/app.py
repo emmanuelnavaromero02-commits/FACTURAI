@@ -150,10 +150,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     @app.get('/healthz')
     async def health():
         if container_browser and runner.context is None:
-            try:
-                await runner.start_browser()
-            except ValueError:
-                return {'status': 'degraded', 'browser': 'unavailable'}
+            return {'status': 'degraded', 'browser': 'unavailable'}
         return {'status': 'ok'}
 
     @app.post('/api/tools/check')
@@ -335,14 +332,21 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         return {"saved": True}
 
     @app.post('/api/profile/read-csf')
-    async def read_csf(file: UploadFile = File(...)):
+    async def read_csf(file: UploadFile = File(...), mode: Literal['agent', 'local'] = Form('agent'),
+                       page: int = Form(1, ge=1, le=20), rotation: int = Form(0), force_ocr: bool = Form(False)):
         suffix = Path(file.filename or '').suffix.lower()
         data = await file.read(MAX_UPLOAD + 1)
         if suffix not in IMAGE_EXT | {'.pdf'} or len(data) > MAX_UPLOAD or not data:
             raise ValueError('Elige una constancia PDF o imagen de hasta 25 MB.')
+        if rotation not in {0, 90, 180, 270}:
+            raise ValueError('Elige una rotación de 0, 90, 180 o 270 grados.')
+        await asyncio.to_thread(validate_document, 'constancia' + suffix, data)
         with TemporaryDirectory(dir=root) as folder:
             document = Path(folder) / ('constancia' + suffix)
             document.write_bytes(data)
+            if mode == 'local':
+                reading = await asyncio.to_thread(read_local_page, document, page, rotation, force_ocr)
+                return {**reading, 'codes': [], 'portal_links': []}
             return await asyncio.to_thread(AI(plan).tax_profile, document)
 
     @app.post("/api/upload")

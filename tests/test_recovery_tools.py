@@ -1,4 +1,5 @@
 import io
+import os
 import tempfile
 import unittest
 from email.message import EmailMessage
@@ -128,6 +129,18 @@ class RecoveryTests(unittest.TestCase):
         AI(plan).next_action('instrucciones', 'árbol visible', None)
         self.assertEqual(plan.infer.call_args.args[1], [{'type': 'input_text', 'text': 'árbol visible'}])
 
+    def test_offline_tax_document_is_transient_and_never_calls_model(self):
+        files = {'file': ('constancia.pdf', pdf_bytes(), 'application/pdf')}
+        previous = self.client.get('/api/state').json()['profile']
+        with patch('facturador.ai.AI.tax_profile', side_effect=AssertionError('No debe invocar el plan')):
+            reply = self.client.post('/api/profile/read-csf', files=files, data={'mode': 'local'}, headers=self.headers)
+            self.assertEqual(reply.json()['method'], 'pdf')
+            self.assertIn(PROFILE.rfc, reply.json()['text'])
+            self.assertEqual(self.client.get('/api/state').json()['profile'], previous)
+            self.assertFalse(list(self.root.rglob('constancia.*')))
+            bad = self.client.post('/api/profile/read-csf', files=files, data={'mode': 'local', 'page': 2}, headers=self.headers)
+            self.assertEqual(bad.status_code, 422)
+
     def test_scanned_pdf_is_cotejado_by_ocr_only_when_uuid_and_rfc_agree(self):
         doc = io.BytesIO()
         Image.new('RGB', (180, 100), 'white').save(doc, 'PDF')
@@ -196,3 +209,13 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(checks['Gmail']['status'], 'pending')
         with self.store.connect() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE kind='diagnostico'").fetchone()[0], 0)
+
+    def test_failed_browser_start_keeps_panel_and_health_response_available(self):
+        with patch.dict(os.environ, {'FACTURADOR_CONTAINER': '1'}), tempfile.TemporaryDirectory() as folder:
+            app = create_app(Path(folder))
+            with patch.object(app.state.runner, 'start_browser', new=AsyncMock(side_effect=ValueError('Sin navegador'))) as start:
+                with TestClient(app) as client:
+                    self.assertEqual(client.get('/healthz').json(), {'status': 'degraded', 'browser': 'unavailable'})
+                    self.assertEqual(client.get('/').status_code, 200)
+                    self.assertEqual(client.get('/api/state').json()['jobs'], [])
+                    start.assert_awaited_once()

@@ -322,6 +322,8 @@ class Runner:
         future = asyncio.get_running_loop().create_future()
         self.pending[key] = {'kind': kind, 'future': future, 'page': page}
         try:
+            if page.is_closed() or page in self.lost_pages:
+                raise ValueError('Se cerró la página antes de iniciar la intervención.')
             self.store.enter_intervention(key, kind, message, kind in MANUAL)
             await self.viewer.set_manual(kind in MANUAL)
             decision = await future

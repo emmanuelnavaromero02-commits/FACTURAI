@@ -345,6 +345,7 @@ function renderBrowser() {
 }
 
 function renderSettings() {
+  $('read-csf').disabled = state.plan.status !== 'ready';
   $('restart-browser').disabled = Boolean(state.active_job);
   if (state.profile && !profileDirty && !document.activeElement.closest('#profile')) {
     for (const [key, value] of Object.entries(state.profile)) $('profile').elements[key].value = value;
@@ -427,18 +428,27 @@ for (const node of document.querySelectorAll('[data-filter]')) node.onclick = ()
 $('ticket-search').oninput = () => renderTickets(true);
 $('portal-search').oninput = renderPortals;
 $('profile').oninput = () => {profileDirty = true;};
-$('read-csf').onclick = () => {
-  if (state.plan.status !== 'ready') return notify('Conecta tu plan de ChatGPT para leer la constancia.', true);
+let csfMode = 'local';
+for (const [id, mode] of [['read-csf-local', 'local'], ['read-csf', 'agent']]) $(id).onclick = () => {
+  csfMode = mode;
   $('csf-file').click();
 };
 $('csf-file').onchange = event => {
   const file = event.target.files[0];
   event.target.value = '';
-  if (!file || !window.confirm('¿Usar tu plan de ChatGPT para leer esta constancia fiscal?')) return;
+  if (!file) return;
+  if (csfMode === 'local') return receiptTools.openReader(file);
+  if (!window.confirm('¿Usar tu plan de ChatGPT para leer esta constancia fiscal?')) return;
   perform(async () => {
     const data = new FormData();
     data.append('file', file);
-    const draft = await api('/api/profile/read-csf', 'POST', data);
+    let draft;
+    try {
+      draft = await api('/api/profile/read-csf', 'POST', data);
+    } catch (error) {
+      receiptTools.openReader(file);
+      return error.message + ' Se abrió la lectura local de la constancia.';
+    }
     profileDirty = true;
     for (const key of ['rfc', 'name', 'postal_code', 'regime']) $('profile').elements[key].value = draft[key] || '';
     return ['Comprueba los datos y pulsa Guardar datos fiscales.', ...draft.uncertainties].join(' ');
