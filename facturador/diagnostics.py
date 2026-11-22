@@ -91,7 +91,7 @@ def local_checks(store):
 
 async def check_tools(runner, gmail):
     results = await asyncio.to_thread(local_checks, runner.store)
-    name = 'Chromium y Playwright'
+    name = 'Navegador y Playwright'
     fallback = 'Reabre el navegador o importa comprobantes desde un archivo.'
     if runner.lock.locked() or runner.has_active_jobs():
         results.append(item(name, 'busy', 'Hay un trámite en curso. Se conservó la página activa.', fallback))
@@ -106,10 +106,10 @@ async def check_tools(runner, gmail):
                 snapshot = await page.locator('body').aria_snapshot()
                 frame = await page.screenshot(type='png', timeout=5000)
                 if 'FACTURAI' not in snapshot or not frame.startswith(b'\x89PNG'):
-                    raise ValueError('No se confirmó el control de Chromium.')
-                results.append(item(name, 'ok', 'Formulario, teclado, lectura accesible y captura comprobados.', fallback))
+                    raise ValueError('No se confirmó el control del navegador.')
+                results.append(item(name, 'ok', runner.engine + ' completó el formulario, la lectura accesible y la captura.', fallback))
             except Exception:
-                results.append(item(name, 'error', 'Chromium no completó la prueba.', fallback))
+                results.append(item(name, 'error', 'El navegador interno no completó la prueba.', fallback))
             finally:
                 if page and not page.is_closed():
                     try:
@@ -121,7 +121,7 @@ async def check_tools(runner, gmail):
     results.extend([
         item('Cuenta de ChatGPT', 'configured' if plan == 'ready' else 'pending',
              'Autorización guardada.' if plan == 'ready' else 'Revisa tu conexión o cupo en Ajustes.',
-             'Opera el ticket a mano en Chromium.'),
+             'Opera el ticket a mano en el navegador interno.'),
         item('Gmail', 'configured' if gmail_state == 'connected' else 'pending',
              'Autorización guardada.' if gmail_state == 'connected' else 'Gmail requiere vinculación.',
              'Importa el correo .eml o los archivos de la factura.'),

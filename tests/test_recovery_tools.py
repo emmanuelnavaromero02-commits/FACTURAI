@@ -202,7 +202,7 @@ class RecoveryTests(unittest.TestCase):
              patch('facturador.diagnostics.ocr_text', side_effect=ValueError('Sin OCR')):
             response = self.client.post('/api/tools/check', headers=self.headers)
         checks = {item['name']: item for item in response.json()}
-        self.assertEqual(checks['Chromium y Playwright']['status'], 'error')
+        self.assertEqual(checks['Navegador y Playwright']['status'], 'error')
         self.assertEqual(checks['OCR local']['status'], 'error')
         for name in ('Expedientes y almacenamiento', 'QR y códigos de barras', 'PDF y ZIP', 'Datos del CFDI 4.0'):
             self.assertEqual(checks[name]['status'], 'ok', name)

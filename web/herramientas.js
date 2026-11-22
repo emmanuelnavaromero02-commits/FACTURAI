@@ -55,7 +55,7 @@ export function installReceiptTools({api, el, button, link, perform, gmailConnec
         });
         row.append(el('span', code), add);
         if (result.portal_links.includes(code)) {
-          row.append(button('Cargar en Chromium', async () => {
+          row.append(button('Cargar en el navegador', async () => {
             try {
               await api('/api/browser/open', 'POST', {url: code});
               $('reader-status').textContent = 'Enlace abierto en la sección Navegador.';

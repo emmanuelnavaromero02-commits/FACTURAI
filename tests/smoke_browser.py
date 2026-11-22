@@ -39,6 +39,7 @@ async def smoke():
             await expect(page.get_by_role('button', name='Devolver control')).to_be_visible()
 
             state = await (await page.request.get(url + '/api/state')).json()
+            assert state['browser']['engine'] == 'Chromium', state['browser']
             revision = state['browser']['revision']
             headers = {'x-app-token': state['token']}
 
@@ -97,7 +98,7 @@ async def smoke():
             await page.get_by_role('button', name='Cerrar lectura').click()
             await page.get_by_role('button', name='Comprobar herramientas').click()
             await expect(page.locator('#tools-status')).to_have_text('Comprobación terminada.', timeout=30_000)
-            for name in ('OCR local', 'QR y códigos de barras', 'Chromium y Playwright', 'Expedientes y almacenamiento', 'PDF y ZIP', 'Datos del CFDI 4.0'):
+            for name in ('OCR local', 'QR y códigos de barras', 'Navegador y Playwright', 'Expedientes y almacenamiento', 'PDF y ZIP', 'Datos del CFDI 4.0'):
                 await expect(page.locator('#tools-report')).to_contain_text(name + ' · Comprobado')
             print('OK: OCR, teclado, página, captura PNG y diagnóstico del contenedor desde Ajustes.')
         finally:

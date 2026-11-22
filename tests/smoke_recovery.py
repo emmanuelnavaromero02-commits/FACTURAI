@@ -1,6 +1,7 @@
 """Pérdida real del contexto Chromium y de la disponibilidad del modelo en un comercio sintético."""
 
 import asyncio
+import os
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -54,6 +55,7 @@ async def smoke():
 
         async def start_test_browser():
             await start()
+            assert runner.engine == os.getenv('EXPECTED_ENGINE', 'Chromium'), runner.engine
             if not contexts or contexts[-1] is not runner.context:
                 contexts.append(runner.context)
                 await runner.context.route(origin + '/**', merchant)
@@ -126,7 +128,7 @@ async def smoke():
                 assert row['status'] == 'verified' and row['uuid'] == FISCAL_UUID, row
                 assert Path(row['pdf']).read_bytes() == pdf_bytes() and Path(row['xml']).read_bytes() == xml_bytes()
                 assert submissions == ['POST', 'POST']
-                print('OK: reapertura antes de emitir, recuperación después de emitir y relevo manual sin cuota, con PDF/XML.')
+                print(f'OK en {runner.engine}: reapertura antes de emitir, recuperación después de emitir y relevo manual sin cuota, con PDF/XML.')
         finally:
             await runner.close()
 

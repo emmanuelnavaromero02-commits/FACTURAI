@@ -1,6 +1,6 @@
 # FACTURAI
 
-Facturador personal de tickets mexicanos con una bandeja de expedientes, un navegador Chromium propio y cotejo de PDF y XML. FastAPI sirve el panel y controla el navegador mediante Playwright dentro del mismo contenedor. Tu navegador de escritorio solo muestra el panel.
+Facturador personal de tickets mexicanos con una bandeja de expedientes, Chromium propio, Firefox de respaldo y cotejo de PDF y XML. FastAPI sirve el panel y controla los navegadores mediante Playwright dentro del mismo contenedor. Tu navegador de escritorio muestra el panel.
 
 ## Arranque con Docker
 
@@ -41,6 +41,7 @@ Abre **Ajustes → Herramientas y recuperación → Comprobar herramientas**. Se
 | Qué ocurrió | Cómo continuar con el mismo ticket |
 | --- | --- |
 | ChatGPT quedó sin cuota o perdió conexión | **Continuar a mano** abre los controles en la misma página. Al terminar pulsa **Terminar y cotejar**. También puedes iniciar en modo manual desde **Preparar**. |
+| Chromium falla al arrancar | Se intenta Firefox en el mismo contenedor. La barra del visor indica el navegador activo. Cada motor guarda su propio perfil, por lo que un portal con sesión iniciada puede pedirte entrar otra vez. Este cambio responde a un fallo de arranque local. Las restricciones y verificaciones de un comercio se atienden en su portal. |
 | Se cerró Chromium | Antes de la emisión y de ceder el control, el trámite intenta reabrir el portal una vez. Después de un posible envío se recupera el CFDI existente. Si el portal ya confirmó la emisión, el expediente recuerda esa confirmación incluso sin UUID visible. En **Ajustes** se puede reiniciar Chromium cuando esté libre. |
 | La foto o la lectura con IA falló | El lector local ofrece OCR, rotación, códigos o texto digital del PDF. Se puede corregir cualquier campo en **Revisar**. Si solo falla la captura de la pantalla del portal, el agente puede leer sus controles accesibles. |
 | Necesitas los datos de tu constancia fiscal sin IA | En **Ajustes → Leer constancia localmente**, abre la página del PDF o toma una foto. El lector muestra su texto para capturar los campos fiscales y elimina la copia temporal al terminar la lectura. |
@@ -66,7 +67,7 @@ En Windows, usa `.venv\Scripts\python.exe`. En Linux o macOS, usa `.venv/bin/pyt
 
 ```bash
 python -m pip install -r requirements.txt
-python -m playwright install chromium
+python -m playwright install chromium firefox
 python -m facturador
 ```
 
@@ -100,7 +101,7 @@ node --check web/herramientas.js
 docker compose config
 ```
 
-GitHub Actions construye la imagen y recorre cuatro flujos con Chromium real. Verifica el lector y el diagnóstico desde el panel, la aprobación y descarga de una factura sintética, el intercambio de adjuntos y la recuperación ante fallos. En el último flujo se cierra Chromium antes y después del envío, se comprueba cuántas solicitudes recibió el comercio simulado y se completa otra compra a mano tras agotar la cuota simulada del modelo.
+GitHub Actions construye la imagen y ejecuta cinco pruebas de integración con navegadores reales. Verifica el lector y el diagnóstico desde el panel, la aprobación y descarga de una factura sintética, el intercambio de adjuntos y la recuperación ante fallos. En las dos últimas pruebas se cierra el navegador antes y después del envío, se cuenta cuántas solicitudes recibió el comercio simulado y se completa otra compra a mano tras agotar la cuota simulada del modelo. El mismo recorrido se ejecuta en Firefox con la ruta de Chromium ausente.
 
 La conexión con una cuenta real se verifica desde **Ajustes** con autorización de su titular. Las facturas de ejemplo se usan para revisión sin abrir un portal comercial.
 

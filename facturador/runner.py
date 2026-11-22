@@ -90,6 +90,7 @@ class Runner:
         self.owns_plan = plan is None
         self.viewer = BrowserView()
         self.context = None
+        self.engine = ''
         self.playwright = None
         self.lock = asyncio.Lock()
         self.browser_start = asyncio.Lock()
@@ -109,16 +110,20 @@ class Runner:
                 return
             from playwright.async_api import async_playwright
 
-            settings = {'user_data_dir': str(self.store.root / 'browser_profile'), 'headless': True,
-                        'accept_downloads': True, 'chromium_sandbox': True, 'service_workers': 'block',
+            settings = {'headless': True, 'accept_downloads': True, 'service_workers': 'block',
                         'viewport': {'width': 1280, 'height': 850}, 'timeout': 15_000}
-            executable = os.getenv('FACTURADOR_CHROMIUM_PATH')
-            if executable:
-                settings['executable_path'] = executable
             try:
                 if self.playwright is None:
                     self.playwright = await async_playwright().start()
-                self.context = await self.playwright.chromium.launch_persistent_context(**settings)
+                try:
+                    self.context = await self.playwright.chromium.launch_persistent_context(
+                        self.store.root / 'browser_profile', chromium_sandbox=True,
+                        executable_path=os.getenv('FACTURADOR_CHROMIUM_PATH'), **settings)
+                    self.engine = 'Chromium'
+                except BrowserError:
+                    self.context = await self.playwright.firefox.launch_persistent_context(
+                        self.store.root / 'browser_profile_firefox', firefox_user_prefs={'dom.serviceWorkers.enabled': False}, **settings)
+                    self.engine = 'Firefox'
             except Exception as exc:
                 if self.playwright is not None:
                     try:
@@ -127,11 +132,12 @@ class Runner:
                         pass
                     finally:
                         self.playwright = None
-                raise ValueError('No se pudo iniciar Chromium con su aislamiento. Revisa la instalación o inicia con Docker Compose.') from exc
+                raise ValueError('No se pudo iniciar el navegador interno. Revisa Chromium y Firefox en la instalación o reconstruye el contenedor.') from exc
             self.context.set_default_timeout(7000)
             def context_closed(context):
                 if self.context is context:
                     self.context = None
+                    self.engine = ''
             self.context.on('close', context_closed)
             self.context.on('page', self.register_page)
             for page in self.context.pages:

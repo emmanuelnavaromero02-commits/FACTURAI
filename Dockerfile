@@ -4,6 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     FACTURADOR_CONTAINER=1 \
     FACTURADOR_DATA=/data \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/facturador-browsers \
     FACTURADOR_CHROMIUM_PATH=/usr/bin/chromium
 
 RUN apt-get update \
@@ -15,7 +16,9 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt && python -m playwright --version
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -m playwright install --with-deps firefox \
+    && rm -rf /var/lib/apt/lists/*
 COPY facturador ./facturador
 COPY apps/api/src/vision/receipt_scan.py ./apps/api/src/vision/receipt_scan.py
 COPY web ./web

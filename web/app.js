@@ -516,10 +516,10 @@ $('check-tools').onclick = async () => {
   }
 };
 $('restart-browser').onclick = () => perform(async () => {
-  if (state.browser.open && !window.confirm('Se cerrarán las pestañas de Chromium. ¿Reiniciar el navegador?')) return;
+  if (state.browser.open && !window.confirm('Se cerrarán las pestañas del navegador interno. ¿Reiniciarlo?')) return;
   await api('/api/browser/restart', 'POST');
   route('navegador');
-  return 'Chromium está listo.';
+  return 'Navegador listo.';
 });
 $('portal-link-form').onsubmit = event => {
   event.preventDefault();

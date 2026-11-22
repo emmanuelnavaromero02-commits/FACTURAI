@@ -322,7 +322,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
             row["human_kind"] = runner.pending.get(row["id"], {}).get("kind")
         return {"token": token, "profile": read_json(path), "jobs": jobs,
                 'catalog': CATALOG, 'plan': plan.status(), 'gmail': gmail_connection.status(),
-                'browser': runner.viewer.state(), 'active_job': runner.active_id}
+                'browser': {**runner.viewer.state(), 'engine': runner.engine}, 'active_job': runner.active_id}
 
     @app.put("/api/profile")
     def save_profile(value: Profile):
