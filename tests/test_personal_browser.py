@@ -27,6 +27,11 @@ class PersonalBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.runner.playwright = Mock(chromium=Mock(launch_persistent_context=self.launch))
         self.runner.start_browser = AsyncMock()
 
+    def tearDown(self):
+        for event, callback in (registration.args for registration in self.context.on.call_args_list):
+            if event == 'close':
+                callback(self.context)
+
     async def test_blank_home_persists_its_own_profile_and_leaves_worker_unlocked(self):
         state = await self.runner.open_personal()
         self.assertEqual(state['mode'], 'personal')
@@ -60,7 +65,7 @@ class PersonalBrowserTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_manual_navigation_does_not_export_query_or_send_to_work_context(self):
         await self.runner.open_personal()
-        dest = 'https://accounts.google.com/signin?test=dummy'
+        dest = 'https://consulta.example/buscar?test=dummy'
         with patch('facturador.personal_browser.resolves_publicly', new=AsyncMock(return_value=True)):
             await self.runner.open_personal(dest)
         self.assertEqual(self.blank.goto.await_args.args[0], dest)
@@ -90,11 +95,11 @@ class PersonalBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.runner.screen.page, billing)
 
     async def test_guards_public_https_resources_and_secure_websockets(self):
-        route = Mock(request=Mock(url='https://accounts.google.com/x?' + 'z'*3000),
+        route = Mock(request=Mock(url='https://consulta.example/x?' + 'z'*3000),
                      continue_=AsyncMock(), abort=AsyncMock())
         with patch('facturador.personal_browser.resolves_publicly', new=AsyncMock(return_value=True)) as resolve:
             await PersonalBrowser.guard_request(route)
-        resolve.assert_awaited_once_with('https://accounts.google.com')
+        resolve.assert_awaited_once_with('https://consulta.example')
         route.continue_.assert_awaited_once()
         with patch('facturador.personal_browser.resolves_publicly', new=AsyncMock(return_value=False)):
             await PersonalBrowser.guard_request(route)

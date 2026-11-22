@@ -20,9 +20,17 @@ from .read_http import read_with_retry
 from .ingest import IMAGE_EXT, MAX_UPLOAD, save_inputs, write_original
 
 SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
+AUTHORIZE = 'https://accounts.google.com/o/oauth2/v2/auth'
 TOKEN = 'https://oauth2.googleapis.com/token'
 GMAIL = 'https://gmail.googleapis.com/gmail/v1/users/me/messages'
+PROFILE = 'https://gmail.googleapis.com/gmail/v1/users/me/profile'
 GMAIL_LOCK = threading.RLock()
+
+
+class GmailAuthorizationError(ValueError):
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
 
 
 class GmailConnection:
@@ -31,7 +39,7 @@ class GmailConnection:
         self.client = root / 'google_client.json'
         self.token = root / 'gmail_token.json'
         self.redirect = f'http://127.0.0.1:{port}/auth/gmail/callback'
-        self.pending = None
+        self.pending: dict[str, tuple[str, float]] = {}
 
     def status(self) -> str:
         return 'connected' if self.token.exists() else 'configured' if self.client.exists() else 'disconnected'
@@ -48,9 +56,14 @@ class GmailConnection:
         except (KeyError, TypeError, UnicodeError, ValueError) as exc:
             raise ValueError('Selecciona el JSON de un cliente OAuth de escritorio de Google.') from exc
         with GMAIL_LOCK:
-            write_private(self.client, {'installed': {'client_id': client['client_id'], 'client_secret': client['client_secret']}})
-            self.token.unlink(missing_ok=True)
-            self.pending = None
+            existing = read_json(self.client, {}).get('installed', {})
+            installed = {'client_id': client['client_id'], 'client_secret': client['client_secret']}
+            if existing == installed:
+                return
+            if self.token.exists() and existing.get('client_id') != installed['client_id']:
+                raise ValueError('Desvincula Gmail antes de cambiar de cliente OAuth.')
+            write_private(self.client, {'installed': installed})
+            self.pending.clear()
 
     def start(self) -> str:
         with GMAIL_LOCK:
@@ -59,28 +72,43 @@ class GmailConnection:
                 raise ValueError('Carga primero el cliente OAuth de escritorio de Google.')
             state, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(64)
             challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('=')
-            self.pending = (state, verifier, time.monotonic() + 600)
+            now = time.monotonic()
+            self.pending = {s: attempt for s, attempt in self.pending.items() if attempt[1] > now}
+            if len(self.pending) >= 8:
+                del self.pending[next(iter(self.pending))]
+            self.pending[state] = (verifier, now + 600)
             params = {'client_id': client['client_id'], 'redirect_uri': self.redirect, 'response_type': 'code',
                       'scope': SCOPE, 'access_type': 'offline', 'prompt': 'consent', 'state': state,
                       'code_challenge_method': 'S256', 'code_challenge': challenge}
-            return 'https://accounts.google.com/o/oauth2/v2/auth?' + urlencode(params)
+            return AUTHORIZE + '?' + urlencode(params)
 
     def finish(self, state: str, code: str, error: str = ''):
         with GMAIL_LOCK:
-            pending = self.pending
-            if not pending or not secrets.compare_digest(state, pending[0]) or pending[2] < time.monotonic():
-                raise ValueError('La solicitud de Gmail caducó.')
-            self.pending = None
+            pending = self.pending.pop(state, None)
+            if not pending or pending[1] <= time.monotonic():
+                raise GmailAuthorizationError('caducado', 'La solicitud de Gmail caducó.')
             if error or not code:
-                raise ValueError('La autorización de Gmail no se completó.')
+                raise GmailAuthorizationError('consentimiento', 'La autorización de Gmail no se completó.')
             client = read_json(self.client)['installed']
             tokens = exchange({'grant_type': 'authorization_code', 'redirect_uri': self.redirect, 'code': code,
-                               'code_verifier': pending[1], **client})
-            write_private(self.token, record_from(tokens))
+                               'code_verifier': pending[0], **client})
+            record = record_from(tokens)
+            if not record['refresh_token']:
+                raise GmailAuthorizationError('sin-renovacion', 'Vuelve a autorizar el acceso sin conexión para Gmail.')
+            try:
+                response = httpx.get(PROFILE, headers={'Authorization': 'Bearer ' + record['token']},
+                                     params={'fields': 'emailAddress'}, timeout=15)
+                profile = response.raise_for_status().json()
+                if not isinstance(profile, dict) or not profile.get('emailAddress'):
+                    raise ValueError
+            except (ValueError, httpx.HTTPError) as exc:
+                raise GmailAuthorizationError('buzon', 'Verifica que Gmail API esté habilitada para el cliente y que la cuenta tenga Gmail.') from exc
+            write_private(self.token, record)
+            self.pending.clear()
 
     def disconnect(self):
         with GMAIL_LOCK:
-            self.pending = None
+            self.pending.clear()
             self.token.unlink(missing_ok=True)
 
 
@@ -88,17 +116,27 @@ def exchange(form: dict) -> dict:
     try:
         response = httpx.post(TOKEN, data=form, timeout=20)
         response.raise_for_status()
-        return response.json()
+        tokens = response.json()
+        if not isinstance(tokens, dict):
+            raise ValueError
+        return tokens
     except (ValueError, httpx.HTTPError) as exc:
-        raise ValueError('Google rechazó o no completó la conexión. Conecta Gmail desde Ajustes.') from exc
+        raise GmailAuthorizationError('intercambio', 'Google rechazó o no completó la conexión. Conecta Gmail desde Ajustes.') from exc
 
 
 def record_from(tokens: dict, previous: dict | None = None) -> dict:
     previous = previous or {}
-    if SCOPE not in (tokens.get('scope') or previous.get('scope', '')).split() or not tokens.get('access_token'):
-        raise ValueError('Gmail no concedió lectura del buzón.')
+    scope = tokens.get('scope') or previous.get('scope', '')
+    if not isinstance(scope, str) or SCOPE not in scope.split() or not isinstance(tokens.get('access_token'), str) or not tokens['access_token']:
+        raise GmailAuthorizationError('permiso', 'Gmail no concedió lectura del buzón.')
+    try:
+        lifetime = int(tokens.get('expires_in', 3600))
+        if lifetime <= 0:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise GmailAuthorizationError('intercambio', 'Google devolvió una vigencia de autorización inválida.') from exc
     return {'token': tokens['access_token'], 'refresh_token': tokens.get('refresh_token') or previous.get('refresh_token'),
-            'scope': tokens.get('scope') or previous['scope'], 'expires_at': time.time() + int(tokens.get('expires_in', 3600))}
+            'scope': scope, 'expires_at': time.time() + lifetime}
 
 
 def access_token(root: Path) -> str:

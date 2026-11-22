@@ -29,7 +29,7 @@ from .db import Store
 from .diagnostics import check_tools
 from .invoice_mail import InvoiceMailRecovery
 from .documents import browser_file, browser_files, reconcile, save_candidate
-from .gmail import GmailConnection, cfdi_parts, import_eml, import_tickets, parse_eml, recover_attachments, search_tickets, ticket_parts
+from .gmail import GmailAuthorizationError, GmailConnection, cfdi_parts, import_eml, import_tickets, parse_eml, recover_attachments, search_tickets, ticket_parts
 from .ingest import IMAGE_EXT, MAX_UPLOAD, save_input, save_upload, validate_document
 from .local_reader import read_local_page
 from .models import Profile, Receipt
@@ -254,8 +254,8 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     def gmail_callback(state: str = '', code: str = '', error: str = ''):
         try:
             gmail_connection.finish(state, code, error)
-        except ValueError:
-            return RedirectResponse('/?conexion=gmail-error#ajustes', 303)
+        except GmailAuthorizationError as exc:
+            return RedirectResponse(f'/?conexion=gmail-error&motivo={exc.reason}#ajustes', 303)
         return RedirectResponse('/?conexion=gmail-ok#ajustes', 303)
 
     @app.post('/api/gmail/disconnect')

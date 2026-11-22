@@ -57,7 +57,7 @@
     </section>
 
     <section class="screen" id="screen-navegador" hidden aria-labelledby="browser-title">
-      <header class="screen-header"><div><h1 id="browser-title">Navegador</h1><p>La navegación libre conserva tus sesiones de sitios web en el contenedor.</p></div><div class="buttons"><button id="browser-open" class="primary">Navegación libre</button><button id="browser-google" class="secondary">Cuenta de Google</button><button id="wa-open" class="secondary">Abrir WhatsApp Web</button></div></header>
+      <header class="screen-header"><div><h1 id="browser-title">Navegador</h1><p>El contenedor guarda las sesiones de tus portales. Vincula Gmail desde tu Chrome para recibir códigos y facturas.</p></div><div class="buttons"><button id="browser-open" class="primary">Navegación libre</button><button id="browser-google" class="secondary">Cuenta de Google</button><a id="browser-webmail" class="secondary button-link" href="https://mail.google.com/" target="_blank" rel="noopener noreferrer">Abrir Gmail en mi Chrome</a><button id="wa-open" class="secondary">Abrir WhatsApp Web</button></div></header>
       <div class="browser-grid">
         <section class="card browser-card">
           <nav id="browser-tabs" class="browser-tabs" aria-label="Pestañas de navegación libre" hidden><div id="browser-tab-list"></div><button type="button" class="secondary" id="browser-new-tab" title="Nueva pestaña" aria-label="Nueva pestaña">+</button><button type="button" class="secondary" id="browser-close-tab" title="Cerrar pestaña actual" aria-label="Cerrar pestaña actual">×</button></nav>
@@ -67,7 +67,7 @@
           </div>
           <div class="browser-location"><span id="browser-address">Sin página abierta</span><span class="pill browser-pill" id="browser-state">En espera</span></div>
           <div class="browser-stage">
-            <div id="browser-empty" class="empty small-empty"><span class="empty-symbol" aria-hidden="true">⊞</span><h3>Sin página abierta</h3><p>Escribe una dirección o abre tu cuenta de Google.</p></div>
+            <div id="browser-empty" class="empty small-empty"><span class="empty-symbol" aria-hidden="true">⊞</span><h3>Sin página abierta</h3><p>Escribe la dirección del portal que quieres abrir.</p></div>
             <img id="browser-image" alt="Página en vivo del navegador" tabindex="0" draggable="false" hidden>
             <div id="browser-loading" class="browser-loading" hidden>Abriendo la página…</div>
           </div>
@@ -124,7 +124,7 @@
           <div class="settings-body"><p id="plan-email" class="muted"></p><p id="plan-message" class="muted"></p><div class="buttons"><button id="pod-connect" class="primary" data-oai-siwc-button>Continuar con ChatGPT</button><button id="pod-other" class="plain" hidden>Usar otra cuenta</button><button id="pod-disconnect" class="secondary" hidden>Desconectar</button><button id="pod-retry" class="secondary" hidden>Revisar cupo</button></div>
           <div id="model-row" class="model-row" hidden><div><strong>Modelo</strong><p id="current-model"></p></div><button class="secondary" id="model-list">Elegir modelo</button></div></div>
         </section>
-        <section class="card settings-card"><div class="card-heading"><div><h2>Gmail</h2><p>Recupera PDF, XML y ZIP adjuntos.</p></div><span class="pill" id="gmail-status">Por conectar</span></div><div class="settings-body"><p class="muted">Importa el JSON OAuth de escritorio de Google y vincula el buzón en modo lectura.</p><div class="buttons"><button id="gmail-configure" class="secondary">Importar cliente OAuth</button><button id="gmail-connect" class="primary" disabled>Conectar Gmail</button><button id="gmail-disconnect" class="plain" hidden>Desvincular</button></div></div></section>
+        <section class="card settings-card"><div class="card-heading"><div><h2>Gmail</h2><p>Lee los códigos de registro y recupera archivos PDF, XML y ZIP.</p></div><span class="pill" id="gmail-status">Por conectar</span></div><div class="settings-body"><p class="muted">Importa el JSON de un cliente OAuth de escritorio de Google. Al conectar, Google te pedirá en otra pestaña que autorices a FACTURAI a leer el buzón. Mantén abierto el acceso a FACTURAI hasta regresar.</p><div class="buttons"><button id="gmail-configure" class="secondary">Importar cliente OAuth</button><button id="gmail-connect" class="primary" disabled>Conectar Gmail</button><a class="secondary button-link" href="https://mail.google.com/" target="_blank" rel="noopener noreferrer">Abrir Gmail en mi Chrome</a><button id="gmail-disconnect" class="plain" hidden>Desvincular</button></div></div></section>
         <section class="card settings-card"><div class="card-heading"><div><h2>Historial anterior</h2><p>Incorpora el registro del facturador anterior.</p></div></div><div class="settings-body"><p class="muted">Importa el JSON de historial para reconocer tickets ya registrados.</p><button class="secondary" id="import-history">Importar historial</button></div></section>
       </div>
     </section>

@@ -270,5 +270,5 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
   }
   setInterval(frame, 360);
   return {update, hasControl: () => Boolean(channel), openPersonal: navigation.openPersonal,
-    returnToJob: navigation.returnToJob};
+    returnToJob: navigation.returnToJob, gmail: navigation.gmail};
 }

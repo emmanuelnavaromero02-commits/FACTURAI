@@ -434,7 +434,7 @@ function renderBrowser() {
   $('browser-empty').querySelector('h3').textContent = opening ? 'Abriendo el portal del ticket…' :
     personal ? 'Nueva pestaña' : 'Sin página abierta';
   $('browser-empty').querySelector('p').textContent = opening ? 'Aquí verás a Chrome en cuanto abra el portal.' :
-    'Escribe una dirección o abre tu cuenta de Google.';
+    'Escribe la dirección del portal que quieres abrir.';
   const previous = !state.browser.open || state.browser.job_id === lastLiveJob ? lastLiveJob : null;
   const row = state.jobs.find(job => job.id === (state.active_job || previous));
   const signature = JSON.stringify([row, state.active_job, personal, state.profile?.rfc, state.plan.status]);
@@ -508,6 +508,7 @@ function renderSettings() {
   $('plan-card-link').textContent = plan.status === 'ready' ? 'Administrar plan →' : 'Conectar ChatGPT →';
   $('gmail-status').textContent = state.gmail === 'connected' ? 'Conectado' : state.gmail === 'configured' ? 'Listo para vincular' : 'Por configurar';
   $('gmail-connect').disabled = state.gmail === 'disconnected';
+  $('gmail-connect').textContent = state.gmail === 'connected' ? 'Vincular otra cuenta' : 'Conectar Gmail';
   $('gmail-disconnect').hidden = state.gmail !== 'connected';
 }
 
@@ -791,9 +792,12 @@ function attach(input, url, field, message) {
   });
 }
 $('gmail-configure').onclick = () => $('gmail-file').click();
-$('gmail-file').onchange = event => attach(event.target, '/api/gmail/client', 'file', 'Cliente OAuth cargado. Pulsa Conectar Gmail.');
-$('gmail-connect').onclick = () => perform(async () => { const {url} = await api('/api/gmail/connect', 'POST'); location.assign(url); });
-$('gmail-disconnect').onclick = () => perform(async () => { await api('/api/gmail/disconnect', 'POST'); return 'Gmail desvinculado de este equipo.'; });
+$('gmail-file').onchange = event => {
+  if (event.target.files.length) viewer.gmail.reset();
+  attach(event.target, '/api/gmail/client', 'file', 'Cliente OAuth cargado. Pulsa Conectar Gmail.');
+};
+$('gmail-connect').onclick = viewer.gmail.connect;
+$('gmail-disconnect').onclick = () => perform(async () => { await api('/api/gmail/disconnect', 'POST'); viewer.gmail.reset(); return 'Gmail desvinculado de este equipo.'; });
 $('import-history').onclick = () => $('history-file').click();
 $('history-file').onchange = event => attach(event.target, '/api/history', 'file', 'Historial incorporado.');
 $('cfdi-file').onchange = event => attach(event.target, `/api/jobs/${attachJob}/attachments`, 'files', 'PDF y XML comprobados.');
@@ -823,11 +827,24 @@ window.addEventListener('hashchange', () => {
   openScreen();
 });
 openScreen();
-const outcome = new URLSearchParams(location.search).get('conexion');
+const connectionParams = new URLSearchParams(location.search);
+const outcome = connectionParams.get('conexion');
 if (outcome) {
   history.replaceState(null, '', '/#ajustes');
-  if (outcome.endsWith('-error')) notify('La conexión no se completó. Puedes volver a iniciarla.', true);
-  else notify(outcome.startsWith('chatgpt') ? 'Conexión con ChatGPT guardada. Revisa el estado de tu plan.' : 'Gmail conectado en modo lectura.');
+  if (outcome === 'gmail-ok' || outcome === 'gmail-error') {
+    viewer.gmail.notifyReturn(outcome);
+    const problems = {
+      caducado: 'El enlace de Google caducó. Pulsa Conectar Gmail para obtener uno nuevo.',
+      consentimiento: 'La autorización se canceló. Puedes volver a conectar Gmail cuando estés listo.',
+      intercambio: 'Google no completó la conexión. Comprueba que el cliente OAuth de escritorio sea correcto y vuelve a conectar Gmail.',
+      permiso: 'Faltó el permiso de lectura. Vuelve a conectar Gmail y autoriza la lectura del buzón.',
+      'sin-renovacion': 'Google no concedió acceso continuo. Vuelve a conectar Gmail y confirma el permiso.',
+      buzon: 'FACTURAI no pudo comprobar el buzón. Revisa que Gmail esté habilitado para esa cuenta y vuelve a conectar.'
+    };
+    if (outcome === 'gmail-ok') notify('Gmail vinculado. Puedes cerrar esta pestaña y volver a la pestaña original de FACTURAI.');
+    else notify(problems[connectionParams.get('motivo')] || 'La conexión con Gmail no se completó. Vuelve a la pestaña original de FACTURAI e inténtalo de nuevo.', true);
+  } else if (outcome === 'chatgpt-error') notify('La conexión no se completó. Puedes volver a iniciarla.', true);
+  else if (outcome.startsWith('chatgpt')) notify('Conexión con ChatGPT guardada. Revisa el estado de tu plan.');
 }
 refresh().then(() => {
   if (activeScreen === 'portales') renderPortals();

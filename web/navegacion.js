@@ -1,3 +1,108 @@
+export function installGoogleAccount({api, perform}) {
+  const byId = id => document.getElementById(id);
+  const account = byId('browser-google');
+  let webmail = byId('browser-webmail');
+  if (!webmail) {
+    webmail = document.createElement('a');
+    webmail.id = 'browser-webmail';
+    webmail.className = 'secondary button-link';
+    webmail.textContent = 'Abrir Gmail en mi Chrome';
+    account.after(webmail);
+  }
+  webmail.href = 'https://mail.google.com/';
+  webmail.target = '_blank';
+  webmail.rel = 'noopener noreferrer';
+  const channel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('facturai-gmail') : null;
+  let pending = null;
+  let starting = false;
+
+  function message(text, failed = false) {
+    const notice = byId('notice');
+    notice.textContent = text;
+    notice.hidden = false;
+    notice.classList.toggle('error', failed);
+    return notice;
+  }
+  function settings(control) {
+    if (location.hash === '#ajustes') control.focus();
+    else {
+      window.addEventListener('hashchange', () => requestAnimationFrame(() => control.focus()), {once: true});
+      location.hash = 'ajustes';
+    }
+  }
+  async function checkConnection() {
+    const request = pending;
+    if (!request) return;
+    try {
+      const {gmail} = await api('/api/state');
+      if (pending !== request) return;
+      if (gmail === 'connected' && (!request.alreadyConnected || request.returned)) {
+        pending = null;
+        await perform(async () => 'Gmail vinculado. FACTURAI puede leer los correos de verificación y las facturas.');
+      }
+    } catch { /* El siguiente regreso al panel vuelve a consultar el estado. */ }
+  }
+  window.addEventListener('focus', checkConnection);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) checkConnection(); });
+  if (channel) channel.onmessage = ({data}) => {
+    if (!pending || !['gmail-ok', 'gmail-error'].includes(data)) return;
+    if (data === 'gmail-error') {
+      pending = null;
+      message('La autorización de Gmail no se completó. Revisa el detalle en la pestaña de Google y vuelve a intentarlo.', true);
+    } else {
+      pending.returned = true;
+      checkConnection();
+    }
+  };
+
+  async function connect() {
+    if (starting) return;
+    starting = true;
+    // Open synchronously from the click, then sever the opener before visiting Google.
+    const tab = window.open('about:blank', '_blank');
+    if (tab) tab.opener = null;
+    try {
+      if (!pending || Date.now() >= pending.expires) {
+        const {url} = await api('/api/gmail/connect', 'POST');
+        const destination = new URL(url);
+        if (destination.origin !== 'https://accounts.google.com' || destination.username || destination.password) {
+          throw Error('FACTURAI no recibió una dirección de autorización de Google válida.');
+        }
+        pending = {url: destination.href, expires: Date.now() + 9 * 60 * 1000,
+          alreadyConnected: !byId('gmail-disconnect').hidden};
+      }
+      if (tab && !tab.closed) {
+        tab.location.replace(pending.url);
+        message('Autoriza la lectura de Gmail en la otra pestaña y vuelve a FACTURAI para continuar.');
+      } else {
+        const link = document.createElement('a');
+        link.textContent = 'Continuar en Google';
+        link.href = pending.url;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        message('Chrome bloqueó la pestaña de autorización. ').append(link);
+        link.focus();
+      }
+    } catch (error) {
+      if (tab && !tab.closed) tab.close();
+      pending = null;
+      message(error.message, true);
+    } finally {
+      starting = false;
+    }
+  }
+  account.onclick = () => {
+    if (byId('gmail-connect').disabled) {
+      settings(byId('gmail-configure'));
+      message('Para que FACTURAI lea códigos y facturas, importa el cliente OAuth de escritorio y pulsa Conectar Gmail.');
+    } else if (!byId('gmail-disconnect').hidden) {
+      settings(byId('gmail-connect'));
+      message('Gmail ya está vinculado a FACTURAI. Puedes consultar tu buzón con Abrir Gmail en mi Chrome.');
+    } else connect();
+  };
+  return {connect, notifyReturn: outcome => channel?.postMessage(outcome), reset: () => { pending = null; }};
+}
+
 export function installNavigation({api, perform, current}) {
   const byId = id => document.getElementById(id);
   const address = byId('browser-url');
@@ -17,7 +122,7 @@ export function installNavigation({api, perform, current}) {
     for (const id of ['page-back', 'page-forward', 'page-reload']) {
       byId(id).disabled = blocked || !browser.open || !canNavigate;
     }
-    for (const id of ['browser-open', 'browser-google', 'browser-go', 'browser-return']) {
+    for (const id of ['browser-open', 'browser-go', 'browser-return']) {
       byId(id).disabled = blocked;
     }
     byId('wa-open').disabled = blocked || active;
@@ -115,7 +220,7 @@ export function installNavigation({api, perform, current}) {
   }
   byId('browser-open').onclick = () => openPersonal();
   byId('browser-return').onclick = returnToJob;
-  byId('browser-google').onclick = () => openPersonal('https://accounts.google.com/');
+  const gmail = installGoogleAccount({api, perform});
   byId('browser-new-tab').onclick = () => changeTab('new');
   byId('browser-close-tab').onclick = () => {
     const tab = current().browser.tabs?.find(item => item.selected);
@@ -124,5 +229,5 @@ export function installNavigation({api, perform, current}) {
   for (const [id, direction] of [['page-back', 'back'], ['page-forward', 'forward'], ['page-reload', 'reload']]) {
     byId(id).onclick = () => navigate('/api/browser/history', {direction});
   }
-  return {update, openPersonal, returnToJob};
+  return {update, openPersonal, returnToJob, gmail};
 }
