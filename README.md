@@ -1,6 +1,6 @@
 # FACTURAI
 
-Facturador personal de tickets mexicanos con una bandeja de expedientes, un navegador Chromium propio y cotejo de PDF y XML. FastAPI sirve el panel y controla el navegador mediante Playwright dentro del mismo contenedor. Tu navegador de escritorio solo muestra el panel.
+Facturador personal de tickets mexicanos con una bandeja de expedientes, Chromium propio, Firefox de respaldo y cotejo de PDF y XML. FastAPI sirve el panel y controla los navegadores mediante Playwright dentro del mismo contenedor. Tu navegador de escritorio muestra el panel.
 
 ## Arranque con Docker
 
@@ -16,9 +16,9 @@ Abre [la bandeja](http://127.0.0.1:8765/#bandeja). En Windows también puedes de
 
 1. En **Navegador → Abrir navegador** aparece el directorio de comercios dentro de Chromium. Pulsa **Tomar control** para buscar y abrir un portal. También puedes abrirlo desde la ficha del comercio en **Portales**. Esto funciona antes de conectar cuentas.
 2. Para probar la bandeja, pulsa **Cargar ticket de ejemplo** y **Revisar**. El ejemplo usa datos ficticios y queda fuera de la cola de emisión.
-3. Para procesar compras, guarda tu perfil fiscal en **Ajustes**, vincula tu plan y sube un ticket. Las pantallas de acceso o verificación del comercio se atienden en ese mismo navegador.
+3. Para procesar compras, guarda tu perfil fiscal en **Ajustes** y sube un ticket. En **Preparar** elige operar el portal a mano o usar tu plan de ChatGPT vinculado. Las pantallas de acceso y verificación se atienden en el navegador del contenedor.
 
-Docker comprueba que la aplicación y Chromium estén listos antes de dar por terminado el arranque. El volumen `expedientes` conserva la cola, los archivos y el perfil de Chromium al reiniciar. El puerto 8765 se publica en el equipo local. Para detenerlo ejecuta `docker compose stop`; para reanudarlo, `docker compose up -d`.
+Docker inicia Chromium y comprueba que responda el panel. Si el navegador falla, la bandeja, la lectura local y la recuperación de archivos siguen disponibles. El volumen `expedientes` conserva la cola, los archivos y el perfil de Chromium al reiniciar. El puerto 8765 se publica en el equipo local. Puedes detenerlo con `docker compose stop` y reanudarlo con `docker compose up -d`.
 
 ## Herramientas del contenedor
 
@@ -30,9 +30,26 @@ Docker comprueba que la aplicación y Chromium estén listos antes de dar por te
 | Selector de archivos del portal | En Chromium haz clic en el campo del comercio. El panel muestra el dominio que recibirá el archivo. Elige tu constancia o ticket en PDF o foto y pulsa **Adjuntar al portal**. |
 | Navegador → Descargas manuales | Descargar los PDF, XML y ZIP que el navegador recogió mientras tenías el control de un portal. Desde el menú del ticket, **Usar descargas del navegador** permite elegir los archivos y cotejarlos con ese expediente. Los archivos obtenidos en un trámite de la cola se asocian directamente con él. |
 | Bandeja → Importar desde Gmail | Buscar por comercio, remitente o reservación. Abre el mensaje y marca el texto o los adjuntos concretos que contienen el ticket. Sirve también para vuelos con los datos en el cuerpo del correo. Requiere la conexión de lectura de Gmail. |
-| Navegador → Abrir WhatsApp Web | Vincular el dispositivo, abrir la foto del ticket y llevarla a la bandeja. |
+| Navegador → Abrir WhatsApp Web | Vincular el dispositivo, abrir la foto del ticket y llevarla a la bandeja. La acción de WhatsApp del expediente permite gestionar la solicitud con el comercio. |
 
 ChatGPT recibe imágenes y texto para las operaciones de IA que elijas. El OCR, lector PDF, decodificador de QR y barras, controles de Playwright, descargas y cotejo se ejecutan en el contenedor. Las verificaciones interactivas del comercio se completan en la vista en vivo.
+
+## Recuperación ante fallos
+
+Abre **Ajustes → Herramientas y recuperación → Comprobar herramientas**. Se prueban lectura y escritura en SQLite, OCR, QR, barras, PDF, ZIP, datos de un CFDI sintético y control de Chromium. El diagnóstico distingue las pruebas locales del estado de las cuentas vinculadas. Durante un trámite conserva la página activa y muestra el navegador como ocupado.
+
+| Qué ocurrió | Cómo continuar con el mismo ticket |
+| --- | --- |
+| ChatGPT quedó sin cuota o perdió conexión | **Continuar a mano** abre los controles en la misma página. Al terminar pulsa **Terminar y cotejar**. También puedes iniciar en modo manual desde **Preparar**. |
+| Chromium falla al arrancar | Se intenta Firefox en el mismo contenedor. La barra del visor indica el navegador activo. Cada motor guarda su propio perfil, por lo que un portal con sesión iniciada puede pedirte entrar otra vez. Este cambio responde a un fallo de arranque local. Las restricciones y verificaciones de un comercio se atienden en su portal. |
+| Se cerró Chromium | Antes de la emisión y de ceder el control, el trámite intenta reabrir el portal una vez. Después de un posible envío se recupera el CFDI existente. Si el portal ya confirmó la emisión, el expediente recuerda esa confirmación incluso sin UUID visible. En **Ajustes** se puede reiniciar Chromium cuando esté libre. |
+| La foto o la lectura con IA falló | El lector local ofrece OCR, rotación, códigos o texto digital del PDF. Se puede corregir cualquier campo en **Revisar**. Si solo falla la captura de la pantalla del portal, el agente puede leer sus controles accesibles. |
+| Necesitas los datos de tu constancia fiscal sin IA | En **Ajustes → Leer constancia localmente**, abre la página del PDF o toma una foto. El lector muestra su texto para capturar los campos fiscales y elimina la copia temporal al terminar la lectura. |
+| El PDF y el XML llegaron por canales distintos | Adjunta el que tengas y conserva el expediente. Después recupera el otro de Gmail, de las descargas de Chromium, de un correo exportado `.eml` o de tus archivos. Se cotejan UUID, RFC, importe y datos fiscales. Un PDF escaneado se intenta leer con OCR en sus primeras cuatro páginas. |
+| Gmail o WhatsApp están desconectados | En **Bandeja** sube el correo `.eml`, las fotos, el PDF o un ZIP exportado de WhatsApp. Para recuperar una factura de un correo, usa **Adjuntar PDF/XML, ZIP o correo** en el ticket. |
+| El comercio carece de portal en el catálogo | En **Revisar** selecciona **Otro comercio · solicitar directamente**. Abre WhatsApp desde el expediente para enviar la solicitud a su número de facturación y recuperar la respuesta. También puedes copiar el mensaje si el comercio usa otro canal. |
+
+Si la conexión se pierde mientras alguien controla el trámite, se conserva como pendiente de recuperación. Un archivo aislado o una captura de la página de éxito todavía requieren el cotejo de la pareja PDF/XML.
 
 ### Código de este repositorio
 
@@ -50,7 +67,7 @@ En Windows, usa `.venv\Scripts\python.exe`. En Linux o macOS, usa `.venv/bin/pyt
 
 ```bash
 python -m pip install -r requirements.txt
-python -m playwright install chromium
+python -m playwright install chromium firefox
 python -m facturador
 ```
 
@@ -62,9 +79,18 @@ En Linux instala las dependencias del navegador con `python -m playwright instal
 2. El menú del ticket ofrece **Leer con ChatGPT**. Comprueba folio, fecha, importe y forma de pago en **Revisar**. Selecciona el portal y guarda. Para fotos con varios papeles, importa cada ticket por separado. Para una factura conjunta de CAPUFE, registra en un expediente la suma y los códigos que correspondan.
 3. Pulsa **Preparar** o **Preparar listos**. El facturador abre las solicitudes en orden. En **Navegador** ves la página activa. Ante un CAPTCHA, inicio de sesión o paso manual, **Tomar control** habilita clics y teclado sobre la misma página. **Continuar** devuelve el trámite al agente.
 4. La emisión muestra una revisión antes del envío. En CAPUFE puedes elegir emisión automática. Solo aplica a su confirmación reconocida cuando el código comprueba la tabla de peajes, fecha, total, agrupación, forma de pago y perfil. En portales que cambien de flujo, revisa la pantalla o guarda el pendiente.
-5. La app recoge las descargas del portal. Si ofrece envío por correo, recupera desde **Comprobantes** o desde las acciones del ticket. También admite adjuntar PDF/XML/ZIP. La pareja se entrega como comprobada cuando el XML coteja receptor, importe, pago, timbre y uso, y el PDF refleja UUID y RFC. Para vigencia o cancelación consulta al SAT.
+5. La app recoge las descargas del portal. Si ofrece envío por correo, recupera desde **Comprobantes** o desde las acciones del ticket. También admite adjuntar PDF/XML/ZIP. La pareja se entrega como comprobada cuando el XML coteja receptor, importe, pago, timbre y uso, y el PDF refleja UUID y RFC.
+6. En un expediente con la pareja cotejada, usa **Consultar al SAT** para conocer la vigencia del CFDI. La consulta envía los identificadores del comprobante al servicio oficial y guarda la respuesta con fecha. Ante un fallo temporal puedes consultar el mismo CFDI otra vez. [Documentación del servicio del SAT](https://www.sat.gob.mx/minisitio/Factura/documentos/cancelacion/consulta_cfdi.pdf)
 
 Cada intento de emisión queda registrado antes del clic que puede timbrar. Ante un resultado incierto se conservan el expediente y los archivos para recuperar la factura. El menú **Preparar solicitud** redacta el mensaje que puedes copiar al canal del comercio.
+
+### Solicitar la factura por WhatsApp
+
+1. Guarda tu perfil fiscal, revisa el ticket y abre **Solicitar por WhatsApp** en su expediente. Si es la primera vez, vincula WhatsApp Web en el navegador de la app.
+2. Escribe el número internacional de facturación que proporcionó el comercio. El ticket original se incluye automáticamente. Puedes elegir la constancia y el comprobante de pago, revisar el correo de recepción y confirmar el envío.
+3. La app comprueba el número en WhatsApp y envía un mensaje con una referencia del expediente. Si el navegador pierde la confirmación, revisa el chat antes de completar cualquier adjunto pendiente.
+4. Puedes activar el seguimiento automático de respuestas mientras Docker esté en ejecución y WhatsApp siga vinculado. Puedes pausarlo desde el expediente. **Buscar PDF y XML en el chat** hace una revisión inmediata. Si hay varias solicitudes al mismo número, la referencia permite distinguirlas.
+5. Cuando llegue un solo archivo, puedes agregar su pareja más tarde, incluso si llegó por correo. El panel verifica los archivos contra el perfil fiscal guardado en el momento del envío.
 
 ## Conexiones y datos
 
@@ -81,10 +107,12 @@ python -m unittest discover -s tests -v
 node --check web/app.js
 node --check web/visor.js
 node --check web/herramientas.js
+node --check web/seguimiento.js
+node --test tests/seguimiento-panel.test.mjs
 docker compose config
 ```
 
-Las pruebas cubren lectura local, importación selectiva de mensajes, deduplicación y recuperación de sesión. GitHub Actions construye la imagen y recorre tres flujos en Chromium. El primero verifica OCR, teclado, lectura de página y captura PNG. El segundo usa un comercio simulado para aprobar un trámite y cotejar el PDF y XML. El tercero usa el panel para navegar por el historial, adjuntar un documento y descargarlo de un portal simulado. Se comprueban los bytes entregados en ambos sentidos.
+Las pruebas de integración en `tests/smoke_*.py` usan tickets y comercios simulados para comprobar el lector, la aprobación, los adjuntos y la recuperación ante fallos. El flujo de GitHub Actions se encuentra archivado en `.github/workflows-desactivados/`.
 
 La conexión con una cuenta real se verifica desde **Ajustes** con autorización de su titular. Las facturas de ejemplo se usan para revisión sin abrir un portal comercial.
 

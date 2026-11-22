@@ -28,6 +28,10 @@ jobs:
           docker compose exec -T -e PYTHONPATH=/app facturador python /tmp/pruebas-facturador/smoke_invoice.py
       - name: Probar adjuntos y descargas manuales en Chromium
         run: docker compose exec -T -e PYTHONPATH=/app facturador python /tmp/pruebas-facturador/smoke_portal_tools.py
+      - name: Recuperar el navegador y continuar sin IA
+        run: docker compose exec -T -e PYTHONPATH=/app facturador python /tmp/pruebas-facturador/smoke_recovery.py
+      - name: Operar con Firefox de respaldo cuando Chromium no puede arrancar
+        run: docker compose exec -T -e PYTHONPATH=/app -e EXPECTED_ENGINE=Firefox -e FACTURADOR_CHROMIUM_PATH=/ruta-de-prueba/chromium-ausente facturador python /tmp/pruebas-facturador/smoke_recovery.py
       - if: failure()
         run: docker compose logs --no-color --tail=100 facturador
       - if: always()

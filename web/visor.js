@@ -51,7 +51,8 @@ export function installViewer({api, token, showError, perform}) {
     } else if (value.open) {
       byId('browser-address').textContent = value.label;
     }
-    byId('browser-state').textContent = value.manual ? 'Intervención' : value.open ? 'En vivo' : 'En espera';
+    const label = value.manual ? 'Intervención' : value.open ? 'En vivo' : 'En espera';
+    byId('browser-state').textContent = value.open && value.engine ? label + ' · ' + value.engine : label;
     byId('browser-empty').hidden = value.open;
     byId('browser-loading').hidden = !value.open || Boolean(frameUrl) || Boolean(value.dialog);
     image.hidden = !value.open || !frameUrl;

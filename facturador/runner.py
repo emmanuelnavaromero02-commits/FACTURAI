@@ -7,15 +7,17 @@ import ipaddress
 import json
 import os
 import re
+import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
+from playwright.async_api import Error as BrowserError
 
 from .ai import AI
 from .auth import ChatGPTPlan, PlanError
 from .catalog import CATALOG, allowed_url, provider_for_url
 from .cfdi import UUID_RE
 from .db import Store
-from .documents import reconcile
+from .documents import job_candidates, reconcile
 from .models import Action, Profile, Receipt
 from .portals import capufe_proof, normalize
 from .viewer import BrowserView
@@ -28,7 +30,7 @@ CHALLENGE_TEXT = re.compile(r'no soy un robot|verifica que eres humano|verify (?
 ACCESS_DENIED = re.compile(r'access denied|error 16\b|blocked by our security service|acceso denegado|err_cert_', re.I)
 SUCCESS = re.compile(r'factura\s+(?:emitida|generada)\b|cfdi\s+(?:emitido|generado)\b|timbrad[ao]\s+correctamente|resultado facturaci[oó]n[^\n]*\n[\s\S]{0,130}facturas generadas|se gener[oó]\s+exitosamente', re.I)
 DOWNLOAD = re.compile(r'descargar|download|\bpdf\b|\bxml\b|imprimir', re.I)
-MANUAL = {'captcha', 'login', 'terms', 'unknown', 'blocked', 'confirm', 'attachment'}
+MANUAL = {'captcha', 'login', 'terms', 'unknown', 'blocked', 'confirm', 'attachment', 'operator'}
 
 
 def action_risk(action: Action) -> str:
@@ -88,6 +90,7 @@ class Runner:
         self.owns_plan = plan is None
         self.viewer = BrowserView()
         self.context = None
+        self.engine = ''
         self.playwright = None
         self.lock = asyncio.Lock()
         self.browser_start = asyncio.Lock()
@@ -95,6 +98,7 @@ class Runner:
         self.job_tasks: dict[str, asyncio.Task] = {}
         self.downloads: set[asyncio.Task] = set()
         self.page_job = {}
+        self.lost_pages = weakref.WeakSet()
         self.active_id: str | None = None
         self.whatsapp = None
         self.portal_page = None
@@ -106,25 +110,37 @@ class Runner:
                 return
             from playwright.async_api import async_playwright
 
-            if self.playwright is not None:
-                await self.playwright.stop()
-                self.playwright = None
-            settings = {'user_data_dir': str(self.store.root / 'browser_profile'), 'headless': True,
-                        'accept_downloads': True, 'chromium_sandbox': True, 'service_workers': 'block',
+            settings = {'headless': True, 'accept_downloads': True, 'service_workers': 'block',
                         'viewport': {'width': 1280, 'height': 850}, 'timeout': 15_000}
-            executable = os.getenv('FACTURADOR_CHROMIUM_PATH')
-            if executable:
-                settings['executable_path'] = executable
             try:
-                self.playwright = await async_playwright().start()
-                self.context = await self.playwright.chromium.launch_persistent_context(**settings)
+                if self.playwright is None:
+                    self.playwright = await async_playwright().start()
+                try:
+                    self.context = await self.playwright.chromium.launch_persistent_context(
+                        self.store.root / 'browser_profile', chromium_sandbox=True,
+                        executable_path=os.getenv('FACTURADOR_CHROMIUM_PATH'), **settings)
+                    self.engine = 'Chromium'
+                except BrowserError:
+                    # Repair existing profiles. Disabling Firefox's API also disables request interception;
+                    # Playwright blocks worker registration separately via the shared context policy.
+                    self.context = await self.playwright.firefox.launch_persistent_context(
+                        self.store.root / 'browser_profile_firefox', firefox_user_prefs={'dom.serviceWorkers.enabled': True}, **settings)
+                    self.engine = 'Firefox'
             except Exception as exc:
                 if self.playwright is not None:
-                    await self.playwright.stop()
-                    self.playwright = None
-                raise ValueError('No se pudo iniciar Chromium con su aislamiento. Revisa la instalación o inicia con Docker Compose.') from exc
+                    try:
+                        await self.playwright.stop()
+                    except BrowserError:
+                        pass
+                    finally:
+                        self.playwright = None
+                raise ValueError('No se pudo iniciar el navegador interno. Revisa Chromium y Firefox en la instalación o reconstruye el contenedor.') from exc
             self.context.set_default_timeout(7000)
-            self.context.on('close', lambda _: setattr(self, 'context', None))
+            def context_closed(context):
+                if self.context is context:
+                    self.context = None
+                    self.engine = ''
+            self.context.on('close', context_closed)
             self.context.on('page', self.register_page)
             for page in self.context.pages:
                 self.register_page(page)
@@ -160,7 +176,18 @@ class Runner:
         page.on('framenavigated', lambda frame: self.viewer.invalidate_file_request(page, frame))
         page.on('popup', on_popup)
         page.on('dialog', on_dialog)
-        page.on('close', lambda _: self.page_job.pop(page, None))
+        def page_lost(_):
+            self.lost_pages.add(page)
+            owner = self.page_job.pop(page, None)
+            pending = self.pending.get(owner)
+            if self.viewer.page is page and self.viewer.dialog:
+                self.viewer.dialog = None
+                self.viewer.dialog_key = ''
+            if pending and self.viewer.page is page and not pending['future'].done():
+                pending['future'].set_exception(ValueError('Se cerró la página del trámite.'))
+
+        page.on('crash', page_lost)
+        page.on('close', page_lost)
 
     async def guard_navigation(self, route):
         request = route.request
@@ -284,10 +311,10 @@ class Runner:
         finally:
             await self.viewer.set_manual(True)
 
-    def schedule(self, key: str, profile: Profile, auto_issue: bool = False):
+    def schedule(self, key: str, profile: Profile, auto_issue: bool = False, manual: bool = False):
         if not self.store.queue(key, profile):
             raise ValueError('Solo se puede encolar un ticket revisado y sin emisión previa.')
-        task = asyncio.create_task(self.run(key, profile, auto_issue))
+        task = asyncio.create_task(self.run(key, profile, auto_issue, manual))
         self.job_tasks[key] = task
         task.add_done_callback(lambda _: self.job_tasks.pop(key, None))
 
@@ -304,16 +331,19 @@ class Runner:
     async def human(self, key: str, page, kind: str, message: str):
         future = asyncio.get_running_loop().create_future()
         self.pending[key] = {'kind': kind, 'future': future, 'page': page}
-        await self.viewer.set_manual(kind in MANUAL)
-        self.store.update(key, status='needs_user', message=message)
-        self.store.event(key, 'needs_user', kind)
         try:
-            if await future == 'cancel':
+            if page.is_closed() or page in self.lost_pages:
+                raise ValueError('Se cerró la página antes de iniciar la intervención.')
+            self.store.enter_intervention(key, kind, message, kind in MANUAL)
+            await self.viewer.set_manual(kind in MANUAL)
+            decision = await future
+            if decision == 'cancel':
                 raise ValueError('Proceso detenido por el usuario.')
         finally:
             await self.viewer.set_manual(False)
             self.pending.pop(key, None)
-        self.store.update(key, status='running', message='Continuando en el portal…')
+        self.store.resume_intervention(key)
+        return decision
 
     def decide(self, key: str, decision: str):
         pending = self.pending.get(key)
@@ -326,6 +356,8 @@ class Runner:
         if not pending or pending['future'].done():
             raise ValueError('La intervención ya no está activa.')
         kind = pending['kind']
+        if decision == 'manual' and kind not in {'plan', 'blocked', 'unknown'}:
+            raise ValueError('Este paso no admite cambiar el modo de trabajo.')
         if decision != 'cancel':
             if (kind == 'issue') != (decision == 'approve'):
                 raise ValueError('Revisa la acción que solicita el panel.')
@@ -336,7 +368,7 @@ class Runner:
                 if await visible_challenge(page, await page.locator('body').aria_snapshot()) == kind:
                     message = 'Todavía falta el archivo que pide el portal.' if kind == 'attachment' else 'El portal todavía muestra la verificación.'
                     raise ValueError(message + ' Completa el paso y pulsa Continuar.')
-            if kind == 'plan' and self.plan.status()['status'] != 'ready':
+            if kind == 'plan' and decision != 'manual' and self.plan.status()['status'] != 'ready':
                 raise ValueError('Conecta ChatGPT o revisa el cupo antes de continuar.')
         await self.viewer.set_manual(False)
         self.decide(key, decision)
@@ -365,22 +397,44 @@ class Runner:
             await page.mouse.wheel(0, max(-1800, min(1800, int(action.value or '600'))))
             return
         locator = self.locator(page, action.target)
-        if await locator.count() != 1:
+        if hasattr(locator, 'filter'):
+            visible = locator.filter(visible=True)
+            if await visible.count() != 1:
+                candidates = []
+                for frame in page.frames:
+                    if frame.parent_frame and not allowed_url(frame.url, receipt.provider):
+                        continue
+                    candidate = self.locator(frame, action.target).filter(visible=True)
+                    found = await candidate.count()
+                    if found > 1 or (found and candidates):
+                        raise ValueError('Hay varios controles visibles con esa etiqueta.')
+                    if found:
+                        candidates.append(candidate)
+                if not candidates:
+                    raise ValueError('El control ya no está visible en el portal.')
+                visible = candidates[0]
+            locator = visible
+        elif await locator.count() != 1:
             raise ValueError('La etiqueta no identifica un único control visible.')
         if action.kind == 'click':
             await locator.click()
         elif action.kind == 'fill':
             await locator.fill((action.value or '')[:1000])
         elif action.kind == 'select':
-            await locator.select_option(action.value or '')
+            value = action.value or ''
+            choices = await locator.locator('option').evaluate_all('(options) => options.map(o => [o.value, o.label])')
+            use_value = [item[0] for item in choices if item[0] == value]
+            matches = use_value or [item[0] for item in choices if item[1] == value]
+            if len(matches) != 1:
+                raise ValueError('La lista del portal no tiene una opción única que coincida.')
+            await locator.select_option(value=matches[0])
         elif action.kind == 'press' and action.value in {'Enter', 'Tab', 'ArrowDown', 'ArrowUp', 'Escape', 'Space'}:
             await locator.press(action.value)
         else:
             raise ValueError('Tipo de acción o tecla no admitida.')
 
     async def recover(self, key: str, profile: Profile) -> bool:
-        files = [path for path in (self.store.root / 'downloads' / key).rglob('*')
-                 if path.is_file() and 'extracted' not in path.parts and not path.name.startswith('pending_')]
+        files = job_candidates(self.store, key)
         if not files:
             return False
         try:
@@ -389,136 +443,195 @@ class Runner:
             return False
         return True
 
-    async def run(self, key: str, profile: Profile, auto_issue: bool = False):
+    async def manual_job(self, key, page, profile):
+        row = self.store.get(key)
+        if not (row['issue_attempted'] or row['issuance_seen'] or row['uuid']):
+            self.store.begin_emission(key, 'Operación manual en el navegador')
+        await self.human(key, page, 'operator', 'El navegador es tuyo. Completa o consulta el trámite, descarga sus archivos y pulsa Terminar y cotejar.')
+        if self.downloads:
+            await asyncio.wait(list(self.downloads), timeout=12)
+        if not await self.recover(key, profile):
+            snapshot = await self.viewer.page.locator('body').aria_snapshot()
+            if SUCCESS.search(snapshot) or row['issuance_seen'] or row['uuid']:
+                self.store.confirm_issued(key)
+            else:
+                self.store.update(key, status='uncertain', message='Sesión manual terminada. Recupera los comprobantes de este expediente.')
+
+    async def run(self, key: str, profile: Profile, auto_issue: bool = False, manual: bool = False):
         async with self.lock:
             if not self.store.claim(key):
                 return
-            committed = issued = False
-            page = None
+            self.active_id = key
             try:
-                receipt = Receipt(**self.store.get(key)['receipt'])
-                errors = receipt.ready_errors()
-                if errors or receipt.provider not in CATALOG:
-                    raise ValueError(' · '.join(errors) or 'Portal sin configurar.')
-                ai = AI(self.plan)
-                provider = CATALOG[receipt.provider]
-                await self.start_browser()
-                page = await self.context.new_page()
-                self.active_id = key
-                self.page_job[page] = key
-                await self.viewer.show(page, provider['name'])
-                arrival = await page.goto(provider['url'], wait_until='domcontentloaded')
-                prompt = (Path(__file__).resolve().parent.parent / 'PROMPT_FACTURADOR.md').read_text(encoding='utf-8')
-                instructions = prompt + '\n' + json.dumps({'perfil': profile.model_dump(), 'ticket': receipt.model_dump(),
-                                                          'portal': provider}, ensure_ascii=False)
-                recent = []
-                last_error = ''
-                for number in range(65):
-                    page = self.viewer.page
-                    status = self.store.get(key)['status']
-                    if status in {'verified', 'duplicate', 'historical'}:
-                        return
-                    if page.is_closed() or not allowed_url(page.url, receipt.provider):
-                        raise ValueError('El portal se cerró o cambió a un destino fuera del catálogo.')
-                    snapshot = await page.locator('body').aria_snapshot()
-                    if ACCESS_DENIED.search(snapshot):
-                        raise ValueError('El portal rechazó el acceso a este navegador. El ticket quedó pendiente.')
-                    if number == 0 and arrival and arrival.status in {403, 429} and not await visible_challenge(page, snapshot):
-                        raise ValueError(f'El portal respondió HTTP {arrival.status}. El ticket quedó pendiente.')
-                    issued = issued or bool(SUCCESS.search(snapshot))
-                    if issued:
-                        self.store.update(key, status='issued_waiting_files', message='Emisión confirmada. Recuperando PDF y XML.')
-                        uuids = set(value.upper() for value in UUID_RE.findall(snapshot))
-                        if len(uuids) == 1 and not self.store.get(key)['uuid']:
-                            self.store.update(key, uuid=next(iter(uuids)))
-                        if self.downloads:
-                            await asyncio.wait(list(self.downloads), timeout=2)
-                        if await self.recover(key, profile):
-                            return
-                    challenge = await visible_challenge(page, snapshot)
-                    if challenge:
-                        message = {'captcha': 'Completa la verificación en este navegador.',
-                                   'login': 'Inicia sesión en el portal y regresa al trámite.',
-                                   'attachment': 'Toma el control y abre el selector del portal. Elige el documento en el panel y pulsa Adjuntar al portal.'}[challenge]
-                        await self.human(key, page, challenge, message)
-                        continue
-                    observation = json.dumps({'url': page.url, 'paso': number, 'emision_intentada': committed,
-                                              'emision_visible': issued, 'acciones_recientes': recent[-6:],
-                                              'ultimo_error': last_error, 'estado_visible': snapshot[:26_000]}, ensure_ascii=False)
+                for attempt in range(2):
                     try:
-                        image = await page.screenshot(type='jpeg', quality=76, scale='css')
-                        action = await asyncio.to_thread(ai.next_action, instructions, observation, image)
-                    except PlanError as exc:
-                        if not issued and not committed and exc.status in {'limit', 'disconnected', 'reconnect', 'identity_only', 'model'}:
-                            await self.human(key, page, 'plan', str(exc))
-                            continue
-                        raise
-                    risk = action_risk(action)
-                    name = action.target.name if action.target else ''
-                    if risk == 'forbidden':
-                        raise ValueError('La acción no corresponde a solicitar el CFDI de esta compra.')
-                    if action.kind == 'done':
-                        if not issued:
-                            if committed and await self.recover(key, profile):
-                                return
-                            raise ValueError('No hay comprobante ni confirmación visible. Recupera el resultado antes de volver a intentar.')
-                        if self.downloads:
-                            await asyncio.wait(list(self.downloads), timeout=12)
-                        await self.recover(key, profile)
+                        await self._session(key, profile, auto_issue, manual)
                         return
-                    if risk in MANUAL or action.kind == 'human':
-                        await self.human(key, page, risk if risk in MANUAL else 'unknown', 'Revisa el paso pendiente en el navegador.')
-                        continue
-                    preparing_capufe = (receipt.provider == 'capufe' and normalize(name) == 'FACTURAR CONCEPTOS' and
-                                       action.kind == 'click' and not committed and not issued and
-                                       urlsplit(page.url).path.rstrip('/').lower() == '/capufe/facturacionrapida' and
-                                       await capufe_proof(page, profile, receipt))
-                    if risk == 'issue' and not preparing_capufe:
-                        if committed or issued:
-                            raise ValueError('Ya hubo un intento de emisión. Consulta o recupera ese CFDI.')
-                        if action.kind != 'click' or not action.target.exact:
-                            last_error = 'Para emitir, elige el botón o enlace exacto de la confirmación.'
-                            continue
-                        valid = auto_issue and normalize(name) in {'SI ESTOY SEGURO', 'SÍ ESTOY SEGURO'} and await capufe_proof(page, profile, receipt)
-                        if not valid:
-                            approved_at = (page.url, snapshot)
-                            await self.human(key, page, 'issue', 'Revisa ticket, importe, forma de pago y datos fiscales en el portal para aprobar esta emisión.')
-                            if approved_at != (page.url, await page.locator('body').aria_snapshot()):
-                                last_error = 'La página cambió durante la revisión. Lee el formulario nuevamente.'
-                                continue
-                        self.store.begin_emission(key, name)
-                        committed = True
-                    elif committed or issued:
-                        if action.kind not in {'wait', 'scroll'} and not (action.kind == 'click' and DOWNLOAD.search(name)):
-                            if action.kind == 'click' and re.fullmatch(r'continuar', name.strip(), re.I) and not issued:
-                                await self.human(key, page, 'confirm', 'Revisa la confirmación que muestra el portal y completa ese paso si coincide con tu ticket.')
-                                continue
-                            raise ValueError('Revisa o recupera la factura del intento actual.')
-                    try:
-                        await self.execute(page, action, receipt)
-                        last_error = ''
                     except Exception:
-                        if committed:
-                            raise ValueError('El portal no confirmó el resultado del intento de emisión. Busca el CFDI antes de repetir.')
-                        last_error = 'No se completó el paso. Revisa la pantalla y el control.'
-                    recent.append({'tipo': action.kind, 'control': name[:120]})
-                    self.store.event(key, 'action', action.kind + ' · ' + name[:120])
-                    if len(recent) >= 4 and recent[-4:].count(recent[-1]) == 4:
-                        await self.human(key, page, 'blocked', 'El portal no avanzó tras varios pasos. Toma el control para revisar.')
-                raise ValueError('La factura requiere revisar el resultado del portal.')
-            except asyncio.CancelledError:
-                self.store.update(key, status='issued_waiting_files' if issued else 'uncertain' if committed else 'blocked',
-                                  message='Trámite detenido. Revisa el estado antes de volver a preparar el ticket.')
-                raise
-            except Exception as exc:
-                if self.store.get(key)['status'] not in {'verified', 'duplicate'}:
-                    status = 'issued_waiting_files' if issued else 'uncertain' if committed else 'blocked'
-                    message = str(exc)[:450] if isinstance(exc, ValueError) else 'El navegador no completó el trámite. Revisa el portal.'
-                    self.store.update(key, status=status, message=message)
+                        row = self.store.get(key)
+                        if row['status'] in {'verified', 'duplicate'}:
+                            return
+                        if row['issue_attempted'] or row['human_exposed'] or row['uuid'] or row['issuance_seen']:
+                            # The browser can disappear after saving both files but before the next page snapshot.
+                            if self.downloads:
+                                await asyncio.wait(tuple(self.downloads), timeout=12)
+                            if await self.recover(key, profile):
+                                return
+                            raise
+                        page = self.viewer.page
+                        lost = self.context is None or page in self.lost_pages or (page and page.is_closed())
+                        if attempt or not lost:
+                            raise
+                        failed_context = self.context
+                        if failed_context:
+                            try:
+                                await failed_context.close()
+                            except BrowserError:
+                                pass  # The close event may be in flight when the job wakes up.
+                            finally:
+                                if self.context is failed_context:
+                                    self.context = None
+                        self.store.update(key, status='running', message='Reabriendo el portal tras perder la sesión.')
+                        self.store.event(key, 'browser_reopened', 'Nueva sesión antes de la emisión')
+            except (Exception, asyncio.CancelledError) as exc:
+                row = self.store.get(key)
+                if row['status'] not in {'verified', 'duplicate', 'historical'}:
+                    attempted = bool(row['issue_attempted'] or row['human_exposed'] or row['uuid'])
+                    issued = bool(row['issuance_seen'] or row['uuid'])
+                    message = str(exc)[:450] if isinstance(exc, ValueError) else 'El trámite se interrumpió.'
+                    if attempted:
+                        message += ' Recupera el CFDI del intento existente.'
+                    self.store.update(key, status='issued_waiting_files' if issued else 'uncertain' if attempted else 'blocked', message=message)
                     self.store.event(key, 'stopped', message)
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
             finally:
                 self.active_id = None
                 await self.viewer.set_manual(False)
+
+    async def _session(self, key: str, profile: Profile, auto_issue: bool, manual: bool):
+        committed = issued = False
+        receipt = Receipt(**self.store.get(key)['receipt'])
+        errors = receipt.ready_errors()
+        if errors or receipt.provider not in CATALOG:
+            raise ValueError(' · '.join(errors) or 'Portal sin configurar.')
+        ai = AI(self.plan)
+        provider = CATALOG[receipt.provider]
+        await self.start_browser()
+        page = await self.context.new_page()
+        self.page_job[page] = key
+        await self.viewer.show(page, provider['name'])
+        arrival = await page.goto(provider['url'], wait_until='domcontentloaded')
+        if arrival and arrival.status in {403, 429} and not await visible_challenge(page, await page.locator('body').aria_snapshot()):
+            raise ValueError(f'El portal respondió HTTP {arrival.status}. El ticket quedó pendiente.')
+        if manual:
+            return await self.manual_job(key, page, profile)
+        prompt = (Path(__file__).resolve().parent.parent / 'PROMPT_FACTURADOR.md').read_text(encoding='utf-8')
+        instructions = prompt + '\n' + json.dumps({'perfil': profile.model_dump(), 'ticket': receipt.model_dump(),
+                                                  'portal': provider}, ensure_ascii=False)
+        recent = []
+        last_error = ''
+        for number in range(65):
+            page = self.viewer.page
+            status = self.store.get(key)['status']
+            if status in {'verified', 'duplicate', 'historical'}:
+                return
+            if page.is_closed() or not allowed_url(page.url, receipt.provider):
+                raise ValueError('El portal se cerró o cambió a un destino fuera del catálogo.')
+            snapshot = await page.locator('body').aria_snapshot()
+            if ACCESS_DENIED.search(snapshot):
+                raise ValueError('El portal rechazó el acceso a este navegador. El ticket quedó pendiente.')
+            issued = issued or bool(SUCCESS.search(snapshot))
+            if issued:
+                self.store.confirm_issued(key)
+                uuids = set(value.upper() for value in UUID_RE.findall(snapshot))
+                if len(uuids) == 1 and not self.store.get(key)['uuid']:
+                    self.store.update(key, uuid=next(iter(uuids)))
+                if self.downloads:
+                    await asyncio.wait(list(self.downloads), timeout=2)
+                if await self.recover(key, profile):
+                    return
+            challenge = await visible_challenge(page, snapshot)
+            if challenge:
+                message = {'captcha': 'Completa la verificación en este navegador.',
+                           'login': 'Inicia sesión en el portal y regresa al trámite.',
+                           'attachment': 'Toma el control y abre el selector del portal. Elige el documento en el panel y pulsa Adjuntar al portal.'}[challenge]
+                await self.human(key, page, challenge, message)
+                continue
+            observation = json.dumps({'url': page.url, 'paso': number, 'emision_intentada': committed,
+                                      'emision_visible': issued, 'acciones_recientes': recent[-6:],
+                                      'ultimo_error': last_error, 'estado_visible': snapshot[:26_000]}, ensure_ascii=False)
+            try:
+                try:
+                    image = await page.screenshot(type='jpeg', quality=76, scale='css', timeout=6000)
+                except BrowserError:
+                    if page.is_closed() or page in self.lost_pages or self.context is None:
+                        raise
+                    image = None
+                    self.store.event(key, 'text_navigation', 'El navegador no produjo la captura. Se usó el árbol visible.')
+                action = await asyncio.to_thread(ai.next_action, instructions, observation, image)
+            except PlanError as exc:
+                decision = await self.human(key, page, 'plan', str(exc))
+                if decision == 'manual':
+                    return await self.manual_job(key, page, profile)
+                continue
+            risk = action_risk(action)
+            name = action.target.name if action.target else ''
+            if risk == 'forbidden':
+                raise ValueError('La acción no corresponde a solicitar el CFDI de esta compra.')
+            if action.kind == 'done':
+                if not issued:
+                    if committed and await self.recover(key, profile):
+                        return
+                    raise ValueError('No hay comprobante ni confirmación visible. Recupera el resultado antes de volver a intentar.')
+                if self.downloads:
+                    await asyncio.wait(list(self.downloads), timeout=12)
+                await self.recover(key, profile)
+                return
+            if risk in MANUAL or action.kind == 'human':
+                decision = await self.human(key, page, risk if risk in MANUAL else 'unknown', 'Revisa el paso pendiente en el navegador.')
+                if decision == 'manual':
+                    return await self.manual_job(key, page, profile)
+                continue
+            preparing_capufe = (receipt.provider == 'capufe' and normalize(name) == 'FACTURAR CONCEPTOS' and
+                               action.kind == 'click' and not committed and not issued and
+                               urlsplit(page.url).path.rstrip('/').lower() == '/capufe/facturacionrapida' and
+                               await capufe_proof(page, profile, receipt))
+            if risk == 'issue' and not preparing_capufe:
+                if committed or issued:
+                    raise ValueError('Ya hubo un intento de emisión. Consulta o recupera ese CFDI.')
+                if action.kind != 'click' or not action.target.exact:
+                    last_error = 'Para emitir, elige el botón o enlace exacto de la confirmación.'
+                    continue
+                valid = auto_issue and normalize(name) in {'SI ESTOY SEGURO', 'SÍ ESTOY SEGURO'} and await capufe_proof(page, profile, receipt)
+                if not valid:
+                    approved_at = (page.url, snapshot)
+                    await self.human(key, page, 'issue', 'Revisa ticket, importe, forma de pago y datos fiscales en el portal para aprobar esta emisión.')
+                    if approved_at != (page.url, await page.locator('body').aria_snapshot()):
+                        last_error = 'La página cambió durante la revisión. Lee el formulario nuevamente.'
+                        continue
+                self.store.begin_emission(key, name)
+                committed = True
+            elif committed or issued:
+                if action.kind not in {'wait', 'scroll'} and not (action.kind == 'click' and DOWNLOAD.search(name)):
+                    if action.kind == 'click' and re.fullmatch(r'continuar', name.strip(), re.I) and not issued:
+                        await self.human(key, page, 'confirm', 'Revisa la confirmación que muestra el portal y completa ese paso si coincide con tu ticket.')
+                        continue
+                    raise ValueError('Revisa o recupera la factura del intento actual.')
+            try:
+                await self.execute(page, action, receipt)
+                last_error = ''
+            except Exception:
+                if committed:
+                    raise ValueError('El portal no confirmó el resultado del intento de emisión. Busca el CFDI antes de repetir.')
+                last_error = 'No se completó el paso. Revisa la pantalla y el control.'
+            recent.append({'tipo': action.kind, 'control': name[:120]})
+            self.store.event(key, 'action', action.kind + ' · ' + name[:120])
+            if len(recent) >= 4 and recent[-4:].count(recent[-1]) == 4:
+                decision = await self.human(key, page, 'blocked', 'El portal no avanzó tras varios pasos. Toma el control para revisar.')
+                if decision == 'manual':
+                    return await self.manual_job(key, page, profile)
+        raise ValueError('La factura requiere revisar el resultado del portal.')
 
     async def close(self):
         jobs = list(self.job_tasks.values())

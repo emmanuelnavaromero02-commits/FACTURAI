@@ -203,4 +203,17 @@ textarea { resize: vertical; }
 .tool-list { display: grid; gap: 8px; }
 .tool-list label, .tool-list .tool-entry { display: flex; align-items: center; gap: 10px; overflow-wrap: anywhere; }
 .tool-list input[type=checkbox] { width: auto; }
+.diagnostic-list { margin: 8px 0 0; }
+.diagnostic-list dt { margin-top: 12px; font-weight: 650; }
+.diagnostic-list dd { margin: 3px 0 0; font-size: .9rem; }
 .tool-list .tool-entry span { flex: 1; }
+.followup-result { padding: 12px 14px; border-left: 3px solid #83ae99; background: #f0f6f1; border-radius: 4px; overflow-wrap: anywhere; }
+.followup-result p { font-size: 13px; margin-top: 4px; }
+.fiscal-uuid { overflow-wrap: anywhere; font: 12px ui-monospace, monospace; color: var(--muted); }
+.followup-fields { display: grid; gap: 12px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.followup-fields legend { margin-bottom: 10px; font-size: 14px; font-weight: 700; }
+.followup-fields input[type=file] { font-size: 12px; }
+@media (max-width: 520px) {
+  .followup-fields .fields { grid-template-columns: minmax(0, 1fr); }
+  .followup-actions button { white-space: normal; }
+}

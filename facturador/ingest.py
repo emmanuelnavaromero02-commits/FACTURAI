@@ -43,7 +43,7 @@ def save_input(store: Store, name: str, data: bytes, source: str = "archivo") ->
 
 def save_inputs(store: Store, items: list[tuple[str, bytes]], source: str) -> list[dict]:
     for name, data in items:
-        if Path(name).suffix.lower() == '.txt' and source == 'Gmail':
+        if Path(name).suffix.lower() == '.txt' and (source == 'Gmail' or source.startswith('EML: ')):
             if not data.strip() or len(data) > 256_000:
                 raise ValueError('El texto elegido está vacío o supera el límite.')
         else:
@@ -57,16 +57,21 @@ def _store_original(store: Store, name: str, data: bytes, source: str) -> dict:
     directory = store.root / "originales"
     directory.mkdir(exist_ok=True, mode=0o700)
     path = directory / (sha + suffix)
-    if not path.exists():
-        with NamedTemporaryFile(dir=directory, prefix='pending_', delete=False) as output:
-            temp = Path(output.name)
-        try:
-            temp.write_bytes(data)
-            temp.replace(path)
-        finally:
-            temp.unlink(missing_ok=True)
+    write_original(path, data)
     row, created = store.add(str(path), sha, source + ": " + Path(name).name[:100])
     return {"id": row["id"], "created": created, "status": row["status"]}
+
+
+def write_original(path: Path, data: bytes) -> None:
+    if path.exists():
+        return
+    with NamedTemporaryFile(dir=path.parent, prefix='pending_', delete=False) as output:
+        temporary = Path(output.name)
+    try:
+        temporary.write_bytes(data)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def save_upload(store: Store, name: str, data: bytes, source: str = "archivo") -> list[dict]:

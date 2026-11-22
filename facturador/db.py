@@ -14,7 +14,7 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-EDITABLE = {"new", "review", "ready", "blocked"}
+EDITABLE = {"new", "review", "ready", "blocked", "external"}
 
 
 class Store:
@@ -43,6 +43,13 @@ class Store:
             if 'issue_attempted' not in columns:
                 db.execute('ALTER TABLE jobs ADD COLUMN issue_attempted INTEGER NOT NULL DEFAULT 0')
                 db.execute("UPDATE jobs SET issue_attempted=1 WHERE status IN ('issuing','uncertain','issued_waiting_files')")
+            if 'human_exposed' not in columns:
+                db.execute('ALTER TABLE jobs ADD COLUMN human_exposed INTEGER NOT NULL DEFAULT 0')
+                db.execute("UPDATE jobs SET human_exposed=1 WHERE status='needs_user' AND "
+                           "COALESCE((SELECT detail FROM events WHERE job_id=jobs.id AND kind='needs_user' ORDER BY id DESC LIMIT 1),'') NOT IN ('issue','plan')")
+            if 'issuance_seen' not in columns:
+                db.execute('ALTER TABLE jobs ADD COLUMN issuance_seen INTEGER NOT NULL DEFAULT 0')
+                db.execute("UPDATE jobs SET issuance_seen=1 WHERE uuid IS NOT NULL OR status IN ('verified','issued_waiting_files')")
         self.path.chmod(0o600)
 
     @contextmanager
@@ -104,12 +111,16 @@ class Store:
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row = self.decode(db.execute('SELECT * FROM jobs WHERE id=?', (key,)).fetchone())
-            if row['status'] not in EDITABLE or row['issue_attempted']:
+            if row['status'] not in EDITABLE or row['issue_attempted'] or row['human_exposed'] or row['issuance_seen'] or row['uuid']:
                 raise ValueError('Este ticket ya está en proceso o tiene un intento de emisión.')
             status, message = ('ready', 'Revisado') if ready else ('review', 'Revisar datos extraídos')
+            if ready and receipt.provider == 'solicitud_directa':
+                status, message = 'external', 'Solicita el CFDI al comercio y adjunta sus comprobantes aquí.'
             for other in db.execute('SELECT id, identity, receipt FROM jobs WHERE id<>?', (key,)):
                 old = Receipt.model_validate_json(other['receipt'])
                 same_codes = old.provider == receipt.provider and set(old.billing_codes).intersection(receipt.billing_codes)
+                if receipt.provider == 'solicitud_directa' and old.merchant.strip().casefold() != receipt.merchant.strip().casefold():
+                    same_codes = False
                 if (identity and other['identity'] == identity) or same_codes:
                     status, message, identity = 'duplicate', f"Ya registrado en {other['id']}", None
                     break
@@ -119,13 +130,21 @@ class Store:
 
     def claim(self, key: str) -> bool:
         with self.connect() as db:
-            count = db.execute("UPDATE jobs SET status='running',updated=? WHERE id=? AND status IN ('ready','queued')", (now(), key)).rowcount
+            count = db.execute("UPDATE jobs SET status='running',updated=? WHERE id=? AND status IN ('ready','queued') "
+                               "AND issue_attempted=0 AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL", (now(), key)).rowcount
             return count == 1
 
     def queue(self, key: str, profile=None) -> bool:
         with self.connect() as db:
-            return db.execute("UPDATE jobs SET status='queued',message='En cola',updated=?,billing_profile=? WHERE id=? AND status='ready' AND issue_attempted=0",
+            return db.execute("UPDATE jobs SET status='queued',message='En cola',updated=?,billing_profile=? WHERE id=? "
+                              "AND (status='ready' OR (status='blocked' AND billing_profile IS NOT NULL)) "
+                              "AND issue_attempted=0 AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL",
                               (now(), profile.model_dump_json() if profile else None, key)).rowcount == 1
+
+    def confirm_issued(self, key: str):
+        with self.connect() as db:
+            db.execute("UPDATE jobs SET issuance_seen=1,status='issued_waiting_files',message='Emisión confirmada. Recuperando PDF y XML.',updated=? "
+                       "WHERE id=? AND status NOT IN ('verified','duplicate','historical')", (now(), key))
 
     def begin_emission(self, key: str, action: str) -> None:
         with self.connect() as db:
@@ -135,10 +154,26 @@ class Store:
                 raise ValueError('Recupera el resultado del intento anterior antes de emitir.')
             db.execute('INSERT INTO events(job_id,at,kind,detail) VALUES(?,?,?,?)', (key, now(), 'issue_attempt', action[:250]))
 
+    def enter_intervention(self, key: str, kind: str, message: str, manual: bool):
+        with self.connect() as db:
+            db.execute("UPDATE jobs SET status='needs_user',human_exposed=?,message=?,updated=? WHERE id=?",
+                       (int(manual), message, now(), key))
+            db.execute('INSERT INTO events(job_id,at,kind,detail) VALUES(?,?,?,?)', (key, now(), 'needs_user', kind))
+
+    def resume_intervention(self, key: str):
+        with self.connect() as db:
+            db.execute("UPDATE jobs SET status='running',human_exposed=0,message='Continuando en el portal…',updated=? WHERE id=?",
+                       (now(), key))
+
     def recover_after_restart(self):
         with self.connect() as db:
-            db.execute("UPDATE jobs SET status='uncertain',message='Proceso interrumpido. Recuperar CFDI antes de intentar emitir otra vez.',updated=? WHERE status IN ('running','issuing','needs_user')", (now(),))
-            db.execute("UPDATE jobs SET status='ready',message='Cola recuperada; aún no se había abierto el portal.',updated=? WHERE status='queued'", (now(),))
+            db.execute("UPDATE jobs SET status='issued_waiting_files',message='El portal confirmó la emisión. Recupera el PDF y el XML.',updated=? "
+                       "WHERE status IN ('queued','running','issuing','needs_user') AND (issuance_seen=1 OR uuid IS NOT NULL)", (now(),))
+            db.execute("UPDATE jobs SET status='uncertain',issue_attempted=1,message='Hay un intento previo. Recupera sus comprobantes.',updated=? "
+                       "WHERE status IN ('queued','running','issuing','needs_user') AND "
+                       "(issue_attempted=1 OR uuid IS NOT NULL OR status='issuing' OR human_exposed=1)", (now(),))
+            db.execute("UPDATE jobs SET status='ready',message='Trámite interrumpido antes de enviar. Puedes prepararlo de nuevo.',updated=? "
+                       "WHERE status IN ('queued','running','needs_user') AND issue_attempted=0 AND uuid IS NULL", (now(),))
 
     def import_history(self, rows: list[dict]):
         with self.connect() as db:

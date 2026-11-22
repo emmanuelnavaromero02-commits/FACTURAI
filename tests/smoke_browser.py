@@ -39,6 +39,7 @@ async def smoke():
             await expect(page.get_by_role('button', name='Devolver control')).to_be_visible()
 
             state = await (await page.request.get(url + '/api/state')).json()
+            assert state['browser']['engine'] == 'Chromium', state['browser']
             revision = state['browser']['revision']
             headers = {'x-app-token': state['token']}
 
@@ -85,7 +86,21 @@ async def smoke():
                 assert png.format == 'PNG' and png.size == (1280, 850)
             await page.get_by_role('button', name='Devolver control').click()
             await expect(page.get_by_role('button', name='Tomar control')).to_be_visible()
-            print('OK: OCR local, ticket, Chromium interno, teclado, búsqueda en el texto visible y captura PNG.')
+            await page.get_by_role('link', name='Ajustes', exact=True).click()
+            sample = await operator.new_page()
+            await sample.set_content('<p>Constancia de prueba para el lector local</p><p>RFC XAXX010101000</p>')
+            fiscal_pdf = await sample.pdf()
+            await sample.close()
+            async with page.expect_file_chooser() as upload:
+                await page.get_by_role('button', name='Leer constancia localmente').click()
+            await (await upload.value).set_files({'name': 'constancia.pdf', 'mimeType': 'application/pdf', 'buffer': fiscal_pdf})
+            await expect(page.locator('#reader-text')).to_contain_text('XAXX010101000')
+            await page.get_by_role('button', name='Cerrar lectura').click()
+            await page.get_by_role('button', name='Comprobar herramientas').click()
+            await expect(page.locator('#tools-status')).to_have_text('Comprobación terminada.', timeout=30_000)
+            for name in ('OCR local', 'QR y códigos de barras', 'Navegador y Playwright', 'Expedientes y almacenamiento', 'PDF y ZIP', 'Datos del CFDI 4.0'):
+                await expect(page.locator('#tools-report')).to_contain_text(name + ' · Comprobado')
+            print('OK: OCR, teclado, página, captura PNG y diagnóstico del contenedor desde Ajustes.')
         finally:
             await operator.close()
 

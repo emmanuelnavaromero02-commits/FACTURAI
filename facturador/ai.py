@@ -47,7 +47,15 @@ def read_receipt(path: Path) -> list[dict]:
     reader = PdfReader(path)
     result = []
     for index, page in enumerate(reader.pages[:4]):
-        result.extend(receipt_image(render_pdf_page(path, index), (page.extract_text() or '').strip()))
+        text = (page.extract_text() or '').strip()
+        try:
+            image = render_pdf_page(path, index)
+        except (OSError, RuntimeError, ValueError):
+            if text:
+                result.append({'type': 'input_text', 'text': text[:8000]})
+                continue
+            raise ValueError('Esta página requiere una foto o un renderizador PDF disponible.')
+        result.extend(receipt_image(image, text))
     return result
 
 
@@ -67,8 +75,10 @@ class AI:
         )
         return self.plan.infer(instruction, read_receipt(path), Extraction)
 
-    def next_action(self, instructions: str, state: str, screenshot: bytes) -> Action:
-        content = [{'type': 'input_text', 'text': state}, image_part(screenshot, 'image/jpeg')]
+    def next_action(self, instructions: str, state: str, screenshot: bytes | None) -> Action:
+        content = [{'type': 'input_text', 'text': state}]
+        if screenshot:
+            content.append(image_part(screenshot, 'image/jpeg'))
         return self.plan.infer(instructions, content, Action, effort='high')
 
     def tax_profile(self, path: Path) -> TaxProfileExtraction:

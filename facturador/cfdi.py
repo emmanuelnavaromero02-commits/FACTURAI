@@ -8,13 +8,19 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from pypdf import PdfReader
+from pypdf.errors import PyPdfError
 
 from .models import Profile, Receipt, money
 from .catalog import CATALOG
+from .local_reader import ocr_text, render_pdf_page
 
 NS = {"c": "http://www.sat.gob.mx/cfd/4", "t": "http://www.sat.gob.mx/TimbreFiscalDigital"}
 UUID_RE = re.compile(r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
 MAX_FILE = 25 * 1024 * 1024
+
+
+class MissingPair(ValueError):
+    """Solo llegó uno de los formatos necesarios para el cotejo."""
 
 
 def normalized(value: str) -> str:
@@ -62,7 +68,13 @@ def collect_documents(paths: list[Path], output: Path) -> list[Path]:
     count, total = 0, 0
     for path in paths:
         if path.suffix.lower() == ".zip":
-            with zipfile.ZipFile(path) as archive:
+            try:
+                archive_file = zipfile.ZipFile(path)
+            except zipfile.BadZipFile as exc:
+                if len(paths) == 1:
+                    raise ValueError('El ZIP está incompleto. Conserva o adjunta otra copia.') from exc
+                continue
+            with archive_file as archive:
                 for member in archive.infolist():
                     if member.is_dir() or Path(member.filename).suffix.lower() not in {".pdf", ".xml"}:
                         continue
@@ -75,7 +87,11 @@ def collect_documents(paths: list[Path], output: Path) -> list[Path]:
                     name = Path(member.filename.replace("\\", "/")).name
                     safe_name = re.sub(r"[^\w.()-]", "_", name)[:160]
                     target = output / f"{count:03d}_{safe_name}"
-                    target.write_bytes(archive.read(member))
+                    try:
+                        data = archive.read(member)
+                    except (zipfile.BadZipFile, RuntimeError, NotImplementedError):
+                        continue
+                    target.write_bytes(data)
                     result.append(target)
         elif path.suffix.lower() in {".pdf", ".xml"}:
             if path.stat().st_size > MAX_FILE:
@@ -84,22 +100,43 @@ def collect_documents(paths: list[Path], output: Path) -> list[Path]:
     return list(dict.fromkeys(result))
 
 
-def find_valid_pair(paths: list[Path], profile: Profile, receipt: Receipt) -> tuple[dict, Path, Path]:
+def find_valid_pair(paths: list[Path], profile: Profile, receipt: Receipt, expected_uuid='') -> tuple[dict, Path, Path]:
     matches = {}
     errors = []
+    valid_xml = {}
     for xml in [p for p in paths if p.suffix.lower() == ".xml"]:
         try:
             result = verify_xml(xml.read_bytes(), profile, receipt)
-            for pdf in [p for p in paths if p.suffix.lower() == ".pdf"]:
-                text = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(pdf.read_bytes())).pages)
-                # El nombre de archivo no prueba que el PDF corresponda al XML.
-                uuids = {u.upper() for u in UUID_RE.findall(text)}
-                if result["uuid"] in uuids and profile.rfc in text:
-                    matches[result["uuid"]] = (result, xml, pdf)
+            if not expected_uuid or result['uuid'] == expected_uuid.upper():
+                valid_xml[result['uuid']] = (result, xml)
+            else:
+                errors.append('El XML tiene otro UUID.')
         except (ValueError, ET.ParseError) as exc:
+            errors.append(str(exc))
+    for pdf in (p for p in paths if p.suffix.lower() == '.pdf' and valid_xml):
+        try:
+            reader = PdfReader(io.BytesIO(pdf.read_bytes()))
+            text = '\n'.join(page.extract_text() or '' for page in reader.pages)
+            if not UUID_RE.search(text):
+                for index in range(min(len(reader.pages), 4)):
+                    try:
+                        text += '\n' + ocr_text(render_pdf_page(pdf, index))
+                    except (ValueError, RuntimeError):
+                        break
+            uuids = {u.upper() for u in UUID_RE.findall(text)}
+            if len(uuids) == 1 and profile.rfc in text.upper():
+                found = next(iter(uuids))
+                if found in valid_xml:
+                    matches[found] = (*valid_xml[found], pdf)
+        except (ValueError, PyPdfError, OSError, RuntimeError) as exc:
             errors.append(str(exc))
     if len(matches) > 1:
         raise ValueError("Hay varios CFDI posibles. Requiere selección manual; no se asignan por importe solamente")
     if not matches:
-        raise ValueError("Aún no hay pareja PDF/XML válida. " + "; ".join(dict.fromkeys(errors))[:400])
+        suffixes = {p.suffix.lower() for p in paths}
+        message = {frozenset({'.xml'}): 'Se conservó el XML. Falta el PDF para cotejarlo.',
+                   frozenset({'.pdf'}): 'Se conservó el PDF. Falta el XML para cotejarlo.'}.get(frozenset(suffixes),
+                             'Aún no hay pareja PDF/XML válida.')
+        error_type = MissingPair if suffixes in ({'.xml'}, {'.pdf'}) and not errors else ValueError
+        raise error_type((message + ' ' + ' '.join(dict.fromkeys(errors))[:350]).strip())
     return next(iter(matches.values()))

@@ -1,6 +1,7 @@
 export function installReceiptTools({api, el, button, link, perform, gmailConnected, openSettings, currentTicket}) {
   const $ = id => document.getElementById(id);
   let reading = 0;
+  let taxFile = null;
   let downloadTicket = null;
   let messageId = null;
   let mailRequest = 0;
@@ -25,15 +26,23 @@ export function installReceiptTools({api, el, button, link, perform, gmailConnec
     $('reader-codes').replaceChildren();
     $('reader-status').textContent = 'Leyendo en el contenedor…';
     try {
-      const result = await api('/api/jobs/' + ticket.id + '/read-local', 'POST', {
-        page: Number($('reader-page').value || 1), rotation: Number($('reader-rotation').value), force_ocr: force,
-      });
+      const values = {page: Number($('reader-page').value || 1), rotation: Number($('reader-rotation').value), force_ocr: force};
+      let result;
+      if (taxFile) {
+        const data = new FormData();
+        data.append('file', taxFile);
+        data.append('mode', 'local');
+        for (const [field, value] of Object.entries(values)) data.append(field, String(value));
+        result = await api('/api/profile/read-csf', 'POST', data);
+      } else {
+        result = await api('/api/jobs/' + ticket.id + '/read-local', 'POST', values);
+      }
       if (sequence !== reading) return;
       $('reader-page').replaceChildren(...Array.from({length: result.pages}, (_, n) => new Option(String(n + 1), n + 1)));
       $('reader-page').value = String(result.page);
       $('reader-ocr').disabled = $('reader-rotation').disabled = result.method === 'email';
-      const source = {pdf: 'Texto del PDF', ocr: 'OCR local', email: 'Texto del correo'}[result.method];
-      $('reader-status').textContent = source + ' · Página ' + result.page + ' de ' + result.pages;
+      const source = {pdf: 'Texto del PDF', ocr: 'OCR local', email: 'Texto del correo', codes: 'Códigos impresos'}[result.method];
+      $('reader-status').textContent = [source, 'Página ' + result.page + ' de ' + result.pages, result.notice].filter(Boolean).join(' · ');
       $('reader-text').textContent = result.text || 'No se encontró texto legible.';
       for (const code of result.codes) {
         const row = el('div', '', 'tool-entry');
@@ -46,7 +55,7 @@ export function installReceiptTools({api, el, button, link, perform, gmailConnec
         });
         row.append(el('span', code), add);
         if (result.portal_links.includes(code)) {
-          row.append(button('Cargar en Chromium', async () => {
+          row.append(button('Cargar en el navegador', async () => {
             try {
               await api('/api/browser/open', 'POST', {url: code});
               $('reader-status').textContent = 'Enlace abierto en la sección Navegador.';
@@ -62,14 +71,22 @@ export function installReceiptTools({api, el, button, link, perform, gmailConnec
     }
   }
 
-  $('local-reader').onclick = () => {
+  function openReader(file = null) {
+    taxFile = file;
+    $('reader-title').textContent = file ? 'Lectura local de la constancia fiscal' : 'Lectura local del ticket';
     $('reader-page').replaceChildren(new Option('1', 1));
     $('reader-rotation').value = '0';
     $('reader-ocr').disabled = $('reader-rotation').disabled = false;
     $('reader-dialog').showModal();
     readPage();
-  };
-  $('reader-dialog').addEventListener('close', () => {reading++;});
+  }
+  $('local-reader').onclick = () => openReader();
+  $('reader-dialog').addEventListener('close', () => {
+    reading++;
+    taxFile = null;
+    $('reader-text').textContent = '';
+    $('reader-codes').replaceChildren();
+  });
   $('reader-page').onchange = () => readPage();
   $('reader-rotation').onchange = $('reader-ocr').onclick = () => readPage(true);
 
@@ -179,5 +196,5 @@ export function installReceiptTools({api, el, button, link, perform, gmailConnec
       if (sequence === mailRequest) $('mail-import').disabled = !checked('mail-parts').length;
     }
   };
-  return {showDownloads};
+  return {showDownloads, openReader};
 }
