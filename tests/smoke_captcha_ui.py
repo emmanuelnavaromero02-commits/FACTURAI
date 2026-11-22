@@ -36,6 +36,7 @@ async def exercise(browser, mobile):
         control = alert.get_by_role('button', name='Resolver verificación')
         await expect(control).to_be_enabled()
         await expect(alert).to_contain_text('Tienda de prueba')
+        await expect(alert).to_contain_text('¿Quieres verificarte ahora? Tú completas el reto del comercio')
         assert (await control.bounding_box())['height'] >= 44
         if mobile:
             await control.tap()

@@ -9,7 +9,7 @@ import time
 import unicodedata
 from urllib.parse import parse_qs, urlsplit
 
-from playwright.async_api import Error as BrowserError, async_playwright
+from playwright.async_api import Error as BrowserError, TimeoutError as BrowserTimeout, async_playwright
 
 from .auth import read_json, write_private
 from .catalog import CATALOG
@@ -22,6 +22,10 @@ LOOKUP = '/capufe-quadrum-backend/sinregistro/documentos/descargar_codigo_alfanu
 MAX_RESPONSE = 24 * 1024 * 1024
 
 
+class LookupProblem(ValueError):
+    """Only messages constructed here may appear in the ticket's activity."""
+
+
 def _is_lookup(request, code):
     url = urlsplit(request.url)
     return (request.method == 'POST' and url.scheme == 'https' and url.netloc == HOST
@@ -31,6 +35,19 @@ def _is_lookup(request, code):
 
 def _unaccent(value):
     return ''.join(c for c in unicodedata.normalize('NFD', value.casefold()) if not unicodedata.combining(c))
+
+
+def _payload(data):
+    if data.startswith(b'PK\x03\x04'):
+        return {'zip': data}, False, ''
+    if data.startswith(b'%PDF-'):
+        return {'pdf': data}, False, ''
+    if data.lstrip(b'\xef\xbb\xbf \t\n\r').startswith((b'<?xml', b'<cfdi:Comprobante')):
+        return {'xml': data}, False, ''
+    try:
+        return _reply(json.loads(data))
+    except (ValueError, UnicodeError):
+        raise LookupProblem('CAPUFE devolvió un formato de respuesta que no permite comprobar la factura.') from None
 
 
 def _reply(data):
@@ -83,13 +100,16 @@ async def _lookup(page, code):
         delay = retry_seconds(landing.headers.get('retry-after'))
         if delay:
             raise ServiceWait(delay)
-        raise ValueError('La página de recuperación de CAPUFE no está disponible.')
-    await page.get_by_role('link', name=re.compile(r'^Recuperar una factura, por c.digo alfan.m[eé]rico$', re.I)).click(timeout=10000)
+        raise LookupProblem(f'El portal de CAPUFE respondió HTTP {landing.status} al abrir la recuperación.')
+    try:
+        await page.get_by_role('link', name=re.compile(r'^Recuperar una factura, por c.digo alfan.m[eé]rico$', re.I)).click(timeout=10000)
+    except BrowserTimeout:
+        raise LookupProblem('CAPUFE abrió la página, pero no mostró el enlace para recuperar una factura.') from None
     dialog = page.get_by_role('dialog').filter(has_text=re.compile(r'Recuperar Factura por C.digo Alfanum.rico', re.I))
     field = dialog.get_by_role('textbox')
     submit = dialog.get_by_role('button', name=re.compile(r'^(?:check\s+)?recuperar$', re.I))
     if await field.count() != 1 or await submit.count() != 1:
-        raise ValueError('CAPUFE cambió el formulario de recuperación.')
+        raise LookupProblem('CAPUFE cambió el formulario de recuperación.')
     used = False
     async def lookup_only(route):
         nonlocal used
@@ -107,7 +127,7 @@ async def _lookup(page, code):
     # permitted is the lookup that the public recovery dialog constructs for this code.
     await page.route('**/*', lookup_only)
     if urlsplit(page.url).netloc != HOST:
-        raise ValueError('Cambió el dominio del portal de recuperación.')
+        raise LookupProblem('Cambió el dominio del portal de recuperación.')
     await field.fill(code)
     async with page.expect_response(lambda r: _is_lookup(r.request, code), timeout=22000) as result:
         await submit.click(timeout=3500)
@@ -117,11 +137,11 @@ async def _lookup(page, code):
         if delay:
             raise ServiceWait(delay)
         if response.status not in {400,404,422}:
-            raise ValueError('CAPUFE no pudo completar la consulta del ticket.')
+            raise LookupProblem(f'El servicio de recuperación de CAPUFE respondió HTTP {response.status}.')
     payload = await response.body()
     if len(payload) > MAX_RESPONSE:
-        raise ValueError('La descarga de CAPUFE supera el tamaño permitido.')
-    files, negative, note = _reply(json.loads(payload))
+        raise LookupProblem('La descarga de CAPUFE supera el tamaño permitido.')
+    files, negative, note = _payload(payload)
     return files if response.ok else {}, bool(response.ok and negative), note
 
 
@@ -163,9 +183,20 @@ async def recover_capufe(store, key, receipt, profile):
         until = int(time.time()) + exc.seconds + 1
         write_private(cooldown, {'until': until})
         return defer(until)
-    except (BrowserError, ValueError, OSError):
+    except LookupProblem as exc:
+        return str(exc)
+    except BrowserTimeout:
+        return 'CAPUFE agotó el tiempo de espera al abrir la página o consultar el código de peaje.'
+    except (BrowserError, ValueError, OSError) as exc:
         if not received:
-            return 'CAPUFE no completó la consulta. Puedes volver a buscar el comprobante.'
+            error = str(exc).lower()
+            if 'err_cert_' in error or 'certificate' in error:
+                return 'Chrome no pudo validar el certificado de CAPUFE durante la recuperación.'
+            if 'err_name_not_resolved' in error:
+                return 'Chrome no pudo encontrar la dirección de CAPUFE.'
+            if 'err_connection' in error:
+                return 'Se interrumpió la conexión con CAPUFE durante la recuperación.'
+            return 'El navegador no pudo terminar la consulta de CAPUFE. Puedes volver a buscar el comprobante.'
     if received:
         return 'CAPUFE entregó ' + ', '.join(sorted(received)) + ' para el cotejo del expediente.'
     if absent == len(codes):

@@ -2,7 +2,7 @@ import base64
 import unittest
 from types import SimpleNamespace
 
-from facturador.capufe_recovery import HOST, LOOKUP, _is_lookup, _reply
+from facturador.capufe_recovery import HOST, LOOKUP, LookupProblem, _is_lookup, _payload, _reply
 
 
 class TollLookupTests(unittest.TestCase):
@@ -29,3 +29,9 @@ class TollLookupTests(unittest.TestCase):
         self.assertEqual(files, {'pdf':pdf, 'xml':xml})
         self.assertFalse(negative)
         self.assertEqual(_reply({'pdf':'archivos no disponibles'})[:2], ({},False))
+
+    def test_direct_files_are_candidates_and_html_errors_cannot_authorize_another_issue(self):
+        for kind, raw in [('zip',b'PK\x03\x04doc'),('pdf',b'%PDF-1.6'),('xml',b'<cfdi:Comprobante/>')]:
+            self.assertEqual(_payload(raw), ({kind:raw}, False, ''))
+        with self.assertRaises(LookupProblem):
+            _payload(b'<html>Consulta no disponible</html>')

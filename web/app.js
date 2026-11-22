@@ -260,8 +260,8 @@ function renderCaptcha() {
   const returning = state.browser.mode === 'personal' && state.browser.return_job_id === key;
   const title = 'Verificación del portal · ' + (row.receipt.merchant || row.receipt.ticket_number || 'Tu ticket');
   const detail = occupied ? 'Resuelve el reto en la imagen del portal. Cuando el portal avance, pulsa Devolver control.' :
-    viewing || returning ? 'El comercio ha pausado este ticket hasta que completes la verificación en su página.' :
-    'Esperando a que el visor de este ticket esté disponible.';
+    viewing || returning ? '¿Quieres verificarte ahora? Tú completas el reto del comercio en el visor de este ticket.' :
+    'Tú completas el reto del comercio. Esperando a que el visor de este ticket esté disponible.';
   if ($('captcha-title').textContent !== title) $('captcha-title').textContent = title;
   if ($('captcha-detail').textContent !== detail) $('captcha-detail').textContent = detail;
   const control = $('captcha-action');
