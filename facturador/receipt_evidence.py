@@ -4,7 +4,9 @@ import unicodedata
 from datetime import date
 from pathlib import Path
 
-from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, portal_suggestions
+from pypdf.errors import PyPdfError
+
+from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, printed_portals, public_portal_origin
 from .local_reader import read_local_page
 from .models import Receipt, money
 
@@ -37,6 +39,36 @@ def unique(matches):
     return values.pop() if len(values) == 1 else ''
 
 
+def portal_evidence(path, first=None):
+    """Look for printed destinations on the same four pages as the ticket reader, without network access."""
+    first = first or read_local_page(path)
+    primary, other = [], []
+    for number in range(1, min(first.get('pages', 1), 4) + 1):
+        try:
+            page = first if number == 1 else read_local_page(path, number)
+        except (OSError, RuntimeError, ValueError, PyPdfError):
+            continue
+        marked, secondary = printed_portals(page.get('codes', []), page.get('text', ''))
+        primary.extend(marked)
+        other.extend(secondary)
+    primary = list(dict.fromkeys(primary))
+    return primary, list(dict.fromkeys(link for link in other if link not in primary))
+
+
+def alternate_portal_note(row):
+    receipt = row['receipt']
+    attempted = receipt.get('portal_url') or CATALOG.get(receipt.get('provider'), {}).get('url', '')
+    try:
+        primary, other = portal_evidence(Path(row['source_path']))
+    except (OSError, ValueError, RuntimeError, TypeError, PyPdfError):
+        return ''
+    origins = list(dict.fromkeys(public_portal_origin(link) for link in primary + other if link != attempted))
+    if not origins:
+        return ''
+    return (' Otra dirección impresa está disponible en Leer texto, QR y barras del original. '
+            'Revisa el destino antes de abrirlo: ' + ', '.join(origins[:4]) + '.')
+
+
 def local_ticket(row):
     old = Receipt.model_validate(row['receipt'])
     path = Path(row['source_path'])
@@ -64,10 +96,14 @@ def local_ticket(row):
     values = old.model_dump()
     if len(recognized) == 1:
         values.update(provider=recognized[0], merchant=CATALOG[recognized[0]]['name'])
-    links = portal_suggestions(page['codes'], text)
-    billing = [url for url in links if re.search(r'factur|cfdi', url, re.I) or any(allowed_url(url, k) for k in CATALOG)]
+    billing, other = portal_evidence(path, page)
+    warning = ''
     if len(billing) == 1 and (values['provider'] not in CATALOG or not allowed_url(billing[0], values['provider'])):
         values.update(provider=CUSTOM_PORTAL, portal_url=billing[0])
+    elif len(billing) > 1:
+        warning = 'El ticket contiene varios enlaces fiscales. Revisa las opciones en Leer texto, QR y barras.'
+    elif other and not billing and values['provider'] not in CATALOG:
+        warning = 'Hay un sitio impreso sin identificar como facturación. Revísalo en Leer texto, QR y barras.'
     totals = re.findall(r'(?im)^\s*(?:GRAN\s+)?TOTAL(?:\s+(?:FACTURABLE|A\s+PAGAR))?[ \t:=$]*(?:MXN[ \t$]*)?'
                         r'(\d[\d,]*\.\d{2})(?=\s|$)', plain)
     amount = unique(totals)
@@ -93,4 +129,4 @@ def local_ticket(row):
     if codes:
         values['billing_codes'] = list(dict.fromkeys(codes))
     values['payment_code'] = row.get('confirmed_payment') or old.payment_code or printed_payment(text)
-    return Receipt.model_validate(values), ''
+    return Receipt.model_validate(values), warning

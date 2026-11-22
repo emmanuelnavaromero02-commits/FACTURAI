@@ -38,6 +38,12 @@ ChatGPT recibe imágenes y texto para las operaciones de IA que elijas. El OCR, 
 
 ## Recuperación ante fallos
 
+En la bandeja o el visor, **Retomar trámite** vuelve a leer la página del expediente. **Recuperar comprobantes** comprueba las descargas y busca los documentos del intento anterior. Para CAPUFE también abre la consulta por código alfanumérico que ofrece el comercio. La aplicación coteja cualquier archivo obtenido con la compra y el perfil fiscal del expediente.
+
+Con **Procesar al subir** activo, las lecturas pendientes y las consultas de comprobantes se reintentan con esperas crecientes que sobreviven a un reinicio. El botón permite solicitar otra consulta tras agotar la espera automática. Una pausa por CAPTCHA, permiso o aprobación conserva la pestaña para la persona. Cuando CAPUFE confirma expresamente que todos los códigos siguen sin facturar, un expediente con intervención anterior y sin intento de emisión puede avanzar hasta una nueva revisión para aprobación.
+
+Cuando el comercio pide «No soy un robot», el panel muestra **Resolver verificación** con el ticket correspondiente. Pulsa el botón desde el equipo que tenga acceso al panel, completa el reto en la vista en vivo y pulsa **Devolver control**. FACTURAI comprueba que el formulario esté disponible antes de continuar. El aviso se muestra mientras el panel está abierto. La instancia personal en Azure se abre con el túnel privado de ese equipo.
+
 Abre **Ajustes → Herramientas y recuperación → Comprobar herramientas**. Se prueban lectura y escritura en SQLite, OCR, QR, barras, PDF, ZIP, datos de un CFDI sintético y control del navegador activo. El diagnóstico distingue las pruebas locales del estado de las cuentas vinculadas. Durante un trámite conserva la página activa y muestra el navegador como ocupado.
 
 | Qué ocurrió | Cómo continuar con el mismo ticket |

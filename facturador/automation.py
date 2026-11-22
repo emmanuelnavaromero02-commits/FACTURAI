@@ -4,17 +4,37 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import unicodedata
 from pathlib import Path
+
+import httpx
+from pypdf.errors import PyPdfError
 
 from .ai import AI
 from .auth import PlanError, read_json, write_private
 from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, portal_suggestions, public_portal_origin
+from .db import READ_DELAYS
 from .local_reader import read_local_page
 from .models import Receipt
-from .receipt_evidence import local_ticket, printed_payment
+from .read_http import ServiceWait, retry_seconds
+from .receipt_evidence import local_ticket, portal_evidence, printed_payment
 
 log = logging.getLogger(__name__)
+
+
+def transient_read_delay(error):
+    """Return a delay only for retryable reads, never for invalid input or a refusal."""
+    if isinstance(error, ServiceWait):
+        return error.seconds
+    if isinstance(error, PlanError) and (error.status == 'transient' or (error.status == 'limit' and error.retry_after)):
+        return error.retry_after
+    cause = error.__cause__ if isinstance(error, PlanError) else error
+    if isinstance(cause, httpx.TransportError):
+        return 0
+    if isinstance(cause, httpx.HTTPStatusError) and cause.response.status_code in {408, 425, 429, 500, 502, 503, 504}:
+        return retry_seconds(cause.response.headers.get('retry-after'))
+    return None
 
 
 def review_questions(receipt: Receipt) -> list[str]:
@@ -54,19 +74,25 @@ def read_ticket(plan, row, automatic):
             try:
                 page = read_local_page(path)
                 payment = printed_payment(page['text'])
-            except (ValueError, OSError, RuntimeError):
+            except (ValueError, OSError, RuntimeError, PyPdfError):
                 pass
     receipt = Receipt(provider=result.provider, merchant=result.merchant.strip(), amount=(result.amount or '').strip(),
                       date=date, ticket_number=(result.ticket_number or '').strip(),
                       billing_codes=[code.strip() for code in result.billing_codes if code.strip()],
                       payment_code=payment, details=result.details, source=row['receipt']['source'])
+    try:
+        page = page or read_local_page(path)
+        marked, other = portal_evidence(path, page)
+    except (OSError, ValueError, RuntimeError, PyPdfError):
+        marked, other = [], []
     reported = getattr(result, 'billing_url', None)
-    billing_url = reported if public_portal_origin(reported) else ''
+    choices = marked or ([reported] if reported in other else [])
+    billing_url = choices[0] if len(choices) == 1 else ''
     known = receipt.provider in CATALOG
     if billing_url and (not known or not allowed_url(billing_url, receipt.provider)):
         receipt.provider, receipt.portal_url = CUSTOM_PORTAL, billing_url
         known = False
-    if row.get('auto_stage') == 'offline':
+    if row.get('auto_stage') in {'offline', 'retry_read'}:
         old = Receipt.model_validate(row['receipt'])
         for field in ('amount', 'date', 'merchant', 'billing_codes', 'ticket_number', 'payment_code'):
             if not getattr(receipt, field):
@@ -78,6 +104,10 @@ def read_ticket(plan, row, automatic):
             receipt.payment_code = ''
         payment = receipt.payment_code
     uncertainties = list(result.uncertainties)
+    if len(choices) > 1:
+        uncertainties.append('Se encontraron varios enlaces fiscales impresos. Revisa los destinos en Leer texto, QR y barras.')
+    elif not billing_url and not known and (other or reported):
+        uncertainties.append('Comprueba el sitio del comercio en el original. El destino para facturar sigue sin confirmar.')
     if payment:
         # Drop an uncertainty solely about an absent payment when the original or owner resolved it.
         uncertainties = [msg for msg in uncertainties if not re.fullmatch(
@@ -109,7 +139,9 @@ class TicketAutomation:
     def __init__(self, store, runner, plan, get_profile):
         self.store, self.runner, self.plan, self.get_profile = store, runner, plan, get_profile
         self.settings = store.root / 'automation.json'
-        self.enabled = read_json(self.settings, {}).get('enabled') is True
+        settings = read_json(self.settings, {})
+        self.enabled = settings.get('enabled') is True
+        self.plan_read_after = settings.get('plan_read_after', 0)
         self.wake = asyncio.Event()
         self.task = None
         self.stopping = False
@@ -129,7 +161,7 @@ class TicketAutomation:
         return {'enabled': self.enabled, **self._state}
 
     def configure(self, enabled: bool):
-        write_private(self.settings, {'enabled': enabled})
+        write_private(self.settings, {'enabled': enabled, 'plan_read_after': self.plan_read_after})
         if self.enabled != enabled:
             self.enabled = enabled
             self._reset()
@@ -147,7 +179,7 @@ class TicketAutomation:
         if self.task:
             await self.task
 
-    async def read_offline(self, row, claim, *, reason, retry_when_connected):
+    async def read_offline(self, row, claim, *, reason, stage='review', read_after=0):
         try:
             receipt, warning = await asyncio.to_thread(local_ticket, row)
         except Exception:
@@ -156,9 +188,11 @@ class TicketAutomation:
         notes = [reason, warning, *review_questions(receipt)]
         note = ' '.join(s.rstrip('.') + '.' for s in notes if s)
         return self.store.save_receipt(row['id'], receipt, claim=claim, note=note,
-                                       read_stage='offline' if retry_when_connected else 'review')
+                                       read_stage=stage, read_after=read_after)
 
     async def analyze(self, key: str, automatic=False, offline=False):
+        if not offline and self.plan_read_after > time.time():
+            raise ValueError('ChatGPT solicitó una espera. Mientras tanto puedes usar la lectura local.')
         claimed = self.store.claim_read(key, automatic)
         if not claimed:
             return self.store.get(key)
@@ -166,20 +200,36 @@ class TicketAutomation:
         try:
             if offline:
                 return await self.read_offline(row, claim, reason='Lectura local',
-                                               retry_when_connected=automatic)
+                                               stage='offline' if automatic else 'review')
             receipt, ready, note = await asyncio.to_thread(read_ticket, self.plan, row, automatic)
             if receipt is None:
                 return self.store.finish_read(key, claim, 'blocked', note)
             return self.store.save_receipt(key, receipt, ready, claim=claim, note=note)
         except Exception as exc:
-            # A persisted quota/authentication hold can be cleared from Settings. Ambiguous
-            # transport failures may already have consumed a reading and require a manual retry.
-            hold = isinstance(exc, PlanError) and self.plan.status()['status'] != 'ready'
             note = str(exc) if isinstance(exc, PlanError) else 'No se pudo completar la lectura. Revisa el original o vuelve a leerlo.'
-            return await self.read_offline(row, claim, reason=note, retry_when_connected=automatic and hold)
+            stage, due = 'review', 0
+            wait = transient_read_delay(exc)
+            if wait:
+                self.plan_read_after = max(self.plan_read_after, time.time() + wait)
+                write_private(self.settings, {'enabled': self.enabled, 'plan_read_after': self.plan_read_after})
+            if automatic or (self.enabled and row['auto_stage'] == 'retry_read'):
+                if wait is None and isinstance(exc, PlanError) and self.plan.status()['status'] != 'ready':
+                    stage = 'offline'
+                else:
+                    attempts = row['read_attempts']
+                    if wait is not None and 1 <= attempts <= len(READ_DELAYS):
+                        delay = max(wait, READ_DELAYS[attempts - 1])
+                        stage, due = 'retry_read', time.time() + delay
+                        note += f' Reintento automático de lectura en {delay} segundos.'
+                    elif wait is not None:
+                        note += ' Se agotaron los reintentos automáticos. Puedes volver a leer el ticket desde la bandeja.'
+            return await self.read_offline(row, claim, reason=note, stage=stage, read_after=due)
 
     def _plan_ready(self, key):
         state = self.plan.status()
+        if state['status'] == 'ready' and self.plan_read_after > time.time():
+            self._set('waiting_read', key, 'ChatGPT solicitó una espera temporal. La bandeja sigue leyendo los originales localmente.')
+            return False
         if state['status'] == 'ready':
             return True
         self._set('waiting_plan', key, state.get('message') or 'Conecta o reactiva tu plan de ChatGPT en Ajustes.')
@@ -229,8 +279,10 @@ class TicketAutomation:
         ready = self.store.auto_candidates('ready')
         if ready and self._prepare(ready):
             return True
-        incoming = self.store.auto_candidates('new')
-        if not incoming and self.plan.status()['status'] == 'ready':
+        plan_ready = self.plan.status()['status'] == 'ready' and self.plan_read_after <= time.time()
+        incoming = self.store.auto_candidates('review', stage='retry_read', due_only=True) if plan_ready else None
+        incoming = incoming or self.store.auto_candidates('new')
+        if not incoming and plan_ready:
             incoming = self.store.auto_candidates('review', stage='offline')
         if incoming:
             key = incoming['id']
@@ -248,12 +300,22 @@ class TicketAutomation:
             key = self.runner.active_id or next(iter(self.runner.job_tasks))
             self._set('queued', key, self.store.get(key)['message'])
         else:
+            if not (self.runner.viewer.channel or self.runner.viewer.dialog or self.runner.viewer.file_request):
+                key = self.store.next_recovery(int(time.time()))
+                if key:
+                    result = await self.runner.retry_job(key, self.get_profile, automatic=True)
+                    self._set('recovering', key, result['message'])
+                    return True
             pending = self.store.auto_candidates('review', stage='review') or self.store.auto_candidates('ready', stage='review')
             offline = self.store.auto_candidates('review', stage='offline')
-            if pending:
+            retry = self.store.auto_candidates('review', stage='retry_read')
+            if retry:
+                if self._plan_ready(retry['id']):
+                    self._set('waiting_read', retry['id'], retry['message'])
+            elif pending:
                 self._set('review', pending['id'], pending['message'])
             elif offline:
-                self._set('waiting_plan', offline['id'], offline['message'])
+                self._plan_ready(offline['id'])
             else:
                 self._reset()
         return False

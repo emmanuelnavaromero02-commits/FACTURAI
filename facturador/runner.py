@@ -17,6 +17,7 @@ from .ai import AI
 from .account_flow import PortalAccountFlow, SECRET_SCREEN
 from .auth import ChatGPTPlan, PlanError
 from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, provider_for_url, public_portal_origin, resolves_publicly
+from .captcha_transport import WidgetTransport, widget_origin
 from .cfdi import UUID_RE
 from .db import Store
 from .documents import job_candidates, reconcile
@@ -25,6 +26,7 @@ from .models import Action, Profile, Receipt
 from .personal_browser import PersonalBrowser
 from .profile_lock import close_context, launch_chrome
 from .portals import capufe_proof, capufe_recipient, normalize
+from .ticket_retry import FINAL, REOBSERVE, RecoveryRequested, may_have_issued, open_ticket_portal, recover_ticket, retry_action, ticket_in_result
 from .viewer import BrowserView
 
 ISSUE = re.compile(r'\b(facturar|emitir|timbrar|generar\s+(?:mi\s+)?(?:factura|cfdi)|solicitar\s+factura|enviar\s+(?:mi\s+)?(?:factura|cfdi)|s[ií] estoy seguro|confirmar (?:la )?emisi[oó]n)\b', re.I)
@@ -33,6 +35,8 @@ TERMS = re.compile(r'acepto|términos|terminos|condiciones|contrato|privacidad',
 CHALLENGE = re.compile(r'captcha|verificaci[oó]n de seguridad|no soy un robot', re.I)
 CHALLENGE_TEXT = re.compile(r'no soy un robot|verifica que eres humano|verify (?:that )?you are human|introdu(?:ce|zca) el captcha|c[oó]digo (?:de )?captcha', re.I)
 ACCESS_DENIED = re.compile(r'access denied|error 16\b|blocked by our security service|acceso denegado|err_cert_', re.I)
+LOAD_FAILURE = re.compile(r'net::ERR_|(?:error|HTTP)\s*[45]\d\d\b|service unavailable|no se (?:puede acceder|pudo cargar)|bad gateway', re.I)
+FISCAL_INPUT = re.compile(r'\b(?:textbox|combobox|spinbutton|radio)\s+"[^"\n]*\b(?:rfc|régimen|regimen|postal|cfdi|forma de pago|folio|ticket|peaje|razón social|razon social)\b', re.I)
 SUCCESS = re.compile(r'factura\s+(?:emitida|generada)\b|cfdi\s+(?:emitido|generado)\b|timbrad[ao]\s+correctamente|resultado facturaci[oó]n[^\n]*\n[\s\S]{0,130}facturas generadas|se gener[oó]\s+exitosamente', re.I)
 DOWNLOAD = re.compile(r'descargar|download|\bpdf\b|\bxml\b|imprimir', re.I)
 ALREADY_BILLED = re.compile(
@@ -48,6 +52,7 @@ def already_billed(snapshot: str) -> bool:
             return True
     return False
 MANUAL = {'captcha', 'login', 'terms', 'unknown', 'blocked', 'confirm', 'attachment', 'operator'}
+REOBSERVE_DELAY = 3
 
 
 def action_risk(action: Action) -> str:
@@ -98,10 +103,9 @@ async def visible_challenge(page, snapshot: str) -> str | None:
         if await frames.count():
             return 'captcha'
         for frame in page.frames[1:]:
-            host = urlsplit(frame.url).hostname or ''
-            if host in {'www.google.com', 'www.recaptcha.net', 'recaptcha.net'} and '/recaptcha/' in frame.url:
-                checked = frame.locator('[role="checkbox"][aria-checked="false"]:visible')
-                if await checked.count():
+            if widget_origin(frame.url):
+                unchecked = frame.locator('[role="checkbox"][aria-checked="false"]:visible, input[type=checkbox]:not(:checked):visible')
+                if await unchecked.count() and await (await frame.frame_element()).is_visible():
                     return 'captcha'
         if await page.locator('input[type="file"][required]:invalid:visible').count():
             return 'attachment'
@@ -114,6 +118,7 @@ class Runner:
         self.plan = plan or ChatGPTPlan(store.root)
         self.owns_plan = plan is None
         self.viewer = BrowserView()
+        self.widgets = WidgetTransport()
         self.personal = PersonalBrowser(store.root, lambda download: self.track_download(download, None))
         self.personal_at_revision = None
         self.context = None
@@ -123,6 +128,8 @@ class Runner:
         self.browser_start = asyncio.Lock()
         self.pending: dict[str, dict] = {}
         self.job_tasks: dict[str, asyncio.Task] = {}
+        self.retries = asyncio.Lock()
+        self.explicit_approval = set()
         self.downloads: set[asyncio.Task] = set()
         self.page_job = {}
         self.lost_pages = weakref.WeakSet()
@@ -184,6 +191,31 @@ class Runner:
             await self.context.route('**/*', self.guard_navigation)
 
     def register_page(self, page):
+        async def widget_frame_arrived(frame):
+            pending = self.pending.get(self.page_job.get(page))
+            if (self.engine == 'Google Chrome' and pending and pending['page'] is page
+                    and pending.get('challenge_seen') and pending['kind'] == 'captcha' and page in self.page_portal_origins):
+                await self.widgets.arm(frame)
+        def observe_manual_request(request):
+            pending = self.pending.get(self.page_job.get(page))
+            if (not pending or pending['kind'] not in MANUAL or pending['page'] is not page
+                    or pending['control_epoch'] == self.viewer.control_epoch
+                    or request.resource_type not in {'document', 'fetch', 'xhr'}):
+                return
+            target = urlsplit(request.url)
+            if target.netloc != urlsplit(pending['url']).netloc:
+                return
+            # While helping with an account gate the operator may reach billing
+            # themselves. Only known account endpoints are attributable to that gate.
+            path = target.path.rstrip('/').split('/')[-1].split('.')[0]
+            if pending['kind'] == 'login' and re.fullmatch(
+                    r'login|signin|sign-in|registro|register|signup|activar|activate|verificar|verificacion|callback|autenticar', path, re.I):
+                return
+            if pending['kind'] == 'captcha' and re.search(
+                    r'/(?:validar[-_]?captcha|verificar[-_]?captcha|(?:re)?captcha/(?:verify|validate|verificar|validar))/?$', target.path, re.I):
+                return
+            pending['uncertain_request'] = True
+
         def on_download(download):
             key = self.page_job.get(page)
             if key or (page is self.portal_page and page is self.viewer.page and self.viewer.manual):
@@ -216,6 +248,8 @@ class Runner:
                 await self.viewer.receive_file_request(page, chooser)
 
         page.on('download', on_download)
+        page.on('request', observe_manual_request)
+        page.on('framenavigated', widget_frame_arrived)
         page.on('filechooser', on_file_request)
         page.on('framenavigated', lambda frame: self.viewer.invalidate_file_request(page, frame))
         page.on('popup', on_popup)
@@ -253,8 +287,9 @@ class Runner:
                 await route.abort()
                 return
             if request.method not in {'GET', 'HEAD', 'OPTIONS'} and public_portal_origin(request.url) != custom_origin:
-                await route.abort()
-                return
+                if main_frame or not await self.widgets.allows(self, request, frame, owner, custom_origin):
+                    await route.abort()
+                    return
         if request.is_navigation_request():
             if main_frame and ticket:
                 if not allowed_url(request.url, ticket['provider'], ticket.get('portal_url', '')):
@@ -441,32 +476,209 @@ class Runner:
             raise ValueError('Solo se puede encolar un ticket revisado y sin emisión previa.')
         if not self.personal.interacting:
             self.personal_at_revision = None
-        task = asyncio.create_task(self.run(key, profile, auto_issue, manual))
+        self.track_job(key, self.run(key, profile, auto_issue, manual))
+
+    def track_job(self, key, coroutine):
+        task = asyncio.create_task(coroutine)
         self.job_tasks[key] = task
-        task.add_done_callback(lambda _: self.job_tasks.pop(key, None))
+        def finished(completed):
+            if self.job_tasks.get(key) is completed:
+                self.job_tasks.pop(key, None)
+        task.add_done_callback(finished)
+
+    async def recover_only(self, key, profile):
+        try:
+            await recover_ticket(self, key, profile)
+            self.prepare_checked_ticket(key, profile)
+        except (ValueError, BrowserError, OSError):
+            self.store.finish_recovery(key, 'La consulta quedó incompleta. Puedes volver a buscar o adjuntar el PDF y el XML.')
+            self.store.event(key, 'recovery_incomplete', 'No se completó la búsqueda de comprobantes.')
+
+    def prepare_checked_ticket(self, key, profile):
+        row = self.store.get(key)
+        if (row['status'] not in {'uncertain', 'blocked'} or row['issue_attempted'] or not row['human_exposed']
+                or self.plan.status()['status'] != 'ready'):
+            return False
+        receipt = Receipt.model_validate(row['receipt'])
+        if receipt.provider != 'capufe' or receipt.ready_errors() or not self.store.queue_after_negative_check(key, receipt, profile):
+            return False
+        self.track_job(key, self.run(key, profile, auto_issue=False))
+        return True
+
+    async def recover_queued(self, key, profile):
+        async with self.lock:
+            if self.store.get(key)['status'] in FINAL:
+                return
+            self.active_id = key
+            try:
+                await self.recover_only(key, profile)
+            finally:
+                self.active_id = None
+
+    def retry_action(self, row):
+        pending = self.pending.get(row['id'])
+        action = retry_action(row, pending)
+        if action == 'resume' and self.operator_may_have_acted(pending):
+            return 'recover'
+        return action
+
+    def operator_may_have_acted(self, pending):
+        page = pending['page']
+        return (pending.get('control_epoch') != self.viewer.control_epoch or self.viewer.page is not page
+                or page.is_closed() or page in self.lost_pages or pending.get('url') != page.url)
+
+    async def captcha_outcome(self, key, pending):
+        page = pending['page']
+        row = self.store.get(key)
+        receipt = Receipt.model_validate(row['receipt'])
+        if (not pending.get('challenge_seen') or page is not self.viewer.page or page.is_closed()
+                or page in self.lost_pages or self.page_job.get(page) != key or self.viewer.dialog
+                or page.url != pending['url'] or not allowed_url(page.url, receipt.provider, receipt.portal_url)):
+            return None
+        try:
+            snapshot = await page.locator('body').aria_snapshot(timeout=3000)
+            if (not snapshot or ACCESS_DENIED.search(snapshot) or LOAD_FAILURE.search(snapshot)
+                    or await visible_challenge(page, snapshot) or page.url != pending['url']):
+                return None
+        except BrowserError:
+            return None
+        if SUCCESS.search(snapshot) or already_billed(snapshot):
+            return 'recover' if ticket_in_result(snapshot, row, receipt) else None
+        if not FISCAL_INPUT.search(snapshot):
+            return None
+        return 'recover' if may_have_issued(row) or pending.get('uncertain_request') else 'reobserve'
+
+    async def release_control(self, channel):
+        key = self.active_id
+        pending = self.pending.get(key)
+        released = await self.viewer.release(channel)
+        await self.personal.view.release(channel)
+        if (not released or not pending or pending['kind'] != 'captcha' or pending['future'].done()
+                or self.viewer.control_epoch == pending.get('control_epoch')):
+            return
+        revision, epoch = self.viewer.revision, self.viewer.control_epoch
+        outcome = await self.captcha_outcome(key, pending)
+        if (outcome and self.pending.get(key) is pending and not pending['future'].done()
+                and await self.viewer.finish_returned_control(pending['page'], revision, epoch)):
+            if pending['future'].done():
+                return
+            self.explicit_approval.add(key)
+            self.store.event(key, 'captcha_reviewed', 'La verificación se completó en la pestaña del ticket. Se volvió a leer el estado del portal.')
+            self.decide(key, 'recover' if pending.get('uncertain_request') else outcome)
+
+    async def retry_job(self, key, current_profile=None, *, automatic=False):
+        async with self.retries:
+            row = self.store.get(key)
+            pending = self.pending.get(key)
+            operation = self.retry_action(row)
+            response = {'id': key, 'status': row['status'], 'action': 'active', 'message': row['message']}
+            if automatic and (pending or self.has_active_jobs() or row['status'] not in {'uncertain', 'issued_waiting_files'}):
+                return response
+            if not automatic:
+                self.store.pause_automatic_recovery(key, False)
+            if row['status'] in FINAL:
+                return {**response, 'action': 'complete'}
+            if pending and not pending['future'].done():
+                if not operation or self.viewer.dialog or self.viewer.file_request:
+                    return {**response, 'action': 'needs_user'}
+                # Revoke remote input under its command lock before deciding whether any
+                # operator took control. Pending futures are checked again after the await.
+                await self.viewer.set_manual(False)
+                if self.pending.get(key) is not pending or pending['future'].done():
+                    return response
+                operation = self.retry_action(self.store.get(key))
+                if operation == 'resume':
+                    self.explicit_approval.add(key)
+                    self.decide(key, 'reobserve')
+                    return {**response, 'action': 'resumed', 'message': 'Revisando la misma pestaña del ticket.'}
+                self.decide(key, 'recover')
+                return {**response, 'action': 'recovering', 'message': 'Buscando comprobantes sin volver a emitir.'}
+            if key in self.job_tasks and not self.job_tasks[key].done():
+                return response
+            if not operation:
+                return {**response, 'action': 'needs_user'}
+            if row['billing_profile']:
+                profile = Profile.model_validate_json(row['billing_profile'])
+            else:
+                profile = current_profile() if callable(current_profile) else current_profile
+            if profile is None:
+                raise ValueError('Guarda tu perfil fiscal para cotejar este ticket.')
+            if operation == 'queue':
+                if self.plan.status()['status'] != 'ready':
+                    return {**response, 'action': 'needs_user', 'message': 'Conecta ChatGPT en Ajustes para retomar el trámite.'}
+                self.schedule(key, profile, confirmed_url=row['receipt'].get('portal_url') or '')
+                return {**response, 'status': 'queued', 'action': 'queued', 'message': 'Ticket en cola para retomar la preparación.'}
+            if self.prepare_checked_ticket(key, profile):
+                return {**response, 'status': 'queued', 'action': 'queued', 'message': self.store.get(key)['message']}
+            if self.store.claim_recovery(key):
+                self.track_job(key, self.recover_queued(key, profile))
+                return {**response, 'action': 'recovering', 'message': 'Consulta de comprobantes solicitada.'}
+            return {**response, 'action': 'recovering', 'message': 'Se acaba de consultar este ticket. ' + row['message']}
 
     async def stop(self, key: str):
         task = self.job_tasks.get(key)
         if not task:
             raise ValueError('El ticket ya no está en ejecución.')
+        self.store.pause_automatic_recovery(key)
         queued = self.store.get(key)['status'] == 'queued'
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         if queued:
             self.store.update(key, status='ready', message='Retirado de la cola.')
 
-    async def human(self, key: str, page, kind: str, message: str):
+    async def reobserve_untouched_form(self, key, pending, observed, seen):
+        await asyncio.sleep(REOBSERVE_DELAY)
+        page = pending['page']
+        if (len(seen) >= 2 or self.pending.get(key) is not pending or pending['future'].done()
+                or self.operator_may_have_acted(pending) or self.viewer.dialog or self.viewer.file_request):
+            return
+        try:
+            revision, epoch = self.viewer.revision, self.viewer.control_epoch
+            snapshot = await page.locator('body').aria_snapshot(timeout=3000)
+            signature = hashlib.sha256((page.url + '\n' + snapshot).encode()).digest()
+            gated = await visible_challenge(page, snapshot) or any(
+                TERMS.search(line) and ('checkbox' in line or 'button' in line) for line in snapshot.splitlines())
+            preparatory = re.search(r'\b(?:textbox|combobox|spinbutton|radio)\b', snapshot)
+            if (signature in seen or gated or (snapshot == observed and not preparatory)
+                    or may_have_issued(self.store.get(key)) or self.operator_may_have_acted(pending)):
+                return
+            if (self.pending.get(key) is not pending or pending['future'].done()
+                    or not await self.viewer.finish_returned_control(page, revision, epoch) or pending['future'].done()):
+                return
+            seen.add(signature)
+            self.explicit_approval.add(key)
+            self.store.event(key, 'automatic_reobservation', 'Se vuelve a leer el formulario abierto para preparar el ticket.')
+            self.decide(key, 'reobserve')
+        except BrowserError:
+            return
+
+    async def human(self, key: str, page, kind: str, message: str, *, reobserve=None, challenge_seen=False):
         future = asyncio.get_running_loop().create_future()
-        self.pending[key] = {'kind': kind, 'future': future, 'page': page}
+        timer = None
+        pending = self.pending[key] = {'kind': kind, 'future': future, 'page': page,
+                                      'control_epoch': self.viewer.control_epoch, 'url': page.url, 'challenge_seen': challenge_seen}
         try:
             if page.is_closed() or page in self.lost_pages:
                 raise ValueError('Se cerró la página antes de iniciar la intervención.')
             self.store.enter_intervention(key, kind, message, kind in MANUAL)
+            if (kind == 'captcha' and challenge_seen and self.engine == 'Google Chrome' and page in self.page_portal_origins):
+                for frame in page.frames[1:]:
+                    await self.widgets.arm(frame)
             await self.viewer.set_manual(kind in MANUAL)
+            if reobserve is not None:
+                observed, seen = reobserve
+                timer = asyncio.create_task(self.reobserve_untouched_form(key, pending, observed, seen))
             decision = await future
+            if (decision == 'recover' or (decision != 'cancel' and self.store.checked_preparation(key)
+                    and kind in MANUAL and self.operator_may_have_acted(pending))):
+                raise RecoveryRequested()
             if decision == 'cancel':
+                self.store.pause_automatic_recovery(key)
                 raise ValueError('Proceso detenido por el usuario.')
         finally:
+            if timer:
+                timer.cancel()
+                await asyncio.gather(timer, return_exceptions=True)
             await self.viewer.set_manual(False)
             self.pending.pop(key, None)
         self.store.resume_intervention(key)
@@ -490,6 +702,14 @@ class Runner:
                 raise ValueError('Revisa la acción que solicita el panel.')
             if self.viewer.dialog:
                 raise ValueError('Responde primero al aviso del portal.')
+            if kind == 'captcha' and pending.get('challenge_seen'):
+                outcome = await self.captcha_outcome(key, pending)
+                if not outcome:
+                    if pending['page'].is_closed() or pending['page'].url != pending['url'] or self.viewer.page is not pending['page']:
+                        raise ValueError('El portal cambió de página. Detén el trámite y usa Recuperar comprobantes para comprobar el resultado.')
+                    raise ValueError('Completa la verificación en la misma página hasta que se muestre el formulario del ticket o su resultado.')
+                self.explicit_approval.add(key)
+                decision = outcome
             if kind in {'captcha', 'login', 'attachment'}:
                 page = self.viewer.page
                 if await visible_challenge(page, await page.locator('body').aria_snapshot()) == kind:
@@ -498,6 +718,10 @@ class Runner:
             if kind == 'plan' and decision != 'manual' and self.plan.status()['status'] != 'ready':
                 raise ValueError('Conecta ChatGPT o revisa el cupo antes de continuar.')
         await self.viewer.set_manual(False)
+        if decision in {'resume', 'manual'} and (pending.get('uncertain_request')
+                or (kind in MANUAL and self.viewer.page is not pending['page']) or (
+                kind in REOBSERVE and (self.operator_may_have_acted(pending) or may_have_issued(self.store.get(key))))):
+            decision = 'recover'
         self.decide(key, decision)
 
     @staticmethod
@@ -584,6 +808,8 @@ class Runner:
 
     async def manual_job(self, key, page, profile):
         row = self.store.get(key)
+        if self.store.checked_preparation(key):
+            raise RecoveryRequested()
         if not (row['issue_attempted'] or row['issuance_seen'] or row['uuid']):
             self.store.begin_emission(key, 'Operación manual en el navegador')
         await self.human(key, page, 'operator', 'El navegador es tuyo. Completa o consulta el trámite, descarga sus archivos y pulsa Terminar y cotejar.')
@@ -605,6 +831,10 @@ class Runner:
                 for attempt in range(2):
                     try:
                         await self._session(key, profile, auto_issue, manual)
+                        return
+                    except RecoveryRequested:
+                        self.store.claim_recovery(key)
+                        await self.recover_only(key, profile)
                         return
                     except Exception:
                         row = self.store.get(key)
@@ -635,13 +865,14 @@ class Runner:
                     issued = bool(row['issuance_seen'] or row['uuid'])
                     message = str(exc)[:450] if isinstance(exc, ValueError) else 'El trámite se interrumpió.'
                     if attempted:
-                        message += ' Recupera el CFDI del intento existente.'
+                        message += ' Busca los comprobantes de este ticket antes de intentar otra emisión.'
                     self.store.update(key, status='issued_waiting_files' if issued else 'uncertain' if attempted else 'blocked', message=message)
                     self.store.event(key, 'stopped', message)
                 if isinstance(exc, asyncio.CancelledError):
                     raise
             finally:
                 self.active_id = None
+                self.explicit_approval.discard(key)
                 await self.viewer.set_manual(False)
 
     async def _session(self, key: str, profile: Profile, auto_issue: bool, manual: bool):
@@ -664,9 +895,7 @@ class Runner:
         if receipt.provider == CUSTOM_PORTAL:
             self.page_portal_origins[page] = public_portal_origin(receipt.portal_url)
         await self.viewer.show(page, provider['name'])
-        arrival = await page.goto(provider['url'], wait_until='domcontentloaded')
-        if arrival and arrival.status in {403, 429} and not await visible_challenge(page, await page.locator('body').aria_snapshot()):
-            raise ValueError(f'El portal respondió HTTP {arrival.status}. El ticket quedó pendiente.')
+        await open_ticket_portal(page, provider['url'], receipt, visible_challenge, self.store, key)
         if receipt.provider == CUSTOM_PORTAL and not allowed_url(page.url, receipt.provider, receipt.portal_url):
             raise ValueError('El portal redirigió a otro dominio. Confirma la dirección final en la revisión del ticket.')
         if manual:
@@ -676,6 +905,7 @@ class Runner:
         instructions = prompt + '\n' + json.dumps({'perfil': profile.model_dump(exclude={'whatsapp_phone'}), 'ticket': ticket_fields,
                                                   'portal': {**provider, 'url': public_portal_origin(provider['url'])}}, ensure_ascii=False)
         recent = []
+        reobserved = set()
         last_error = ''
         before_action = None
         accounts = PortalAccountFlow(self.store.root, provider['url'], profile, key,
@@ -717,7 +947,7 @@ class Runner:
                 message = {'captcha': 'Completa la verificación en este navegador.',
                            'login': 'Inicia sesión en el portal y regresa al trámite.',
                            'attachment': 'Toma el control y abre el selector del portal. Elige el documento en el panel y pulsa Adjuntar al portal.'}[challenge]
-                await self.human(key, page, challenge, message)
+                await self.human(key, page, challenge, message, challenge_seen=True)
                 continue
             if accounts.private_observation(snapshot):
                 await self.human(key, page, 'login', 'El portal muestra una credencial. Ocúltala o avanza en la misma página para continuar.')
@@ -782,13 +1012,24 @@ class Runner:
             if risk in MANUAL or action.kind == 'human':
                 detail = ('El portal aún no refleja ' + ', '.join(pending_fields) + '. Revisa el formulario.' if pending_fields
                           else 'Revisa el paso pendiente en el navegador.')
-                decision = await self.human(key, page, risk if risk in MANUAL else 'unknown', detail)
+                kind = risk if risk in MANUAL else 'unknown'
+                may_reobserve = kind == 'unknown' and not (committed or issued or accounts.credential_values)
+                decision = await self.human(key, page, kind, detail, reobserve=(snapshot, reobserved) if may_reobserve else None)
                 if decision == 'manual':
                     return await self.manual_job(key, page, profile)
+                if decision == 'reobserve':
+                    last_error = 'Lee otra vez los controles actuales. Sólo se permite preparar datos comprobados hasta la aprobación de emisión.'
                 continue
             preparing_capufe = (receipt.provider == 'capufe' and normalize(name) == 'FACTURAR CONCEPTOS' and
                                 action.kind == 'click' and not committed and not issued and
                                 urlsplit(page.url).path.rstrip('/').lower() == '/capufe/facturacionrapida')
+            if key in self.explicit_approval or self.store.checked_preparation(key):
+                if (not committed and not issued and risk != 'issue' and not preparing_capufe
+                        and action.kind not in {'fill', 'select', 'wait', 'scroll'}
+                        and not (receipt.provider == 'capufe' and action.kind == 'click' and
+                                 re.fullmatch(r'agregar (?:c[oó]digo|ticket|concepto)(?: de peaje)?', name.strip(), re.I))):
+                    await self.human(key, page, 'blocked', 'El siguiente control no se reconoce como preparación del ticket. Revisa este paso en el visor.')
+                    continue
             if preparing_capufe and not await capufe_proof(page, profile, receipt, preparation=True):
                 last_error = 'CAPUFE aún no refleja los datos fiscales, agrupación, códigos, fecha o total del expediente.'
                 if recent and recent[-1].get('bloqueo') == last_error:
@@ -815,7 +1056,8 @@ class Runner:
                         await self.human(key, page, 'blocked', detail)
                     last_error = detail
                     continue
-                valid = auto_issue and normalize(name) in {'SI ESTOY SEGURO', 'SÍ ESTOY SEGURO'} and await capufe_proof(page, profile, receipt)
+                valid = (auto_issue and key not in self.explicit_approval and not self.store.get(key)['human_exposed']
+                         and normalize(name) in {'SI ESTOY SEGURO', 'SÍ ESTOY SEGURO'} and await capufe_proof(page, profile, receipt))
                 if not valid:
                     approved_at = (page.url, snapshot)
                     await self.human(key, page, 'issue', 'Revisa ticket, importe, forma de pago y datos fiscales en el portal para aprobar esta emisión.')

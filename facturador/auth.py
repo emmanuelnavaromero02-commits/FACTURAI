@@ -16,6 +16,8 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 import jwt
 
+from .read_http import retry_seconds
+
 ISSUER = 'https://auth.openai.com'
 RESOURCE = 'https://api.openai.com/v1'
 AUTHORIZATION = ISSUER + '/api/accounts/authorize'
@@ -29,9 +31,10 @@ CALLBACK = '/auth/chatgpt/callback'
 
 
 class PlanError(ValueError):
-    def __init__(self, message: str, status: str = 'unavailable'):
+    def __init__(self, message: str, status: str = 'unavailable', retry_after: int = 0):
         super().__init__(message)
         self.status = status
+        self.retry_after = retry_after
 
 
 def read_json(path: Path, fallback=None):
@@ -82,10 +85,16 @@ class ChatGPTPlan:
         self.pending: dict | None = None
         self.client = client or httpx.Client(timeout=httpx.Timeout(90, connect=12), follow_redirects=False)
 
+    @staticmethod
+    def _active_hold(record):
+        hold = record.get('hold', '')
+        until = record.get('hold_until', 0)
+        return '' if hold == 'limit' and until and until <= time.time() else hold
+
     def status(self) -> dict:
         record = read_json(self.session_path, {})
-        if record.get('hold'):
-            state = record['hold']
+        if hold := self._active_hold(record):
+            state = hold
         elif not record.get('access_token'):
             state = 'disconnected'
         elif not PLAN_SCOPES.issubset(record.get('scopes', [])):
@@ -93,7 +102,7 @@ class ChatGPTPlan:
         else:
             state = 'ready'
         return {'status': state, 'email': record.get('email', ''), 'model': record.get('model', DEFAULT_MODEL),
-                'message': record.get('message', ''), 'registered': bool(record.get('client_id'))}
+                'message': record.get('message', '') if state != 'ready' else '', 'registered': bool(record.get('client_id'))}
 
     def start(self, new_account: bool = False, consent: bool = False) -> str:
         with self.lock:
@@ -198,8 +207,8 @@ class ChatGPTPlan:
     def _credentials(self) -> tuple[str, str]:
         with self.lock:
             record = read_json(self.session_path, {})
-            if record.get('hold'):
-                raise PlanError(record.get('message') or 'Revisa tu conexión con ChatGPT.', record['hold'])
+            if hold := self._active_hold(record):
+                raise PlanError(record.get('message') or 'Revisa tu conexión con ChatGPT.', hold)
             if not record.get('access_token') or not PLAN_SCOPES.issubset(record.get('scopes', [])):
                 raise PlanError('Conecta ChatGPT y autoriza el uso de tu plan desde Ajustes.', 'disconnected')
             if record['expires_at'] - time.time() < 60 and record.get('refresh_token'):
@@ -254,19 +263,22 @@ class ChatGPTPlan:
                 record.update(hold='', message='')
                 write_private(self.session_path, record)
 
-    def _error(self, raw: dict, status: int = 0, access: str = '') -> PlanError:
+    def _error(self, raw: dict, status: int = 0, access: str = '', retry_after: int = 0) -> PlanError:
         error = raw.get('error') or raw
         if not isinstance(error, dict):
             error = {}
         code = str(error.get('code', ''))
-        if code == 'subscription_sharing_usage_limit_exceeded' or status == 429:
-            message = 'El cupo de ChatGPT está en pausa. Consulta el uso de tu plan y retoma cuando esté disponible.'
+        if code == 'subscription_sharing_usage_limit_exceeded' or (status == 429 and code == 'insufficient_quota'):
+            message = (f'El cupo de ChatGPT está en pausa. La lectura se reanudará en {retry_after} segundos.'
+                       if retry_after else 'El cupo de ChatGPT está en pausa. Consulta el uso de tu plan y retoma cuando esté disponible.')
             with self.lock:
                 record = read_json(self.session_path, {})
                 if access and record.get('access_token') == access:
-                    record.update(hold='limit', message=message)
+                    record.update(hold='limit', message=message, hold_until=time.time() + retry_after if retry_after else 0)
                     write_private(self.session_path, record)
-            return PlanError(message, 'limit')
+            return PlanError(message, 'limit', retry_after)
+        if status in {408, 425, 429, 500, 502, 503, 504} or code in {'server_error', 'rate_limit_exceeded'}:
+            return PlanError('ChatGPT está temporalmente ocupado o sin respuesta.', 'transient', retry_after)
         if code == 'subscription_sharing_user_not_eligible':
             return PlanError('El plan o espacio elegido no admite el uso en esta aplicación.', 'ineligible')
         if code == 'subscription_sharing_unsupported_capability' or code == 'model_not_found':
@@ -325,7 +337,8 @@ class ChatGPTPlan:
                                     headers={'Authorization': 'Bearer ' + access}) as response:
                 if not response.is_success:
                     response.read()
-                    raise self._error(self._body(response), response.status_code, access)
+                    raise self._error(self._body(response), response.status_code, access,
+                                      retry_seconds(response.headers.get('retry-after')))
                 for event in decode_event_stream(response.iter_lines()):
                     kind = event.get('type')
                     if kind in {'error', 'response.failed', 'response.incomplete'}:
@@ -340,12 +353,12 @@ class ChatGPTPlan:
                             raise PlanError('ChatGPT no devolvió una respuesta utilizable.')
                         return output_type.model_validate_json(answer)
         except httpx.HTTPError as exc:
-            raise PlanError('Se interrumpió la conexión con ChatGPT.') from exc
+            raise PlanError('Se interrumpió la conexión con ChatGPT.', 'transient') from exc
         except (TypeError, KeyError, ValueError) as exc:
             if isinstance(exc, PlanError):
                 raise
             raise PlanError('ChatGPT devolvió datos incompletos. Revisa el ticket en el panel.') from exc
-        raise PlanError('La respuesta de ChatGPT terminó antes de confirmarse.')
+        raise PlanError('La respuesta de ChatGPT terminó antes de confirmarse.', 'transient')
 
     def close(self) -> None:
         self.client.close()

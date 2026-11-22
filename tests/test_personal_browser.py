@@ -108,3 +108,12 @@ class PersonalBrowserTests(unittest.IsolatedAsyncioTestCase):
         route.abort.assert_awaited_once()
         socket.close.assert_awaited_once()
         socket.connect_to_server.assert_not_called()
+
+    async def test_google_sign_in_document_stays_outside_the_remote_browser(self):
+        route = Mock(request=Mock(resource_type='document', url='https://accounts.google.com/o/oauth2/auth?state=prueba'),
+                     continue_=AsyncMock(), fulfill=AsyncMock())
+        await PersonalBrowser.guard_request(route)
+        route.continue_.assert_not_awaited()
+        route.fulfill.assert_awaited_once()
+        self.assertEqual(route.fulfill.await_args.kwargs['status'], 403)
+        self.assertNotIn('state=',route.fulfill.await_args.kwargs['body'])

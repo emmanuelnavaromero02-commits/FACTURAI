@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -15,6 +17,8 @@ def now() -> str:
 
 
 EDITABLE = {"new", "review", "ready", "blocked", "external"}
+# Delay after each failed automatic read. The final attempt falls back to review.
+READ_DELAYS = (30, 120, 600)
 AUTO_ELIGIBLE = """historical=0 AND source_path IS NOT NULL AND billing_profile IS NULL
     AND issue_attempted=0 AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL
     AND COALESCE(json_extract(receipt,'$.source'),'') NOT LIKE 'Ejemplo:%'"""
@@ -39,6 +43,11 @@ class Store:
             CREATE TABLE IF NOT EXISTS events(
               id INTEGER PRIMARY KEY, job_id TEXT, at TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS recovery_requests(job_id TEXT PRIMARY KEY, requested_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS recovery_schedule(
+              job_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, next_check INTEGER NOT NULL, paused INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS negative_billing_checks(
+              job_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, checked_at INTEGER NOT NULL, preparing INTEGER NOT NULL);
             """)
             columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
             if 'billing_profile' not in columns:
@@ -53,8 +62,14 @@ class Store:
             if 'issuance_seen' not in columns:
                 db.execute('ALTER TABLE jobs ADD COLUMN issuance_seen INTEGER NOT NULL DEFAULT 0')
                 db.execute("UPDATE jobs SET issuance_seen=1 WHERE uuid IS NOT NULL OR status IN ('verified','issued_waiting_files')")
+            db.execute("UPDATE jobs SET issue_attempted=1 WHERE issue_attempted=0 AND id IN "
+                       "(SELECT job_id FROM events WHERE kind='issue_attempt')")
             if 'auto_stage' not in columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN auto_stage TEXT NOT NULL DEFAULT ''")
+            if 'read_attempts' not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN read_attempts INTEGER NOT NULL DEFAULT 0")
+            if 'read_after' not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN read_after REAL NOT NULL DEFAULT 0")
             if 'confirmed_payment' not in columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN confirmed_payment TEXT NOT NULL DEFAULT ''")
                 db.execute("""UPDATE jobs SET confirmed_payment=COALESCE(json_extract(receipt, '$.payment_code'),'')
@@ -122,14 +137,15 @@ class Store:
         with self.connect() as db:
             db.execute("UPDATE jobs SET " + ",".join(f"{x}=?" for x in fields) + " WHERE id=?", (*fields.values(), key))
 
-    def auto_candidates(self, status: str, *, stage: str = ''):
+    def auto_candidates(self, status: str, *, stage: str = '', due_only: bool = False):
         with self.connect() as db:
             row = db.execute(f"SELECT * FROM jobs WHERE {AUTO_ELIGIBLE} AND status=? AND auto_stage=? "
-                             "ORDER BY created,id LIMIT 1", (status, stage)).fetchone()
+                             "AND (?=0 OR read_after<=?) ORDER BY read_after,created,id LIMIT 1",
+                             (status, stage, int(due_only), time.time())).fetchone()
             return self.decode(row) if row else None
 
     def claim_read(self, key: str, automatic: bool):
-        claim = 'reading:' + uuid.uuid4().hex
+        claim = ('reading:auto:' if automatic else 'reading:') + uuid.uuid4().hex
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row = self.decode(db.execute('SELECT * FROM jobs WHERE id=?', (key,)).fetchone())
@@ -141,15 +157,18 @@ class Store:
             if automatic:
                 eligible = db.execute(f"SELECT 1 FROM jobs WHERE id=? AND {AUTO_ELIGIBLE} "
                                       "AND ((status='new' AND auto_stage='') OR "
-                                      "(status='review' AND auto_stage='offline'))", (key,)).fetchone()
+                                      "(status='review' AND (auto_stage='offline' OR "
+                                      "(auto_stage='retry_read' AND read_after<=?))))", (key, time.time())).fetchone()
                 if not eligible:
                     return None
-            db.execute('UPDATE jobs SET auto_stage=? WHERE id=?', (claim, key))
+            if automatic or row['auto_stage'] == 'retry_read':
+                row['read_attempts'] += 1
+            db.execute('UPDATE jobs SET auto_stage=?,read_attempts=? WHERE id=?', (claim, row['read_attempts'], key))
         return row, claim
 
     def finish_read(self, key: str, claim: str, status: str, message: str, stage: str = ''):
         with self.connect() as db:
-            db.execute("UPDATE jobs SET auto_stage=?,status=?,message=?,updated=? WHERE id=? AND auto_stage=? "
+            db.execute("UPDATE jobs SET auto_stage=?,status=?,message=?,updated=?,read_attempts=0,read_after=0 WHERE id=? AND auto_stage=? "
                        "AND status IN ('new','review','ready','external','blocked') AND issue_attempted=0 "
                        "AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL",
                        (stage, status, message, now(), key, claim))
@@ -162,7 +181,7 @@ class Store:
                        ('ready' if keep_ready else 'review', message, now(), row['id'], row['status'], row['updated']))
 
     def save_receipt(self, key: str, receipt: Receipt, ready: bool = False, *, claim: str = '', note: str = '',
-                     read_stage: str = 'review'):
+                     read_stage: str = 'review', read_after: float = 0):
         identity = receipt.identity() if (receipt.ticket_number or receipt.billing_codes) else None
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -185,15 +204,69 @@ class Store:
             stage = read_stage if status == 'review' and claim else ''
             confirmed_payment = receipt.payment_code if ready and not claim else row['confirmed_payment']
             db.execute('UPDATE jobs SET receipt=?, identity=?, status=?, message=?, auto_stage=?, confirmed_payment=?, '
-                       'updated=? WHERE id=?',
-                       (receipt.model_dump_json(), identity, status, message, stage, confirmed_payment, now(), key))
+                       'updated=?,read_attempts=?,read_after=? WHERE id=?',
+                       (receipt.model_dump_json(), identity, status, message, stage, confirmed_payment, now(),
+                        row['read_attempts'] if stage == 'retry_read' else 0,
+                        read_after if stage == 'retry_read' else 0, key))
         return self.get(key)
 
     def claim(self, key: str) -> bool:
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
             count = db.execute("UPDATE jobs SET status='running',updated=? WHERE id=? AND status IN ('ready','queued') "
-                               "AND issue_attempted=0 AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL", (now(), key)).rowcount
+                               "AND issue_attempted=0 AND issuance_seen=0 AND uuid IS NULL AND (human_exposed=0 OR EXISTS("
+                               "SELECT 1 FROM negative_billing_checks WHERE job_id=jobs.id AND preparing=1 AND checked_at>=unixepoch()-300))",
+                               (now(), key)).rowcount
+            if not count:
+                db.execute("""UPDATE jobs SET status='uncertain',message='Venció la consulta. Busca de nuevo el resultado del peaje.',
+                    updated=? WHERE id=? AND status='queued' AND human_exposed=1 AND issue_attempted=0
+                    AND issuance_seen=0 AND uuid IS NULL AND EXISTS(SELECT 1 FROM negative_billing_checks
+                    WHERE job_id=jobs.id AND preparing=1 AND checked_at<unixepoch()-300)""", (now(), key))
             return count == 1
+
+    @staticmethod
+    def billing_fingerprint(receipt, profile):
+        scope = json.dumps([receipt.model_dump(mode='json'), profile.model_dump(mode='json', exclude={'whatsapp_phone'})],
+                           ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+        return hashlib.sha256(scope).hexdigest()
+
+    def record_not_billed(self, key, provider, receipt, profile):
+        if provider != 'capufe' or receipt.provider != provider or not receipt.billing_codes:
+            return False
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = self.decode(db.execute('SELECT * FROM jobs WHERE id=?', (key,)).fetchone())
+            if not self._eligible_negative(row, receipt, profile):
+                return False
+            db.execute("""INSERT INTO negative_billing_checks VALUES(?,?,unixepoch(),0)
+                ON CONFLICT(job_id) DO UPDATE SET fingerprint=excluded.fingerprint,
+                checked_at=excluded.checked_at, preparing=0""", (key, self.billing_fingerprint(receipt, profile)))
+            db.execute('INSERT INTO events(job_id,at,kind,detail) VALUES(?,?,?,?)',
+                       (key, now(), 'not_billed_confirmed', 'CAPUFE confirmó que todos los códigos del expediente siguen sin facturar.'))
+            return True
+
+    @staticmethod
+    def _eligible_negative(row, receipt, profile):
+        from .models import Profile
+        return (Receipt.model_validate(row['receipt']) == receipt and row['billing_profile']
+                and Profile.model_validate_json(row['billing_profile']).model_dump(exclude={'whatsapp_phone'})
+                == profile.model_dump(exclude={'whatsapp_phone'})
+                and row['human_exposed'] and not (row['issue_attempted'] or row['issuance_seen'] or row['uuid'] or row['historical'])
+                and row['status'] in {'needs_user', 'uncertain', 'blocked'})
+
+    def queue_after_negative_check(self, key, receipt, profile):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = self.decode(db.execute('SELECT * FROM jobs WHERE id=?', (key,)).fetchone())
+            if not self._eligible_negative(row, receipt, profile):
+                return False
+            count = db.execute("""UPDATE negative_billing_checks SET preparing=1 WHERE job_id=? AND preparing=0
+                AND checked_at>=unixepoch()-300 AND fingerprint=?""", (key, self.billing_fingerprint(receipt, profile))).rowcount
+            if not count:
+                return False
+            db.execute("UPDATE jobs SET status='queued',auto_stage='scheduled',message=?,updated=? WHERE id=?",
+                       ('CAPUFE confirmó que sigue sin facturar. Preparando el ticket para tu aprobación.', now(), key))
+            return True
 
     def queue(self, key: str, profile=None, confirmed_url: str = '') -> bool:
         with self.connect() as db:
@@ -209,9 +282,68 @@ class Store:
             db.execute("UPDATE jobs SET issuance_seen=1,status='issued_waiting_files',message='Emisión confirmada. Recuperando PDF y XML.',updated=? "
                        "WHERE id=? AND status NOT IN ('verified','duplicate','historical')", (now(), key))
 
+    def pause_automatic_recovery(self, key, paused=True):
+        with self.connect() as db:
+            if paused:
+                db.execute('''INSERT INTO recovery_schedule VALUES(?,0,0,1)
+                    ON CONFLICT(job_id) DO UPDATE SET paused=1''', (key,))
+            else:
+                db.execute('DELETE FROM recovery_schedule WHERE job_id=? AND paused=1', (key,))
+
+    def next_recovery(self, current_time):
+        # A confirmed UUID already has its own Gmail follow-up. Reserve each remaining
+        # check before opening the portal so a restart cannot create a polling loop.
+        delays = (90, 600, 3600)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('''SELECT j.id,COALESCE(s.attempts,0) AS attempts FROM jobs j
+                LEFT JOIN recovery_schedule s ON s.job_id=j.id LEFT JOIN recovery_requests r ON r.job_id=j.id
+                WHERE j.status IN ('uncertain','issued_waiting_files') AND j.historical=0
+                  AND j.billing_profile IS NOT NULL AND COALESCE(j.uuid,'')=''
+                  AND COALESCE(s.paused,0)=0 AND COALESCE(s.attempts,0)<? AND COALESCE(s.next_check,0)<=?
+                  AND COALESCE(r.requested_at,0)<=? AND COALESCE(json_extract(j.receipt,'$.source'),'') NOT LIKE 'Ejemplo:%'
+                ORDER BY s.next_check,j.updated,j.id LIMIT 1''', (len(delays)+1, current_time, current_time-30)).fetchone()
+            if row is None:
+                return None
+            attempts = row['attempts']
+            after = current_time + delays[min(attempts, len(delays)-1)]
+            db.execute('''INSERT INTO recovery_schedule VALUES(?,?,?,0) ON CONFLICT(job_id)
+                DO UPDATE SET attempts=excluded.attempts,next_check=excluded.next_check''',
+                (row['id'], attempts+1, after))
+            return row['id']
+
+    def defer_recovery_until(self, key, when):
+        with self.connect() as db:
+            db.execute('''INSERT INTO recovery_schedule VALUES(?,0,?,0) ON CONFLICT(job_id)
+                DO UPDATE SET next_check=MAX(next_check,excluded.next_check)''', (key, when))
+
+    def claim_recovery(self, key: str) -> bool:
+        with self.connect() as db:
+            changed = db.execute("""INSERT INTO recovery_requests(job_id,requested_at) VALUES(?,unixepoch())
+                ON CONFLICT(job_id) DO UPDATE SET requested_at=excluded.requested_at
+                WHERE requested_at<=excluded.requested_at-30""", (key,)).rowcount == 1
+            if changed:
+                db.execute("DELETE FROM negative_billing_checks WHERE job_id=?", (key,))
+            return changed
+
+    def checked_preparation(self, key):
+        with self.connect() as db:
+            return bool(db.execute("SELECT 1 FROM negative_billing_checks WHERE job_id=? AND preparing=1", (key,)).fetchone())
+
+    def finish_recovery(self, key: str, message: str):
+        with self.connect() as db:
+            db.execute("""UPDATE jobs SET status=CASE WHEN issuance_seen=1 OR uuid IS NOT NULL
+                THEN 'issued_waiting_files' ELSE 'uncertain' END, message=?,updated=? WHERE id=?
+                AND status NOT IN ('verified','duplicate','historical')""", (message, now(), key))
+
     def begin_emission(self, key: str, action: str) -> None:
         with self.connect() as db:
-            result = db.execute("UPDATE jobs SET issue_attempted=1,status='issuing',message='Emisión enviada a revisión del portal',updated=? WHERE id=? AND issue_attempted=0 AND status='running'",
+            db.execute('BEGIN IMMEDIATE')
+            expired = db.execute("""SELECT 1 FROM negative_billing_checks WHERE job_id=? AND preparing=1
+                AND checked_at<unixepoch()-300""", (key,)).fetchone()
+            if expired:
+                raise ValueError('Venció la consulta de CAPUFE. Vuelve a buscar comprobantes para preparar una nueva aprobación.')
+            result = db.execute("UPDATE jobs SET issue_attempted=1,status='issuing',message='Emisión enviada a revisión del portal',updated=? WHERE id=? AND issue_attempted=0 AND issuance_seen=0 AND uuid IS NULL AND status='running'",
                                 (now(), key))
             if result.rowcount != 1:
                 raise ValueError('Recupera el resultado del intento anterior antes de emitir.')
@@ -219,24 +351,30 @@ class Store:
 
     def enter_intervention(self, key: str, kind: str, message: str, manual: bool):
         with self.connect() as db:
-            db.execute("UPDATE jobs SET status='needs_user',human_exposed=?,message=?,updated=? WHERE id=?",
+            db.execute("UPDATE jobs SET status='needs_user',human_exposed=MAX(human_exposed,?),message=?,updated=? WHERE id=?",
                        (int(manual), message, now(), key))
             db.execute('INSERT INTO events(job_id,at,kind,detail) VALUES(?,?,?,?)', (key, now(), 'needs_user', kind))
 
     def resume_intervention(self, key: str):
         with self.connect() as db:
-            db.execute("UPDATE jobs SET status='running',human_exposed=0,message='Continuando en el portal…',updated=? WHERE id=?",
+            db.execute("UPDATE jobs SET status='running',message='Continuando en el portal…',updated=? WHERE id=? AND status='needs_user'",
                        (now(), key))
 
     def recover_after_restart(self):
         with self.connect() as db:
+            db.execute(f"UPDATE jobs SET status='review',auto_stage='retry_read',read_after=?,message=?,updated=? "
+                       f"WHERE {AUTO_ELIGIBLE} AND auto_stage LIKE 'reading:auto:%' AND read_attempts<=? "
+                       "AND status IN ('new','review')",
+                       (time.time() + READ_DELAYS[0], 'Se interrumpió la lectura. El reintento automático está programado.',
+                        now(), len(READ_DELAYS)))
             db.execute("UPDATE jobs SET status='review',auto_stage='review',message=?,updated=? "
                        "WHERE auto_stage LIKE 'reading:%' AND status IN ('new','review','ready','external','blocked') "
                        "AND issue_attempted=0 AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL",
                        ('La lectura se interrumpió. Revisa los datos o pulsa Leer con mi plan para repetirla.', now()))
             db.execute("UPDATE jobs SET status='issued_waiting_files',message='El portal confirmó la emisión. Recupera el PDF y el XML.',updated=? "
                        "WHERE status IN ('queued','running','issuing','needs_user') AND (issuance_seen=1 OR uuid IS NOT NULL)", (now(),))
-            db.execute("UPDATE jobs SET status='uncertain',issue_attempted=1,message='Hay un intento previo. Recupera sus comprobantes.',updated=? "
+            db.execute("UPDATE jobs SET status='uncertain',issue_attempted=MAX(issue_attempted,status='issuing'),"
+                       "message='El resultado del portal sigue pendiente. Puedes buscar los comprobantes del ticket.',updated=? "
                        "WHERE status IN ('queued','running','issuing','needs_user') AND "
                        "(issue_attempted=1 OR uuid IS NOT NULL OR status='issuing' OR human_exposed=1)", (now(),))
             db.execute("UPDATE jobs SET status='ready',message='Trámite interrumpido antes de enviar. Puedes prepararlo de nuevo.',updated=? "

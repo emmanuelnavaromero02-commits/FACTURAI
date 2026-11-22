@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import secrets
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
     from playwright.async_api import FileChooser, Frame
 
 KEY = re.compile(r'(?:Backspace|Delete|Tab|Enter|Escape|Home|End|PageUp|PageDown|Arrow(?:Up|Down|Left|Right)|Space|(?:ControlOrMeta|Control)\+[aAzZyY])')
+CAPTCHA_IDLE_SECONDS = 120
 
 
 class ViewerInput(BaseModel):
@@ -40,6 +42,9 @@ class BrowserView:
         self.title = ''
         self.manual = False
         self.channel = ''
+        self.channel_protected = False
+        self.channel_activity = 0.0
+        self.control_epoch = 0
         self.pointer_down = False
         self.dialog = None
         self.dialog_key = ''
@@ -76,6 +81,7 @@ class BrowserView:
 
     async def _release(self):
         self.channel = ''
+        self.channel_protected = False
         self.file_request = None
         if self.pointer_down and self.open and not self.dialog:
             try:
@@ -84,18 +90,36 @@ class BrowserView:
                 pass
         self.pointer_down = False
 
-    async def take_control(self, revision: int) -> str:
+    async def take_control(self, revision: int, *, check=None) -> str:
         async with self.commands:
+            if check:
+                check()
+            if self.channel and (check or self.channel_protected) and time.monotonic() - self.channel_activity < CAPTCHA_IDLE_SECONDS:
+                raise ValueError('Otra pestaña controla esta verificación. Si se desconectó, podrás retomarla en dos minutos.')
             if not self.open or not self.manual or revision != self.revision or self.dialog:
                 raise ValueError('Espera a que el navegador quede disponible para intervenir.')
             await self._release()
             self.channel = secrets.token_urlsafe(24)
+            self.channel_protected = check is not None
+            self.channel_activity = time.monotonic()
+            self.control_epoch += 1
             return self.channel
 
     async def release(self, channel: str):
         async with self.commands:
             if channel and secrets.compare_digest(channel, self.channel):
                 await self._release()
+                return True
+            return False
+
+    async def finish_returned_control(self, page, revision, epoch):
+        async with self.commands:
+            if (self.page is not page or self.revision != revision or self.control_epoch != epoch
+                    or self.channel or self.dialog or not self.manual or not self.open):
+                return False
+            self.manual = False
+            self.revision += 1
+            return True
 
     async def frame(self, revision: int) -> bytes | None:
         if not self.open or revision != self.revision or self.dialog or self.capture.locked():
@@ -135,6 +159,7 @@ class BrowserView:
     def require_control(self, channel: str):
         if not self.open or not self.manual or not self.channel or self.dialog or not secrets.compare_digest(channel, self.channel):
             raise ValueError('El control de esta página ya terminó. Vuelve a tomarlo desde el panel.')
+        self.channel_activity = time.monotonic()
 
     async def visible_text(self, channel: str) -> str:
         async with self.commands:
@@ -203,6 +228,7 @@ class BrowserView:
             raise ValueError('El aviso ya cambió o se cerró.')
         self.dialog, self.dialog_key = None, ''
         if accept and dialog.type != 'prompt':
+            self.control_epoch += 1
             await dialog.accept()
         else:
             await dialog.dismiss()

@@ -34,6 +34,12 @@ let appliedRefresh = 0;
 let savingAutomation = false;
 let lastLiveJob = null;
 const handledLiveJobs = new Set();
+let selectedRetry = '';
+const retryStrip = document.createElement('div');
+retryStrip.id = 'ticket-retry';
+retryStrip.className = 'buttons';
+retryStrip.hidden = true;
+$('automation-review').after(retryStrip);
 
 function el(tag, content = '', ...classes) {
   const value = document.createElement(tag);
@@ -112,9 +118,11 @@ function openScreen() {
   }
   $('breadcrumb').textContent = sections[activeScreen];
   if (activeScreen === 'portales') renderPortals();
+  renderCaptcha();
 }
 
 const viewer = installViewer({api, token: () => state.token, showError: error => notify(error, true), perform,
+  captchaId: () => state.supports_captcha_control && captchaTicket()?.id,
   accountEmail: () => state.profile?.email || state.plan?.email || ''});
 installPortalMail({api, gmailState: () => state.gmail});
 const receiptTools = installReceiptTools({api, el, button, link, perform, currentTicket: () => editing,
@@ -165,7 +173,7 @@ function prepare(rows) {
     route('ajustes');
     return notify('Guarda tus datos fiscales antes de iniciar el trámite.');
   }
-  prepared = rows.filter(row => (row.status === 'ready' || row.can_retry) && !row.receipt.source.startsWith('Ejemplo:'));
+  prepared = rows.filter(row => (row.status === 'ready' || row.can_retry) && !existingAttempt(row) && !row.receipt.source.startsWith('Ejemplo:'));
   if (!prepared.length) return notify('No hay tickets reales revisados para preparar.');
   const names = [...new Set(prepared.map(({receipt}) => receipt.provider === 'portal_ticket'
     ? receipt.merchant + ' (' + new URL(receipt.portal_url).origin + ')' : state.catalog[receipt.provider]?.name))];
@@ -231,6 +239,61 @@ function liveJob() {
   return state.active_job ? state.jobs.find(isLive) : null;
 }
 
+function captchaTicket() {
+  return state.jobs.find(row => row.id === state.active_job && row.status === 'needs_user' && row.human_kind === 'captcha');
+}
+
+function captchaView(key) {
+  const browser = state.browser;
+  return browser.mode === 'job' && browser.job_id === key && browser.open && browser.manual && !browser.dialog;
+}
+
+function renderCaptcha() {
+  const banner = $('captcha-alert');
+  if (!banner) return;
+  const row = captchaTicket();
+  banner.hidden = !row;
+  if (!row) return;
+  const key = row.id;
+  const viewing = captchaView(key);
+  const occupied = viewing && viewer.hasControl() && activeScreen === 'navegador';
+  const returning = state.browser.mode === 'personal' && state.browser.return_job_id === key;
+  const title = 'Verificación del portal · ' + (row.receipt.merchant || row.receipt.ticket_number || 'Tu ticket');
+  const detail = occupied ? 'Resuelve el reto en la imagen del portal. Cuando el portal avance, pulsa Devolver control.' :
+    viewing || returning ? 'El comercio ha pausado este ticket hasta que completes la verificación en su página.' :
+    'Esperando a que el visor de este ticket esté disponible.';
+  if ($('captcha-title').textContent !== title) $('captcha-title').textContent = title;
+  if ($('captcha-detail').textContent !== detail) $('captcha-detail').textContent = detail;
+  const control = $('captcha-action');
+  control.dataset.ticket = key;
+  control.textContent = occupied ? 'Devolver control' : 'Resolver verificación';
+  control.disabled = !viewing && !returning;
+}
+
+if ($('captcha-action')) $('captcha-action').onclick = () => {
+  const key = $('captcha-action').dataset.ticket;
+  const returningControl = captchaView(key) && activeScreen === 'navegador' && viewer.hasControl();
+  perform(async () => {
+    await refresh();
+    if (captchaTicket()?.id !== key) throw Error('Este ticket ya no solicita tu verificación.');
+    if (returningControl) {
+      if (!captchaView(key) || !viewer.hasControl()) throw Error('La pantalla de este ticket cambió.');
+      await viewer.releaseControl();
+      return;
+    }
+    if (state.browser.mode === 'personal' && state.browser.return_job_id === key) {
+      if (!state.supports_captcha_control) { route('navegador'); return 'Pulsa Volver al trámite y comprueba el ticket antes de tomar control.'; }
+      await viewer.returnToCaptcha(key);
+      await refresh();
+    }
+    if (captchaTicket()?.id !== key || !captchaView(key)) throw Error('El visor de este ticket ya no está disponible.');
+    route('navegador');
+    if (!state.supports_captcha_control) return 'Comprueba el nombre del ticket y pulsa Tomar control.';
+    await viewer.acquireControl(key);
+    if (viewer.hasControl()) $('browser-image').scrollIntoView({block: 'center'});
+  });
+};
+
 function showLive(row) {
   handledLiveJobs.add(row.id);
   lastLiveJob = row.id;
@@ -275,6 +338,71 @@ function reviewAction(row) {
   return {label: 'Revisar'};
 }
 
+function existingAttempt(row) {
+  return Boolean(row.issue_attempted || row.issuance_seen || row.human_exposed || row.uuid ||
+    ['issued_waiting_files', 'uncertain'].includes(row.status));
+}
+
+function retryKind(row) {
+  if (!row || row.historical || terminal.has(row.status) || row.receipt.source.startsWith('Ejemplo:')) return null;
+  if (state.supports_ticket_retry) return ['resume', 'queue', 'recover'].includes(row.retry_action) ? row.retry_action : null;
+  if (existingAttempt(row) && ['blocked', 'issued_waiting_files', 'uncertain'].includes(row.status)) return 'local';
+  if (row.can_retry && !existingAttempt(row)) return 'prepare';
+  if (row.status === 'needs_user' && row.id === state.active_job && ['plan', 'unknown', 'blocked'].includes(row.human_kind) && !existingAttempt(row)) return 'resume';
+  return null;
+}
+
+function retryButton(row) {
+  const kind = retryKind(row);
+  if (!kind) return null;
+  const recovery = kind === 'recover' || kind === 'local';
+  const label = recovery ? 'Recuperar comprobantes' : kind === 'resume' ? 'Retomar trámite' : 'Reintentar';
+  const control = button(label, () => {
+    selectedRetry = row.id;
+    lastLiveJob = row.id;
+    if (kind === 'prepare') return prepare([row]);
+    return perform(async () => {
+      const path = '/api/jobs/' + encodeURIComponent(row.id);
+      if (kind === 'local') {
+        await api(path + '/recover-local', 'POST');
+        return 'PDF y XML del intento anterior cotejados.';
+      }
+      if (!state.supports_ticket_retry) {
+        await api(path + '/decision', 'POST', {decision: 'resume'});
+        showLive(row);
+        return 'Reanudando el trámite en su sesión.';
+      }
+      const result = await api(path + '/retry', 'POST');
+      if (result.action === 'needs_user' && kind === 'queue' && state.plan.status !== 'ready') route('ajustes');
+      else if (['resumed', 'active', 'queued', 'needs_user'].includes(result.action) &&
+               (!state.active_job || state.active_job === row.id)) showLive(row);
+      return result.message;
+    });
+  }, 'primary');
+  control.title = kind === 'local' ? 'Buscar el PDF y XML del intento anterior entre los archivos del expediente.' :
+    recovery ? 'Buscar el PDF y XML del intento existente.' : label;
+  return control;
+}
+
+function renderRetryStrip() {
+  const choices = state.jobs.filter(row => retryKind(row));
+  retryStrip.hidden = !choices.length;
+  if (!choices.length) { retryStrip.replaceChildren(); return; }
+  const ticket = choices.find(row => row.id === selectedRetry) ||
+    choices.find(row => row.id === state.automation?.current_id) || choices[0];
+  const name = row => [row.receipt.merchant || 'Ticket', row.receipt.ticket_number || row.receipt.billing_codes[0] || currency(row.receipt.amount)].filter(Boolean).join(' · ');
+  const title = choices.length === 1 ? el('strong', name(ticket)) : document.createElement('select');
+  if (choices.length > 1) {
+    title.setAttribute('aria-label', 'Seleccionar trámite pendiente');
+    title.replaceChildren(...choices.map(row => new Option(name(row), row.id)));
+    title.value = ticket.id;
+    title.onchange = () => { selectedRetry = title.value; renderRetryStrip(); };
+  }
+  const action = retryButton(ticket);
+  retryStrip.replaceChildren(title, action);
+  if (['recover', 'local'].includes(retryKind(ticket))) retryStrip.append(el('span', action.title, 'muted'));
+}
+
 function primaryAction(row, realTicket) {
   if (isLive(row) || row.id === state.browser.return_job_id) return button('Ver en vivo', () => showLive(row), 'primary');
   if (reading(row)) return null;
@@ -294,7 +422,6 @@ function primaryAction(row, realTicket) {
       () => showWhatsApp(row), 'primary');
   }
   if (row.status === 'external') return button('Preparar solicitud', () => request(row), 'primary');
-  if (row.can_retry) return button('Reintentar', () => prepare([row]), 'primary');
   if (row.status === 'ready' && realTicket) {
     const custom = row.receipt.provider === 'portal_ticket';
     if (!state.profile) return button('Completar perfil fiscal', () => route('ajustes'));
@@ -309,6 +436,8 @@ function rowActions(row) {
   const realTicket = !row.historical && !row.receipt.source.startsWith('Ejemplo:');
   const whatsappPrimary = realTicket && ['external', 'whatsapp_preparing'].includes(row.status);
   const primary = primaryAction(row, realTicket);
+  const retry = retryButton(row);
+  if (retry) group.append(retry);
   if (primary) group.append(primary);
   if (row.status === 'verified' && row.has_pdf && row.has_xml) group.append(button('Vigencia SAT', () => showSAT(row)));
   for (const format of ['pdf', 'xml']) {
@@ -321,7 +450,7 @@ function rowActions(row) {
   const toggle = el('summary', '⋯');
   toggle.setAttribute('aria-label', 'Más acciones para ' + (row.receipt.merchant || 'el ticket'));
   const panel = el('div', '', 'more-panel');
-  if (review.has(row.status) && !row.issue_attempted && !reading(row)) {
+  if (review.has(row.status) && !existingAttempt(row) && !reading(row)) {
     const readLabel = state.plan.status === 'ready' ? 'Leer con ChatGPT' : 'Leer en el contenedor';
     if (primary?.textContent !== readLabel) panel.append(button(readLabel, () => readTicket(row), 'plain'));
     if (row.status !== 'review') panel.append(button('Editar datos', () => edit(row), 'plain'));
@@ -409,11 +538,12 @@ function renderTickets(force = false) {
   const search = $('ticket-search');
   $('clear-ticket-search').hidden = !search.value;
   const query = search.value.trim().toLowerCase();
-  const signature = JSON.stringify([filter, query, state.jobs, state.automation?.enabled, state.automation?.current_id,
+  const signature = JSON.stringify([filter, query, state.jobs, state.supports_ticket_retry, state.automation?.enabled, state.automation?.current_id,
     state.automation?.phase, liveJob()?.id, state.plan.status, Boolean(state.profile)]);
   if (!force && signature === rowSignature) return;
   rowSignature = signature;
-  const rows = state.jobs.filter(row => (filter === 'all' || filter === 'review' && review.has(row.status) && !row.issue_attempted ||
+  renderRetryStrip();
+  const rows = state.jobs.filter(row => (filter === 'all' || filter === 'review' && (review.has(row.status) && !existingAttempt(row) || retryKind(row)) ||
     filter === 'working' && (working.has(row.status) || row.status === 'whatsapp_preparing' || row.status === 'external' && row.issue_attempted))
     && [row.receipt.merchant, row.receipt.ticket_number,
       row.receipt.amount, row.receipt.source, ...row.receipt.billing_codes].join(' ').toLowerCase().includes(query));
@@ -435,8 +565,8 @@ function renderBrowser() {
     personal ? 'Nueva pestaña' : 'Sin página abierta';
   $('browser-empty').querySelector('p').textContent = opening ? 'Aquí verás a Chrome en cuanto abra el portal.' :
     'Escribe la dirección del portal que quieres abrir.';
-  const previous = !state.browser.open || state.browser.job_id === lastLiveJob ? lastLiveJob : null;
-  const row = state.jobs.find(job => job.id === (state.active_job || previous));
+  const row = state.jobs.find(job => job.id === (state.active_job || state.browser.job_id || lastLiveJob)) ||
+    state.jobs.find(job => job.id === selectedRetry && retryKind(job)) || state.jobs.find(job => retryKind(job));
   const signature = JSON.stringify([row, state.active_job, personal, state.profile?.rfc, state.plan.status]);
   if (signature === taskSignature) return;
   taskSignature = signature;
@@ -457,6 +587,8 @@ function renderBrowser() {
   }
   target.replaceChildren(el('span', jobLabels[row.status], 'job-status', row.status), detail, el('p', row.message, 'muted'));
   const actions = el('div', '', 'buttons');
+  const retry = retryButton(row);
+  if (retry) actions.append(retry);
   if (row.id !== state.active_job) {
     if (row.has_pdf || row.has_xml) actions.append(link('Ver comprobantes', '#comprobantes', 'secondary button-link'));
     actions.append(link('Volver a la bandeja', '#bandeja', 'secondary button-link'));
@@ -468,7 +600,7 @@ function renderBrowser() {
     const label = issue ? 'Aprobar emisión' : row.human_kind === 'operator' ? 'Terminar y cotejar' : 'Continuar';
     const resume = button(label, () => perform(() =>
       api(`/api/jobs/${row.id}/decision`, 'POST', {decision: issue ? 'approve' : 'resume'})), 'primary');
-    actions.append(resume);
+    if (!retry || (row.human_kind !== 'plan' && row.human_kind !== 'blocked' && row.human_kind !== 'unknown')) actions.append(resume);
     if (['plan', 'blocked', 'unknown'].includes(row.human_kind)) {
       actions.append(button('Continuar a mano', () => perform(async () => {
         await api(`/api/jobs/${row.id}/decision`, 'POST', {decision: 'manual'});
@@ -536,6 +668,7 @@ async function refresh() {
   renderAutomation();
   renderTickets();
   renderBrowser();
+  renderCaptcha();
   renderSettings();
   if (activeScreen === 'portales' && !$('portal-list').children.length) renderPortals();
 }

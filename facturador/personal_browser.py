@@ -12,6 +12,9 @@ from .profile_lock import close_context, launch_chrome
 from .viewer import BrowserView
 
 
+GOOGLE_INTERACTIVE = {'accounts.google.com', 'mail.google.com', 'myaccount.google.com', 'gmail.com', 'www.gmail.com'}
+
+
 class PersonalBrowser:
     MAX_TABS = 12
 
@@ -74,8 +77,14 @@ class PersonalBrowser:
     @staticmethod
     async def guard_request(route):
         parts = urlsplit(route.request.url)
-        # Large Google asset and OAuth query strings can exceed the operator's address-bar limit.
-        # Only the origin determines eligibility. Let Chrome keep the complete request unchanged.
+        # A merchant link or redirect can lead to sign-in independently of the address bar.
+        # Keep account forms and their parameters out of the automated personal browser.
+        if parts.hostname in GOOGLE_INTERACTIVE and route.request.resource_type == 'document':
+            await route.fulfill(status=403, content_type='text/plain; charset=utf-8',
+                headers={'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'none'",
+                         'Referrer-Policy': 'no-referrer'},
+                body='FACTURAI · Para acceder a Google, usa las opciones de tu Chrome que aparecen sobre el visor.')
+            return
         if await resolves_publicly(f'{parts.scheme}://{parts.netloc}'):
             await route.continue_()
         else:
@@ -190,6 +199,8 @@ class PersonalBrowser:
                 continue
             parsed = urlsplit(page.url)
             address = parsed._replace(query='', fragment='').geturl() if public_portal_origin(f'{parsed.scheme}://{parsed.netloc}') else ''
+            if parsed.hostname in GOOGLE_INTERACTIVE:
+                address = f'https://{parsed.hostname}/'
             tabs.append(dict(id=key, url=address, title=parsed.hostname or 'Nueva pestaña', selected=page is self.view.page))
         return {**state, 'url': next((t['url'] for t in tabs if t['selected']), ''),
                 'mode': 'personal', 'tabs': tabs, 'job_id': None}

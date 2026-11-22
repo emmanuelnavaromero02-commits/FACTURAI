@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import parse_qs, urlsplit
+from unittest.mock import patch
 
 import httpx
 import jwt
@@ -131,6 +132,32 @@ class SubscriptionTests(unittest.TestCase):
         self.assertEqual(len(hit), 1)
         blocked.clear_limit()
         self.assertEqual(blocked.status()['status'], 'ready')
+
+    def test_retry_after_for_service_throttling_keeps_the_plan_ready(self):
+        self.finish()
+        for status in (429, 503):
+            with self.subTest(status=status):
+                plan = self.new_plan(lambda _: httpx.Response(status, headers={'Retry-After': '80'},
+                                                               json={'error': {'code': 'rate_limit_exceeded'}}))
+                with self.assertRaises(PlanError) as result:
+                    plan.infer('Lectura', [], Extraction)
+                self.assertEqual((result.exception.status, result.exception.retry_after), ('transient', 80))
+                self.assertEqual(plan.status()['status'], 'ready')
+
+    def test_quota_with_server_deadline_recovers_after_restart(self):
+        self.finish()
+        def limited(request):
+            return httpx.Response(429, headers={'Retry-After': '120'},
+                                  json={'error': {'code': 'subscription_sharing_usage_limit_exceeded'}})
+        limited_plan = self.new_plan(limited)
+        with self.assertRaises(PlanError):
+            limited_plan.infer('Lectura', [], Extraction)
+        self.assertEqual(limited_plan.status()['status'], 'limit')
+        reopened = self.new_plan(lambda _: httpx.Response(200))
+        deadline = read_json(reopened.session_path)['hold_until']
+        with patch('time.time', return_value=deadline + 1):
+            self.assertEqual(reopened.status()['status'], 'ready')
+            self.assertTrue(reopened._credentials()[0])
 
     def test_incomplete_stream_never_returns_a_guess(self):
         self.finish()

@@ -111,6 +111,57 @@ export function installNavigation({api, perform, current}) {
   let modifying = false;
   let draft = false;
   let lastTab = null;
+  let typedGoogle = null;
+  let hintSignature = '';
+  const portalOrigins = new Map();
+  const googleHint = document.createElement('div');
+  googleHint.className = 'browser-bar buttons';
+  googleHint.id = 'browser-google-hint';
+  googleHint.hidden = true;
+  const hintText = document.createElement('span');
+  const external = document.createElement('a');
+  external.className = 'secondary button-link';
+  external.target = '_blank';
+  external.rel = 'noopener noreferrer';
+  const portalLink = external.cloneNode();
+  portalLink.hidden = true;
+  googleHint.append(hintText, external, portalLink);
+  byId('browser-url-form').closest('.browser-bar').after(googleHint);
+
+  function googlePage(value) {
+    let url;
+    try { url = new URL(value); } catch { return null; }
+    if (url.protocol !== 'https:' || url.username || url.password) return null;
+    if (['mail.google.com', 'gmail.com', 'www.gmail.com'].includes(url.hostname)) return 'mail';
+    if (['accounts.google.com', 'myaccount.google.com'].includes(url.hostname) ||
+        (['www.google.com', 'google.com'].includes(url.hostname) && /^\/accounts(?:\/|$)/i.test(url.pathname))) return 'account';
+    if (url.searchParams.has('redirect_uri') && url.searchParams.has('client_id') ||
+        url.searchParams.has('state') && url.searchParams.has('code') ||
+        /\/(?:oauth2?|oidc|openid-connect)\/(?:v\d+\/)?(?:auth|authorize|callback)(?:\/|$)/i.test(url.pathname)) return url.origin;
+    return null;
+  }
+  function showGoogleHint(kind) {
+    googleHint.hidden = !kind;
+    if (!kind) return;
+    const mail = kind === 'mail';
+    const merchant = portalOrigins.get(lastTab);
+    const generic = kind !== 'account' && !mail;
+    const signature = JSON.stringify([kind, merchant]);
+    if (signature === hintSignature) return;
+    hintSignature = signature;
+    hintText.textContent = generic ? 'Para identificarte en tu Chrome, comienza desde la página principal y elige Iniciar sesión.' :
+      mail ? 'Abre el buzón en una pestaña de tu Chrome.' :
+      'Abre tu cuenta en Chrome. Si llegaste desde un comercio, inicia el acceso desde ese comercio en tu Chrome.';
+    // Transfer only a public homepage. The redirect, path, tokens and ticket stay at their origin.
+    external.href = generic ? (merchant || kind) + '/' : mail ? 'https://mail.google.com/' : 'https://accounts.google.com/';
+    external.textContent = generic ? 'Abrir ' + new URL(external.href).host + ' en Chrome' :
+      mail ? 'Abrir Gmail en Chrome' : 'Abrir mi cuenta en Chrome';
+    portalLink.hidden = !(kind === 'account' && merchant);
+    if (!portalLink.hidden) {
+      portalLink.href = merchant + '/';
+      portalLink.textContent = 'Abrir ' + new URL(merchant).host + ' en Chrome';
+    } else portalLink.removeAttribute('href');
+  }
 
   function update() {
     const {browser, channel, active} = current();
@@ -128,10 +179,19 @@ export function installNavigation({api, perform, current}) {
     byId('wa-open').disabled = blocked || active;
     byId('browser-return').hidden = !(personal && active);
     address.disabled = blocked;
-    if (lastTab !== (selected?.id || null)) draft = false;
+    if (lastTab !== (selected?.id || null)) { draft = false; typedGoogle = null; }
     lastTab = selected?.id || null;
+    const google = personal && googlePage(browser.url);
+    if (lastTab && !google && /^https:\/\//i.test(browser.url)) {
+      const visited = new URL(browser.url);
+      if (!['google.com', 'www.google.com'].includes(visited.hostname)) portalOrigins.set(lastTab, visited.origin);
+    }
+    if (personal) {
+      for (const id of portalOrigins.keys()) if (!tabs.some(tab => tab.id === id)) portalOrigins.delete(id);
+    }
+    showGoogleHint(typedGoogle || google);
     if (!draft && document.activeElement !== address) {
-      address.value = personal && /^https:\/\//i.test(browser.url || '') ? browser.url : '';
+      address.value = google ? external.href : personal && /^https:\/\//i.test(browser.url || '') ? browser.url : '';
     }
     byId('browser-tabs').hidden = !personal;
     byId('browser-new-tab').disabled = blocked || tabs.length >= 12;
@@ -183,7 +243,7 @@ export function installNavigation({api, perform, current}) {
     return navigate('/api/browser/personal/tabs', tabId ? {action, tab_id: tabId} : {action}, action === 'new');
   }
 
-  address.addEventListener('input', () => { draft = true; address.setCustomValidity(''); });
+  address.addEventListener('input', () => { draft = true; typedGoogle = null; address.setCustomValidity(''); });
   address.addEventListener('keydown', event => {
     if (event.key === 'Escape') {
       draft = false;
@@ -195,6 +255,14 @@ export function installNavigation({api, perform, current}) {
     event.preventDefault();
     const value = address.value.trim();
     if (!value) return;
+    function suggestGoogle(kind) {
+      typedGoogle = kind;
+      showGoogleHint(kind);
+      address.value = external.href;
+      external.focus();
+    }
+    if (/^gmail$/i.test(value)) return suggestGoogle('mail');
+    if (/^(?:mi )?cuenta de google$/i.test(value)) return suggestGoogle('account');
     const scheme = /^[a-z][a-z\d+.\-]*:/i.test(value) && !/^[^:/\s]+:\d+(?:\/|$)/.test(value);
     const looksLikeAddress = scheme || /[\/\\@]/.test(value) || /^\S+\.\S+(?:\s|$)/.test(value) ||
       /^(?:localhost|\[|\d+\.\d+)/i.test(value);
@@ -213,6 +281,8 @@ export function installNavigation({api, perform, current}) {
       address.reportValidity();
       return;
     }
+    const google = googlePage(url.href);
+    if (google) return suggestGoogle(google);
     openPersonal(url.href);
   };
   function returnToJob() {

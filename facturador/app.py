@@ -36,6 +36,7 @@ from .models import Profile, Receipt
 from .runner import Runner
 from .sat import sat_router
 from .portal_accounts import portal_accounts_router
+from .portal_discovery import review_links
 from .portal_mail import portal_mail_router
 from .viewer import ViewerInput
 from .whatsapp import whatsapp_router
@@ -294,8 +295,18 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
                             channel: str = Body(default='', max_length=64)):
         return await runner.open_personal(channel=channel, action=action, tab_id=tab_id)
 
+    def check_captcha_ticket(key):
+        pending = runner.pending.get(key)
+        if (key != runner.active_id or not pending or pending['kind'] != 'captcha' or
+                pending['future'].done() or pending['page'] is not runner.viewer.page or
+                runner.page_job.get(runner.viewer.page) != key):
+            raise ValueError('El ticket ya no solicita esta verificación. Actualiza el panel.')
+
     @app.post('/api/browser/return')
-    async def return_to_job(channel: str = Body(default='', embed=True, max_length=64)):
+    async def return_to_job(channel: str = Body(default='', embed=True, max_length=64),
+                            job_id: str | None = Body(default=None, max_length=100)):
+        if job_id is not None:
+            check_captcha_ticket(job_id)
         return await runner.return_to_job(channel)
 
     @app.get('/api/browser/frame')
@@ -307,13 +318,33 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         return Response(content=value, media_type='image/jpeg') if value else Response(status_code=204)
 
     @app.post('/api/browser/control')
-    async def browser_control(revision: int = Body(embed=True)):
-        return {'channel': await runner.screen.take_control(revision)}
+    async def browser_control(revision: int = Body(embed=True), job_id: str | None = Body(default=None, max_length=100)):
+        view = runner.screen
+        if job_id is None and view is runner.viewer and runner.pending.get(runner.active_id, {}).get('kind') == 'captcha':
+            job_id = runner.active_id
+        if job_id is None:
+            return {'channel': await view.take_control(revision)}
+        def check():
+            check_captcha_ticket(job_id)
+            if view is not runner.viewer or runner.screen is not view:
+                raise ValueError('Vuelve al visor de este ticket para resolver la verificación.')
+        return {'channel': await view.take_control(revision, check=check)}
+
+    @app.post('/api/browser/control/alive')
+    async def captcha_control_alive(job_id: str = Body(max_length=100), channel: str = Body(max_length=64)):
+        check_captcha_ticket(job_id)
+        if runner.screen is not runner.viewer:
+            raise ValueError('La pantalla del ticket cambió.')
+        runner.viewer.require_control(channel)
+        return {'active': True}
 
     @app.post('/api/browser/release')
-    async def browser_release(channel: str = Body(embed=True)):
-        await runner.viewer.release(channel)
-        await runner.personal.view.release(channel)
+    async def browser_release(channel: str = Body(embed=True), abandon: bool = Body(default=False)):
+        if abandon:
+            await runner.viewer.release(channel)
+            await runner.personal.view.release(channel)
+        else:
+            await runner.release_control(channel)
         return {'released': True}
 
     @app.post('/api/browser/input')
@@ -372,6 +403,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         path = root / "profile.json"
         jobs = store.list()
         for row in jobs:
+            row['retry_action'] = runner.retry_action(row)
             row['can_retry'] = bool(row['status'] == 'blocked' and row['billing_profile'] and
                                     not (row['issue_attempted'] or row['human_exposed'] or row['issuance_seen'] or row['uuid']))
             row.pop("source_path", None)
@@ -381,7 +413,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
             row.pop('confirmed_payment', None)
             row["has_pdf"], row["has_xml"] = bool(row.pop("pdf")), bool(row.pop("xml"))
             row["human_kind"] = runner.pending.get(row["id"], {}).get("kind")
-        return {"token": token, "profile": read_json(path), "jobs": jobs,
+        return {"token": token, "profile": read_json(path), "jobs": jobs, "supports_ticket_retry": True, "supports_captcha_control": True,
                 'catalog': CATALOG, 'plan': plan.status(), 'gmail': gmail_connection.status(),
                 'automation': automation.status(), 'browser': runner.browser_state(), 'active_job': runner.active_id}
 
@@ -490,6 +522,10 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         await runner.stop(key)
         return {"stopped": True}
 
+    @app.post('/api/jobs/{key}/retry')
+    async def retry_ticket(key: str):
+        return await runner.retry_job(key, profile)
+
     @app.get("/api/jobs/{key}/events")
     def events(key: str):
         store.get(key)
@@ -513,6 +549,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
                       rotation: Literal[0, 90, 180, 270] = Body(default=0), force_ocr: bool = Body(default=False)):
         result = read_local_page(original_path(key), page, rotation, force_ocr)
         result['portal_links'] = portal_suggestions(result['codes'], result.get('text', ''))
+        result['portal_discoveries'] = review_links(root, key, store.get(key)['receipt'])
         return result
 
     def recovery_profile(key: str) -> Profile:

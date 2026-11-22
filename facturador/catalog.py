@@ -29,31 +29,82 @@ def public_portal_origin(url: str) -> str | None:
     return 'https://' + host + (f':{port}' if port not in (None, 443) else '')
 
 
-async def resolves_publicly(url: str) -> bool:
+async def public_addresses(url: str) -> list[str]:
     if not public_portal_origin(url):
-        return False
+        return []
     parts = urlsplit(url)
     try:
         results = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(
             parts.hostname, parts.port or 443, type=socket.SOCK_STREAM), timeout=5)
     except (OSError, asyncio.TimeoutError):
-        return False
+        return []
+    addresses = []
     for _, _, _, _, address in results:
         ip = ipaddress.ip_address(address[0])
         if not ip.is_global or ip.is_multicast or str(ip) == '168.63.129.16':
-            return False
-    return bool(results)
+            return []
+        addresses.append(str(ip))
+    return list(dict.fromkeys(addresses))
+
+
+async def resolves_publicly(url: str) -> bool:
+    return bool(await public_addresses(url))
+
+
+BILLING_WORD = re.compile(r'factur|\bcfdi\b|recibo\s+fiscal|billing|invoice', re.I)
+UNRELATED = re.compile(r'encuesta|survey|promoci[oó]n|satisfacci[oó]n|feedback|privacidad|privacy|'
+                       r'calif[ií]canos|opini[oó]n|verificacfdi|paga\s+aqu[ií]', re.I)
+LINK = re.compile(r'''(?<![\w@./-])(?:https?://[^\s<>"']+|www\.[^\s<>"']+|(?:[a-z0-9-]+\.)+(?:com\.mx|org\.mx|gob\.mx|com|mx|org|net|io|coop|shop|store|biz|app)(?=[:/?#\s,;!)\]]|\.(?![a-z0-9-])|$)(?:[:/?#][^\s<>"']*)?)''', re.I)
+
+
+def _printed_link(raw):
+    value = raw.strip().rstrip('.,;!)]')
+    if not value or not LINK.fullmatch(value):
+        return ''
+    if '://' not in value:
+        value = 'https://' + value
+    if not public_portal_origin(value):
+        return ''
+    host = urlsplit(value).hostname
+    excluded = ('sat.gob.mx', 'facebook.com', 'instagram.com', 'whatsapp.com', 'wa.me', 'x.com',
+                'tiktok.com', 'youtube.com', 'forms.gle', 'docs.google.com', 'maps.app.goo.gl')
+    if any(host == domain or host.endswith('.' + domain) for domain in excluded) or UNRELATED.search(value):
+        return ''
+    return value
+
+
+def printed_portals(codes: list[str], text: str) -> tuple[list[str], list[str]]:
+    """Prioritize fiscal links. Other printed sites are review suggestions only."""
+    primary, other, ignored = [], [], set()
+    for raw in codes:
+        link = _printed_link(raw)
+        if link:
+            (primary if BILLING_WORD.search(urlsplit(link).netloc + urlsplit(link).path) else other).append(link)
+    previous = ''
+    for line in text.splitlines():
+        previous_link_end = 0
+        for match in LINK.finditer(line):
+            prefix = line[previous_link_end:match.start()].strip()
+            previous_link_end = match.end()
+            link = _printed_link(match[0])
+            if not link:
+                continue
+            label = prefix[-75:] if prefix else previous[-75:]
+            parts = urlsplit(link)
+            if UNRELATED.search(label) and not BILLING_WORD.search(parts.netloc + parts.path):
+                ignored.add(link)
+            elif BILLING_WORD.search(label) or BILLING_WORD.search(parts.netloc + parts.path) or provider_for_url(link):
+                primary.append(link)
+            else:
+                other.append(link)
+        previous = line.strip()
+    primary = list(dict.fromkeys(link for link in primary if link not in ignored))
+    return primary, list(dict.fromkeys(link for link in other if link not in ignored and link not in primary))
 
 
 def portal_suggestions(codes: list[str], text: str) -> list[str]:
-    links = []
-    for raw in [*codes, *re.findall(r'''(?:https://|\bwww\.)[^\s<>"']+''', text, re.I)]:
-        link = raw.strip().rstrip('.,;)')
-        if link.lower().startswith('www.'):
-            link = 'https://' + link
-        if public_portal_origin(link) and link not in links:
-            links.append(link)
-    return links
+    primary, other = printed_portals(codes, text)
+    return primary + other
 
 CATALOG = {
     "walmart": {

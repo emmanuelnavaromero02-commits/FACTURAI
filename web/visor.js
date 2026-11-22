@@ -1,12 +1,13 @@
 import {installPortalAccounts} from './cuentas-portal.js';
 import {installNavigation} from './navegacion.js';
 
-export function installViewer({api, token, showError, perform, accountEmail = () => ''}) {
+export function installViewer({api, token, showError, perform, accountEmail = () => '', captchaId = () => null}) {
   const byId = id => document.getElementById(id);
   const image = byId('browser-image');
   const take = byId('take-control');
   let browser = {open: false, revision: 0};
   let channel = '';
+  let challengeOwner = '';
   let frameUrl = '';
   let commandTail = Promise.resolve();
   let dragging = false;
@@ -45,8 +46,9 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
 
   function update(value, active) {
     jobActive = active;
-    if (value.revision !== browser.revision) {
+    if (value.revision !== browser.revision || value.mode !== browser.mode || value.job_id !== browser.job_id) {
       channel = '';
+      challengeOwner = '';
       dragging = false;
       releaseFrame();
     }
@@ -128,26 +130,64 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
       headers: {'x-app-token': token(), 'content-type': 'application/json'},
       body: JSON.stringify({channel: previous})}).catch(() => {});
   }
-  window.addEventListener('pagehide', releasePersonal);
+  window.addEventListener('pagehide', () => {
+    if (!channel || !challengeOwner) return releasePersonal();
+    const previous = channel;
+    channel = '';
+    challengeOwner = '';
+    fetch('/api/browser/release', {method:'POST', keepalive:true,
+      headers:{'x-app-token':token(), 'content-type':'application/json'},
+      body:JSON.stringify({channel:previous, abandon:true})}).catch(() => {});
+  });
+  setInterval(async () => {
+    if (!channel || !challengeOwner || document.hidden || byId('screen-navegador').hidden) return;
+    const held = channel;
+    try {
+      const response = await fetch('/api/browser/control/alive', {method:'POST',
+        headers:{'x-app-token':token(), 'content-type':'application/json'},
+        body:JSON.stringify({channel:held, job_id:challengeOwner})});
+      if (response.status === 422 && channel === held) {
+        channel = '';
+        challengeOwner = '';
+        syncControls();
+      }
+    } catch { /* A disconnected device can reacquire the ticket after its inactive lease expires. */ }
+  }, 25000);
   window.addEventListener('hashchange', () => { if (location.hash !== '#navegador') releasePersonal(); });
   document.addEventListener('visibilitychange', () => { if (document.hidden) releasePersonal(); });
 
-  async function acquireControl() {
+  function matchesTicket(key) {
+    return browser.mode === 'job' && browser.job_id === key && browser.open && browser.manual;
+  }
+  async function acquireControl(jobId) {
     if (acquiring) return;
+    if (jobId && !matchesTicket(jobId)) throw Error('Espera al visor de este ticket.');
+    if (jobId && channel) return;
     acquiring = true;
     const revision = browser.revision;
+    const mode = browser.mode;
     try {
-      const result = await api('/api/browser/control', 'POST', {revision});
-      if (browser.revision !== revision || document.hidden || byId('screen-navegador').hidden) {
+      const result = await api('/api/browser/control', 'POST', jobId ? {revision, job_id: jobId} : {revision});
+      if (browser.revision !== revision || browser.mode !== mode || (jobId && !matchesTicket(jobId)) ||
+          document.hidden || byId('screen-navegador').hidden) {
         await api('/api/browser/release', 'POST', {channel: result.channel});
         return;
       }
       channel = result.channel;
+      challengeOwner = jobId || '';
       image.focus();
     } finally {
       acquiring = false;
       syncControls();
     }
+  }
+  async function releaseControl() {
+    const previous = channel;
+    await commandTail;
+    if (!previous || previous !== channel) return;
+    await api('/api/browser/release', 'POST', {channel: previous});
+    if (channel === previous) { channel = ''; challengeOwner = ''; }
+    syncControls();
   }
   image.addEventListener('click', event => {
     if (channel || acquiring || browser.mode !== 'personal' || !browser.manual) return;
@@ -211,12 +251,10 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
     image.focus();
   });
   take.addEventListener('click', () => perform(async () => {
-    if (channel) {
-      const previous = channel;
-      channel = '';
-      await api('/api/browser/release', 'POST', {channel: previous});
-    } else {
-      await acquireControl();
+    if (channel) await releaseControl();
+    else {
+      const key = captchaId();
+      await acquireControl(key && matchesTicket(key) ? key : undefined);
     }
     syncControls();
   }));
@@ -270,5 +308,6 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
   }
   setInterval(frame, 360);
   return {update, hasControl: () => Boolean(channel), openPersonal: navigation.openPersonal,
-    returnToJob: navigation.returnToJob, gmail: navigation.gmail};
+    returnToJob: navigation.returnToJob, gmail: navigation.gmail, acquireControl, releaseControl,
+    returnToCaptcha: id => api('/api/browser/return', 'POST', {channel, job_id: id})};
 }

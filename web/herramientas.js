@@ -44,7 +44,8 @@ export function installReceiptTools({api, el, button, link, perform, gmailConnec
       const source = {pdf: 'Texto del PDF', ocr: 'OCR local', email: 'Texto del correo', codes: 'Códigos impresos'}[result.method];
       $('reader-status').textContent = [source, 'Página ' + result.page + ' de ' + result.pages, result.notice].filter(Boolean).join(' · ');
       $('reader-text').textContent = result.text || 'No se encontró texto legible.';
-      for (const code of new Set([...result.codes, ...result.portal_links])) {
+      const discovered = result.portal_discoveries || [];
+      for (const code of new Set([...result.codes, ...result.portal_links, ...discovered])) {
         const row = el('div', '', 'tool-entry');
         const add = button('Usar código', () => {
           const field = $('receipt-form').elements.billing_codes;
@@ -54,8 +55,9 @@ export function installReceiptTools({api, el, button, link, perform, gmailConnec
           add.disabled = true;
         });
         row.append(el('span', code));
+        if (discovered.includes(code)) row.append(el('span', 'Sugerido por la portada del comercio', 'muted'));
         if (result.codes.includes(code)) row.append(add);
-        if (result.portal_links.includes(code)) {
+        if (result.portal_links.includes(code) || discovered.includes(code)) {
           row.append(button('Usar como portal del ticket', () => {
             const form = $('receipt-form');
             form.elements.provider.value = 'portal_ticket';

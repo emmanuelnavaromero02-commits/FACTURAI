@@ -87,8 +87,8 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.store.get(key)['status'], 'queued')
 
     async def test_unknown_domain_is_never_scheduled_even_after_saving_review(self):
-        key = self.add(source='WhatsApp: ticket.txt')
         link = 'https://facturas.example.org/mi-ticket'
+        key = self.add(source='WhatsApp: ticket.txt', text='Factura en ' + link)
         with patch('facturador.automation.AI.extract', return_value=extracted(provider='unknown', billing_url=link)):
             await self.worker.step()
         row = self.store.get(key)
