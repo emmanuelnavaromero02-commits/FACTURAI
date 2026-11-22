@@ -174,7 +174,7 @@ class RecoveryTests(unittest.TestCase):
         with patch.object(runner, 'schedule') as scheduled:
             result = self.client.post(self.url + '/run', headers=self.headers, json={'consent': True, 'mode': 'manual'})
             result.raise_for_status()
-            scheduled.assert_called_once_with(self.key, PROFILE, False, manual=True)
+            scheduled.assert_called_once_with(self.key, PROFILE, False, manual=True, confirmed_url='')
         self.assertTrue(self.store.queue(self.key, PROFILE))
         self.store.update(self.key, status='blocked')
         row = next(row for row in self.client.get('/api/state').json()['jobs'] if row['id'] == self.key)

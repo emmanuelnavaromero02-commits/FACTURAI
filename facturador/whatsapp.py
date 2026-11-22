@@ -185,6 +185,7 @@ class WhatsAppWeb:
                 if runner.whatsapp is None or runner.whatsapp.is_closed():
                     runner.whatsapp = await runner.context.new_page()
                 page = runner.whatsapp
+                runner.personal_at_revision = None
                 await runner.viewer.show(page, 'WhatsApp Web', manual=False)
             try:
                 if background:

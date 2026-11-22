@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from .catalog import CUSTOM_PORTAL, public_portal_origin
 
 
 def money(value: str | int | Decimal) -> Decimal:
@@ -33,6 +34,15 @@ class Profile(BaseModel):
     regime: str
     cfdi_use: str = "G03"
     email: str
+    whatsapp_phone: str = Field(default='', max_length=32)
+
+    @field_validator('whatsapp_phone')
+    @classmethod
+    def valid_whatsapp_phone(cls, value: str) -> str:
+        number = re.sub(r'[\s().-]', '', value)
+        if number and not re.fullmatch(r'\+[1-9]\d{7,14}', number):
+            raise ValueError('Escribe tu propio número de WhatsApp con + y el código de país.')
+        return number
 
     @field_validator("rfc")
     @classmethod
@@ -82,6 +92,7 @@ class Profile(BaseModel):
 
 class Receipt(BaseModel):
     provider: str = "unknown"
+    portal_url: str = Field(default='', max_length=2048)
     merchant: str = ""
     amount: str = ""
     date: str = ""
@@ -108,6 +119,10 @@ class Receipt(BaseModel):
 
     def ready_errors(self) -> list[str]:
         result = []
+        if self.provider == CUSTOM_PORTAL and not public_portal_origin(self.portal_url):
+            result.append('Indica la dirección HTTPS pública del portal del comercio.')
+        if self.provider != CUSTOM_PORTAL and self.portal_url:
+            result.append('Selecciona el portal del ticket para usar una dirección personalizada.')
         try:
             money(self.amount)
         except ValueError as exc:
@@ -122,11 +137,15 @@ class Receipt(BaseModel):
             result.append("Falta comercio")
         return result
 
+    def merchant_key(self):
+        if self.provider == CUSTOM_PORTAL:
+            return [self.provider, public_portal_origin(self.portal_url), self.merchant.strip().casefold()]
+        return self.provider if self.provider != 'solicitud_directa' else [self.provider, self.merchant.strip().casefold()]
+
     def identity(self) -> str:
         # No normalizar O/0, I/1 ni eliminar guiones de un código comercial.
         keys = sorted(set(x.strip() for x in self.billing_codes if x.strip()))
-        provider_key = self.provider if self.provider != 'solicitud_directa' else [self.provider, self.merchant.strip().casefold()]
-        identity = [provider_key, keys or [self.ticket_number.strip()], self.date]
+        identity = [self.merchant_key(), keys or [self.ticket_number.strip()], self.date]
         return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -139,17 +158,22 @@ class Extraction(BaseModel):
     date: str | None
     ticket_number: str | None
     billing_codes: list[str]
+    billing_url: str | None
     payment_code: str | None
+    payment_evidence: str | None
     details: str
     uncertainties: list[str]
 
 
 class TaxProfileExtraction(BaseModel):
     model_config = ConfigDict(extra='forbid')
+    is_constancia: bool
     rfc: str | None
     name: str | None
     postal_code: str | None
     regime: str | None
+    regimes: list[str]
+    email: str | None
     uncertainties: list[str]
 
 

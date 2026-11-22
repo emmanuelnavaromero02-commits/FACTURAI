@@ -35,7 +35,13 @@
       <div class="dashboard-grid">
         <section class="card receipts">
           <div class="card-heading"><div><h2>Bandeja de tickets</h2><p>De la foto al PDF y XML.</p></div><button id="batch" class="secondary" disabled>Preparar listos</button></div>
-          <div class="table-tools"><div class="filters" aria-label="Filtrar tickets"><button data-filter="all" aria-pressed="true">Todos</button><button data-filter="review" aria-pressed="false">Por revisar</button><button data-filter="working" aria-pressed="false">En trámite</button></div><label class="search"><span aria-hidden="true">⌕</span><input id="ticket-search" type="search" placeholder="Buscar ticket" aria-label="Buscar por comercio o folio"></label></div>
+          <div class="automation-panel">
+            <label class="check-row"><input type="checkbox" id="automation-enabled" disabled aria-describedby="automation-help"><strong>Procesar al subir con ChatGPT</strong></label>
+            <p id="automation-help">Lee los tickets y abre el portal cuando los datos estén completos. La bandeja te avisa si falta algo.</p>
+            <p id="automation-status" role="status"></p>
+            <button id="automation-review" type="button" class="primary" hidden></button>
+          </div>
+          <div class="table-tools"><div class="filters" aria-label="Filtrar tickets"><button data-filter="all" aria-pressed="true">Todos</button><button data-filter="review" aria-pressed="false">Por revisar</button><button data-filter="working" aria-pressed="false">En trámite</button></div><div class="search" role="search" aria-label="Buscar tickets"><span aria-hidden="true">⌕</span><input id="ticket-search" name="buscar-ticket" type="search" autocomplete="off" spellcheck="false" placeholder="Buscar ticket" aria-label="Buscar por comercio o folio"><button id="clear-ticket-search" type="button" aria-label="Borrar búsqueda" title="Borrar búsqueda" hidden>×</button></div></div>
           <div id="tickets"></div>
         </section>
         <aside class="side-cards">
@@ -51,12 +57,17 @@
     </section>
 
     <section class="screen" id="screen-navegador" hidden aria-labelledby="browser-title">
-      <header class="screen-header"><div><h1 id="browser-title">Navegador</h1><p>Abre un portal o continúa el trámite de un ticket.</p></div><div class="buttons"><button id="browser-open" class="primary">Abrir navegador</button><button id="wa-open" class="secondary">Abrir WhatsApp Web</button></div></header>
+      <header class="screen-header"><div><h1 id="browser-title">Navegador</h1><p>La navegación libre conserva tus sesiones de sitios web en el contenedor.</p></div><div class="buttons"><button id="browser-open" class="primary">Navegación libre</button><button id="browser-google" class="secondary">Cuenta de Google</button><button id="wa-open" class="secondary">Abrir WhatsApp Web</button></div></header>
       <div class="browser-grid">
         <section class="card browser-card">
-          <div class="browser-bar"><div class="browser-lights" aria-hidden="true"><i></i><i></i><i></i></div><span id="browser-address">Sin página abierta</span><span class="pill browser-pill" id="browser-state">En espera</span></div>
+          <nav id="browser-tabs" class="browser-tabs" aria-label="Pestañas de navegación libre" hidden><div id="browser-tab-list"></div><button type="button" class="secondary" id="browser-new-tab" title="Nueva pestaña" aria-label="Nueva pestaña">+</button><button type="button" class="secondary" id="browser-close-tab" title="Cerrar pestaña actual" aria-label="Cerrar pestaña actual">×</button></nav>
+          <div class="browser-bar">
+            <div class="browser-navigation"><button id="page-back" class="secondary" aria-label="Atrás" title="Atrás" disabled>←</button><button id="page-forward" class="secondary" aria-label="Adelante" title="Adelante" disabled>→</button><button id="page-reload" class="secondary" aria-label="Recargar página" title="Recargar página" disabled>↻</button></div>
+            <form id="browser-url-form"><input id="browser-url" type="text" enterkeyhint="go" aria-label="Buscar en Google o escribir una dirección" placeholder="Buscar en Google o escribir una dirección" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="2048" required><button id="browser-go" class="secondary" type="submit">Ir</button></form>
+          </div>
+          <div class="browser-location"><span id="browser-address">Sin página abierta</span><span class="pill browser-pill" id="browser-state">En espera</span></div>
           <div class="browser-stage">
-            <div id="browser-empty" class="empty small-empty"><span class="empty-symbol" aria-hidden="true">⊞</span><h3>Sin página abierta</h3><p>Abre el navegador para elegir un comercio, o prepara un ticket desde la bandeja.</p></div>
+            <div id="browser-empty" class="empty small-empty"><span class="empty-symbol" aria-hidden="true">⊞</span><h3>Sin página abierta</h3><p>Escribe una dirección o abre tu cuenta de Google.</p></div>
             <img id="browser-image" alt="Página en vivo del navegador" tabindex="0" draggable="false" hidden>
             <div id="browser-loading" class="browser-loading" hidden>Abriendo la página…</div>
           </div>
@@ -66,14 +77,13 @@
               <input id="portal-file" type="file" accept=".pdf,.jpg,.jpeg,.png,.webp"></label>
             <div class="buttons"><button id="upload-send" class="primary" disabled>Adjuntar al portal</button><button id="upload-dismiss" class="secondary">Cancelar</button></div>
           </div>
-          <div class="browser-controls"><button id="take-control" class="primary" disabled>Tomar control</button><button id="wa-capture" class="secondary" disabled>Importar foto abierta</button><span id="browser-hint">El panel muestra la misma sesión que usa el facturador.</span></div>
+          <div class="browser-controls"><button id="browser-return" class="primary" hidden>Volver al trámite</button><button id="take-control" class="secondary" disabled>Tomar control</button><button id="wa-capture" class="secondary" hidden>Importar foto abierta</button><span id="browser-hint"></span></div>
           <div id="browser-tools" class="buttons tool-strip" hidden>
-            <button id="page-back" class="secondary">Atrás</button><button id="page-forward" class="secondary">Adelante</button>
             <button id="page-text" class="secondary">Leer página</button><button id="page-png" class="secondary">Guardar captura PNG</button>
           </div>
           <form id="paste-form" class="paste-form" hidden><label for="remote-text">Pegar texto en el campo activo</label><div class="buttons"><input id="remote-text" type="password" autocomplete="off" maxlength="2000" required><button class="secondary">Escribir</button></div></form>
         </section>
-        <section class="card task-card"><h2>Trámite actual</h2><div id="browser-task"><p class="muted">El resumen, la forma de pago y las intervenciones aparecen aquí.</p></div>
+        <section class="card task-card"><h2 id="browser-task-title">Trámite actual</h2><div id="browser-task"><p class="muted">El resumen, la forma de pago y las intervenciones aparecen aquí.</p></div>
           <button id="browser-downloads" class="secondary wide-button">Descargas manuales</button></section>
       </div>
     </section>
@@ -84,9 +94,9 @@
     </section>
 
     <section class="screen" id="screen-portales" hidden aria-labelledby="portals-title">
-      <header class="screen-header"><div><h1 id="portals-title">Portales</h1><p>Comercios disponibles para preparar una solicitud.</p></div><label class="search"><span aria-hidden="true">⌕</span><input id="portal-search" type="search" placeholder="Buscar comercio" aria-label="Buscar portal"></label></header>
+      <header class="screen-header"><div><h1 id="portals-title">Portales</h1><p>Usa la dirección que indica el comercio en el ticket.</p></div></header>
       <form id="portal-link-form" class="buttons tool-strip"><label>Enlace impreso en el ticket<input id="ticket-url" type="url" maxlength="2048" required></label><button class="secondary">Abrir enlace en el navegador</button></form>
-      <div class="portal-list" id="portal-list"></div>
+      <details><summary>Consultar comercios guardados</summary><button type="button" class="secondary" id="open-catalog">Abrir catálogo en el navegador</button><label class="search">Buscar comercio<input id="portal-search" type="search" aria-label="Buscar portal"></label><div class="portal-list" id="portal-list"></div></details>
     </section>
 
     <section class="screen" id="screen-ajustes" hidden aria-labelledby="settings-title">
@@ -97,15 +107,18 @@
             <div class="buttons"><button id="check-tools" class="secondary">Comprobar herramientas</button><button id="restart-browser" class="secondary">Reiniciar navegador</button></div>
             <p id="tools-status" role="status"></p><dl id="tools-report" class="diagnostic-list"></dl>
           </div></section>
-        <section class="card settings-card"><div class="card-heading"><div><h2>Datos fiscales</h2><p>Captúralos como aparecen en tu constancia.</p></div></div>
-          <form id="profile" class="settings-body"><div class="fields">
+        <section class="card settings-card"><div class="card-heading"><div><h2>Datos fiscales</h2><p>Sube tu constancia del SAT en PDF o foto para llenar los datos del receptor.</p></div></div>
+          <form id="profile" class="settings-body"><div class="buttons"><button id="upload-csf" class="primary" type="button">Subir constancia</button><button id="read-csf" class="secondary" type="button">Leer con ChatGPT</button></div>
+          <p id="csf-status" role="status"></p><div class="fields">
             <label>RFC<input name="rfc" required maxlength="13" autocomplete="off"></label>
             <label>Código postal<input name="postal_code" required pattern="[0-9]{5}" inputmode="numeric" maxlength="5"></label>
             <label class="full">Nombre o razón social<input name="name" required maxlength="180"></label>
             <label>Régimen fiscal<input name="regime" required inputmode="numeric" pattern="[0-9]{3}" maxlength="3" placeholder="612"></label>
-            <label>Uso del CFDI<input name="cfdi_use" value="G03" required maxlength="5"></label>
+            <label id="csf-regime-row" class="full" hidden>Regímenes de la constancia<select id="csf-regimes"></select></label>
+            <label>Uso del CFDI<input name="cfdi_use" required maxlength="5" placeholder="Ej. G03"></label>
             <label class="full">Correo de entrega<input name="email" type="email" required maxlength="200"></label>
-          </div><div class="buttons"><button class="primary">Guardar datos fiscales</button><button id="read-csf-local" class="secondary" type="button">Leer constancia localmente</button><button id="read-csf" class="secondary" type="button">Extraer datos con ChatGPT</button></div></form>
+            <label class="full">Tu WhatsApp para registros que pidan teléfono (opcional)<input name="whatsapp_phone" type="tel" maxlength="32" placeholder="+52…"></label>
+          </div><div class="buttons"><button class="primary">Guardar datos fiscales</button><button id="read-csf-local" class="secondary" type="button">Revisar texto de la constancia</button></div></form>
         </section>
         <section class="card settings-card"><div class="card-heading"><div><h2>Suscripción de ChatGPT</h2><p>Usa el cupo de la cuenta que autorices.</p></div><span class="pill" id="plan-status">Por conectar</span></div>
           <div class="settings-body"><p id="plan-email" class="muted"></p><p id="plan-message" class="muted"></p><div class="buttons"><button id="pod-connect" class="primary" data-oai-siwc-button>Continuar con ChatGPT</button><button id="pod-other" class="plain" hidden>Usar otra cuenta</button><button id="pod-disconnect" class="secondary" hidden>Desconectar</button><button id="pod-retry" class="secondary" hidden>Revisar cupo</button></div>
@@ -128,6 +141,7 @@
     <button type="button" id="local-reader" class="secondary">Leer texto, QR y barras en el contenedor</button>
     <div class="fields">
       <label>Portal<select name="provider" required></select></label><label>Comercio<input name="merchant" required maxlength="180"></label>
+      <label id="receipt-portal-row" class="full">Dirección de facturación del ticket<input name="portal_url" type="url" maxlength="2048" placeholder="https://"></label>
       <label>Fecha<input name="date" type="date" required></label><label>Importe facturable<input name="amount" inputmode="decimal" required maxlength="20"></label>
       <label>Forma de pago<select name="payment_code" required><option value="">Seleccionar</option><option value="01">01 · Efectivo</option><option value="04">04 · Crédito</option><option value="28">28 · Débito</option><option value="03">03 · Transferencia</option><option value="99">99 · Por definir</option></select></label>
       <label>Folio<input name="ticket_number" maxlength="180"></label>

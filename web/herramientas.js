@@ -44,7 +44,7 @@ export function installReceiptTools({api, el, button, link, perform, gmailConnec
       const source = {pdf: 'Texto del PDF', ocr: 'OCR local', email: 'Texto del correo', codes: 'Códigos impresos'}[result.method];
       $('reader-status').textContent = [source, 'Página ' + result.page + ' de ' + result.pages, result.notice].filter(Boolean).join(' · ');
       $('reader-text').textContent = result.text || 'No se encontró texto legible.';
-      for (const code of result.codes) {
+      for (const code of new Set([...result.codes, ...result.portal_links])) {
         const row = el('div', '', 'tool-entry');
         const add = button('Usar código', () => {
           const field = $('receipt-form').elements.billing_codes;
@@ -53,11 +53,21 @@ export function installReceiptTools({api, el, button, link, perform, gmailConnec
           add.textContent = 'Agregado';
           add.disabled = true;
         });
-        row.append(el('span', code), add);
+        row.append(el('span', code));
+        if (result.codes.includes(code)) row.append(add);
         if (result.portal_links.includes(code)) {
+          row.append(button('Usar como portal del ticket', () => {
+            const form = $('receipt-form');
+            form.elements.provider.value = 'portal_ticket';
+            form.elements.provider.onchange();
+            form.elements.portal_url.value = code;
+            $('reader-dialog').close();
+          }));
           row.append(button('Cargar en el navegador', async () => {
             try {
-              await api('/api/browser/open', 'POST', {url: code});
+              const origin = new URL(code).origin;
+              if (!window.confirm('¿Abrir el portal de este comercio en ' + origin + '?')) return;
+              await api('/api/browser/open', 'POST', {url: code, confirmed_origin: origin});
               $('reader-status').textContent = 'Enlace abierto en la sección Navegador.';
             } catch (error) {
               $('reader-status').textContent = error.message;

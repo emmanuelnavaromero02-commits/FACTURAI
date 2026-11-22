@@ -146,10 +146,11 @@ class BrowserView:
             self.require_control(channel)
             return await self.page.screenshot(type='png', scale='css', timeout=6000)
 
-    async def history(self, channel: str, direction: Literal['back', 'forward']):
+    async def history(self, channel: str, direction: Literal['back', 'forward', 'reload'], *, personal=False):
         async with self.commands:
-            self.require_control(channel)
-            navigate = self.page.go_back if direction == 'back' else self.page.go_forward
+            if not (personal and self.open and self.manual and not self.channel and not channel and not self.dialog):
+                self.require_control(channel)
+            navigate = getattr(self.page, {'back': 'go_back', 'forward': 'go_forward', 'reload': 'reload'}[direction])
             try:
                 await navigate(wait_until='domcontentloaded', timeout=10_000)
             except Exception as exc:

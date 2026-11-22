@@ -31,15 +31,17 @@ async def smoke():
             await expect(page.locator('#reader-text')).to_contain_text('50.00')
             await page.get_by_role('button', name='Cerrar lectura').click()
             await page.keyboard.press('Escape')
-            await page.get_by_role('link', name='Navegador', exact=True).click()
-            await page.get_by_role('button', name='Abrir navegador', exact=True).click()
+            await page.get_by_role('link', name='Portales', exact=True).click()
+            await page.get_by_text('Consultar comercios guardados', exact=True).click()
+            await page.get_by_role('button', name='Abrir catálogo en el navegador', exact=True).click()
             await expect(page.get_by_alt_text('Página en vivo del navegador')).to_be_visible()
             await expect(page.locator('#browser-address')).to_have_text('Portales de facturación')
             await page.get_by_role('button', name='Tomar control').click()
             await expect(page.get_by_role('button', name='Devolver control')).to_be_visible()
 
             state = await (await page.request.get(url + '/api/state')).json()
-            assert state['browser']['engine'] == 'Chromium', state['browser']
+            expected = 'Google Chrome' if os.getenv('FACTURADOR_CHROME_HEADED') == '1' else 'Chromium'
+            assert state['browser']['engine'] == os.getenv('EXPECTED_ENGINE', expected), state['browser']
             revision = state['browser']['revision']
             headers = {'x-app-token': state['token']}
 
@@ -92,7 +94,7 @@ async def smoke():
             fiscal_pdf = await sample.pdf()
             await sample.close()
             async with page.expect_file_chooser() as upload:
-                await page.get_by_role('button', name='Leer constancia localmente').click()
+                await page.get_by_role('button', name='Revisar texto de la constancia').click()
             await (await upload.value).set_files({'name': 'constancia.pdf', 'mimeType': 'application/pdf', 'buffer': fiscal_pdf})
             await expect(page.locator('#reader-text')).to_contain_text('XAXX010101000')
             await page.get_by_role('button', name='Cerrar lectura').click()

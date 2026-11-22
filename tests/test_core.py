@@ -252,7 +252,8 @@ class AppTests(unittest.TestCase):
 class FakeLocator:
     def __init__(self,page): self.page=page
     async def count(self): return 1
-    async def click(self):
+    async def click(self, *, trial=False, timeout=None):
+        if trial: return
         self.page.clicks+=1
         if self.page.success: self.page.body='generic: Factura emitida'
     async def aria_snapshot(self): return self.page.body

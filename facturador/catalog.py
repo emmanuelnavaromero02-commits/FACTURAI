@@ -1,4 +1,59 @@
+import asyncio
+import ipaddress
+import re
+import socket
 from urllib.parse import urlsplit
+
+CUSTOM_PORTAL = 'portal_ticket'
+
+
+def public_portal_origin(url: str) -> str | None:
+    """HTTPS origin displayed to the operator; never accept credentials or browser URL quirks."""
+    if not isinstance(url, str) or len(url) > 2048 or re.search(r'[\x00-\x20\x7f\\]', url):
+        return None
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ''
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme != 'https' or parts.username is not None or parts.password is not None or port == 0:
+        return None
+    labels = host.split('.')
+    if len(labels) < 2 or len(host) > 253 or not re.fullmatch(r'[a-z]{2,63}|xn--[a-z0-9-]+', labels[-1]):
+        return None
+    if labels[-1] in {'local', 'localhost', 'internal', 'lan', 'home', 'test', 'invalid', 'onion', 'arpa'}:
+        return None
+    if not all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in labels):
+        return None
+    return 'https://' + host + (f':{port}' if port not in (None, 443) else '')
+
+
+async def resolves_publicly(url: str) -> bool:
+    if not public_portal_origin(url):
+        return False
+    parts = urlsplit(url)
+    try:
+        results = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(
+            parts.hostname, parts.port or 443, type=socket.SOCK_STREAM), timeout=5)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    for _, _, _, _, address in results:
+        ip = ipaddress.ip_address(address[0])
+        if not ip.is_global or ip.is_multicast or str(ip) == '168.63.129.16':
+            return False
+    return bool(results)
+
+
+def portal_suggestions(codes: list[str], text: str) -> list[str]:
+    links = []
+    for raw in [*codes, *re.findall(r'''(?:https://|\bwww\.)[^\s<>"']+''', text, re.I)]:
+        link = raw.strip().rstrip('.,;)')
+        if link.lower().startswith('www.'):
+            link = 'https://' + link
+        if public_portal_origin(link) and link not in links:
+            links.append(link)
+    return links
 
 CATALOG = {
     "walmart": {
@@ -115,7 +170,10 @@ CATALOG = {
 }
 
 
-def allowed_url(url: str, provider: str) -> bool:
+def allowed_url(url: str, provider: str, portal_url: str = '') -> bool:
+    if provider == CUSTOM_PORTAL:
+        origin = public_portal_origin(portal_url)
+        return origin is not None and public_portal_origin(url) == origin
     try:
         parts = urlsplit(url)
         if parts.scheme != "https" or parts.username or parts.password:

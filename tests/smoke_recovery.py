@@ -69,7 +69,8 @@ async def smoke():
 
         async def start_test_browser():
             await start()
-            assert runner.engine == os.getenv('EXPECTED_ENGINE', 'Chromium'), runner.engine
+            expected = 'Google Chrome' if os.getenv('FACTURADOR_CHROME_HEADED') == '1' else 'Chromium'
+            assert runner.engine == os.getenv('EXPECTED_ENGINE', expected), runner.engine
             if not contexts or contexts[-1] is not runner.context:
                 contexts.append(runner.context)
                 await runner.context.route(origin + '/**', merchant)

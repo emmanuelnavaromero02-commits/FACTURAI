@@ -16,6 +16,7 @@ from urllib.parse import urlencode
 import httpx
 
 from .auth import read_json, write_private
+from .read_http import read_with_retry
 from .ingest import IMAGE_EXT, MAX_UPLOAD, save_inputs, write_original
 
 SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
@@ -119,9 +120,12 @@ def access_token(root: Path) -> str:
         return record['token']
 
 
+def _get(client, url, params):
+    return read_with_retry(lambda: client.get(url, params=params).raise_for_status())
+
+
 def _ids(client, query: str, limit: int) -> list[str]:
-    response = client.get(GMAIL, params={'q': query, 'maxResults': limit})
-    response.raise_for_status()
+    response = _get(client, GMAIL, {'q': query, 'maxResults': limit})
     return [item['id'] for item in response.json().get('messages', [])[:limit]
             if re.fullmatch(r'[A-Za-z0-9_-]{1,200}', item.get('id', ''))]
 
@@ -129,8 +133,7 @@ def _ids(client, query: str, limit: int) -> list[str]:
 def _raw_message(client, message_id: str):
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,200}', message_id):
         raise ValueError('Mensaje de Gmail desconocido.')
-    payload = client.get(GMAIL + '/' + message_id, params={'format': 'raw'})
-    payload.raise_for_status()
+    payload = _get(client, GMAIL + '/' + message_id, {'format': 'raw'})
     raw = payload.json()['raw']
     if len(raw) > 50 * 1024 * 1024:
         return None
@@ -144,12 +147,13 @@ def search_tickets(root: Path, query: str) -> list[dict]:
         with httpx.Client(headers={'Authorization': 'Bearer ' + access_token(root)}, timeout=30) as client:
             results = []
             for message_id in _ids(client, query.strip(), 10):
-                meta = client.get(GMAIL + '/' + message_id, params={'format': 'metadata',
+                meta = _get(client, GMAIL + '/' + message_id, {'format': 'metadata',
                                   'metadataHeaders': ['Subject', 'From', 'Date']})
-                meta.raise_for_status()
-                headers = {h['name'].lower(): h['value'] for h in meta.json().get('payload', {}).get('headers', [])}
+                metadata = meta.json()
+                headers = {h['name'].lower(): h['value'] for h in metadata.get('payload', {}).get('headers', [])}
                 results.append({'id': message_id, 'subject': headers.get('subject', '')[:250],
-                                'sender': headers.get('from', '')[:250], 'date': headers.get('date', '')[:150]})
+                                'sender': headers.get('from', '')[:250], 'date': headers.get('date', '')[:150],
+                                'received_ms': int(metadata.get('internalDate') or 0)})
             return results
     except httpx.HTTPError as exc:
         raise ValueError('Gmail no completó la búsqueda. Revisa la conexión y vuelve a intentar.') from exc
@@ -176,7 +180,7 @@ class _MailText(HTMLParser):
             self.lines.append(data)
 
 
-def ticket_parts(root: Path, message_id: str) -> dict:
+def read_selected_message(root: Path, message_id: str):
     try:
         with httpx.Client(headers={'Authorization': 'Bearer ' + access_token(root)}, timeout=30) as client:
             msg = _raw_message(client, message_id)
@@ -184,6 +188,11 @@ def ticket_parts(root: Path, message_id: str) -> dict:
         raise ValueError('Gmail no pudo abrir el mensaje seleccionado.') from exc
     if msg is None:
         raise ValueError('El correo supera el límite de tamaño de importación.')
+    return msg
+
+
+def ticket_parts(root: Path, message_id: str) -> dict:
+    msg = read_selected_message(root, message_id)
     return receipt_mail_parts(msg, message_id)
 
 

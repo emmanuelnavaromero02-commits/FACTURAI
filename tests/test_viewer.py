@@ -39,10 +39,17 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
         code = 'ABCDE1234567890000'
         receipt = Receipt(provider='capufe', billing_codes=[code], payment_code='01', date='2026-11-21', amount='50.00')
         values = {'rfc': profile.rfc, 'name': profile.name, 'postal': profile.postal_code, 'email': profile.email,
-                  'regime': profile.regime, 'use': profile.cfdi_use, 'defaultGrouping': True,
+                  'regime': [profile.regime, profile.regime], 'use': [profile.cfdi_use, profile.cfdi_use],
+                  'payment': ['01', 'Efectivo'], 'defaultGrouping': True,
                   'rows': [['', code, 'PLAYAS DE TIJUANA', '2026-noviembre-21 18:02:30 pm', '$50.00']]}
         page = SimpleNamespace(evaluate=AsyncMock(return_value=values))
         self.assertTrue(await capufe_proof(page, profile, receipt))
+        values['payment'] = None
+        self.assertFalse(await capufe_proof(page, profile, receipt))
+        self.assertTrue(await capufe_proof(page, profile, receipt, preparation=True))
+        values['payment'] = ['04', 'Crédito']
+        self.assertFalse(await capufe_proof(page, profile, receipt, preparation=True))
+        values['payment'] = ['01', 'Efectivo']
         values['rows'][0][3] = '2026-noviembre-20 18:02:30 pm'
         self.assertFalse(await capufe_proof(page, profile, receipt))
         values['rows'][0][3] = '2026-noviembre-21 18:02:30 pm'

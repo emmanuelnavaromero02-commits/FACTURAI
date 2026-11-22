@@ -18,18 +18,21 @@
 </head>
 <body>
   <h1>Portales de facturación</h1>
-  <label for="buscar">Buscar comercio</label>
+  <p>Introduce la dirección del ticket en el campo «Dirección del portal de facturación» del panel.</p>
+  <label for="buscar">Buscar en los comercios guardados</label>
   <input id="buscar" type="search" autocomplete="off" autofocus>
   <ul><!--PORTALES--></ul>
   <p id="vacio" hidden>Ningún comercio coincide con tu búsqueda.</p>
   <script>
     const search = document.getElementById('buscar');
     const rows = Array.from(document.querySelectorAll('li'));
-    search.addEventListener('input', () => {
+    function filter() {
       const text = search.value.trim().toLocaleLowerCase('es');
-      for (const row of rows) row.hidden = !row.textContent.toLocaleLowerCase('es').includes(text);
-      document.getElementById('vacio').hidden = rows.some(row => !row.hidden);
-    });
+      for (const row of rows) row.hidden = !text || !row.textContent.toLocaleLowerCase('es').includes(text);
+      document.getElementById('vacio').hidden = !text || rows.some(row => !row.hidden);
+    }
+    search.addEventListener('input', filter);
+    filter();
   </script>
 </body>
 </html>

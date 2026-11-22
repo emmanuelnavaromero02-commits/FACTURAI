@@ -18,7 +18,8 @@ from facturador.models import Extraction
 
 
 REPLY = {'is_receipt': True, 'provider': 'capufe', 'merchant': 'CAPUFE', 'amount': '50.00', 'date': '2026-11-21',
-         'ticket_number': '0000042', 'billing_codes': [], 'payment_code': '01', 'details': '', 'uncertainties': []}
+         'ticket_number': '0000042', 'billing_codes': [], 'billing_url': None,
+         'payment_code': '01', 'payment_evidence': 'Pago en efectivo', 'details': '', 'uncertainties': []}
 
 
 class SubscriptionTests(unittest.TestCase):

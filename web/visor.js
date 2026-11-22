@@ -1,4 +1,7 @@
-export function installViewer({api, token, showError, perform}) {
+import {installPortalAccounts} from './cuentas-portal.js';
+import {installNavigation} from './navegacion.js';
+
+export function installViewer({api, token, showError, perform, accountEmail = () => ''}) {
   const byId = id => document.getElementById(id);
   const image = byId('browser-image');
   const take = byId('take-control');
@@ -10,8 +13,10 @@ export function installViewer({api, token, showError, perform}) {
   let lastMove = 0;
   let updating = false;
   let jobActive = false;
-  let changingPage = false;
+  let acquiring = false;
   let uploadId = '';
+  const syncPortalAccount = installPortalAccounts({api, accountEmail, control: () => ({channel, browser})});
+  const navigation = installNavigation({api, perform, current: () => ({browser, channel, active: jobActive})});
 
   function releaseFrame() {
     if (frameUrl) URL.revokeObjectURL(frameUrl);
@@ -20,12 +25,13 @@ export function installViewer({api, token, showError, perform}) {
   }
 
   function syncControls() {
-    take.disabled = !browser.open || !browser.manual || Boolean(browser.dialog);
+    syncPortalAccount();
+    navigation.update();
+    take.disabled = !browser.open || !browser.manual || acquiring || Boolean(browser.dialog);
     take.textContent = channel ? 'Devolver control' : 'Tomar control';
     image.classList.toggle('controlling', Boolean(channel));
     byId('paste-form').hidden = !channel;
     byId('browser-tools').hidden = !channel;
-    byId('page-back').disabled = byId('page-forward').disabled = jobActive || changingPage;
     const currentUpload = channel ? (browser.upload?.id || '') : '';
     if (uploadId !== currentUpload) byId('portal-file').value = '';
     uploadId = currentUpload;
@@ -33,7 +39,8 @@ export function installViewer({api, token, showError, perform}) {
     byId('upload-origin').textContent = uploadId ? browser.upload.origin : '';
     byId('upload-send').disabled = !uploadId || !byId('portal-file').files.length;
     byId('browser-hint').textContent = channel ? 'Haz clic en la página y usa el teclado.' :
-      browser.manual ? 'Toma el control para completar el paso.' : 'Vista en vivo de la sesión del facturador.';
+      browser.mode === 'personal' ? (browser.url ? 'Haz clic en la página para usarla.' : '') :
+      browser.manual ? 'Toma el control para completar el paso.' : browser.open ? 'Vista en vivo del trámite.' : '';
   }
 
   function update(value, active) {
@@ -51,29 +58,33 @@ export function installViewer({api, token, showError, perform}) {
     } else if (value.open) {
       byId('browser-address').textContent = value.label;
     }
-    const label = value.manual ? 'Intervención' : value.open ? 'En vivo' : 'En espera';
+    if (value.mode === 'personal') byId('browser-address').textContent = 'Navegación libre';
+    const label = value.mode === 'personal' ? 'Perfil personal' : value.manual ? 'Intervención' : value.open ? 'En vivo' : 'En espera';
     byId('browser-state').textContent = value.open && value.engine ? label + ' · ' + value.engine : label;
-    byId('browser-empty').hidden = value.open;
-    byId('browser-loading').hidden = !value.open || Boolean(frameUrl) || Boolean(value.dialog);
-    image.hidden = !value.open || !frameUrl;
+    const blankTab = value.mode === 'personal' && !value.url;
+    byId('browser-empty').hidden = value.open && !blankTab;
+    byId('browser-loading').hidden = !value.open || blankTab || Boolean(frameUrl) || Boolean(value.dialog);
+    image.hidden = !value.open || blankTab || !frameUrl;
     byId('native-dialog').hidden = !value.dialog;
     if (value.dialog) {
       byId('native-text').textContent = value.dialog.text;
       byId('native-yes').hidden = value.dialog.type === 'prompt' || value.dialog.type === 'beforeunload';
     }
-    byId('wa-capture').disabled = active || value.label !== 'WhatsApp Web';
+    byId('wa-capture').hidden = value.mode !== 'whatsapp' && value.label !== 'WhatsApp Web';
+    byId('wa-capture').disabled = active;
     syncControls();
   }
 
   async function frame() {
-    if (!browser.open || browser.dialog || document.hidden || byId('screen-navegador').hidden || updating) return;
+    if (!browser.open || (browser.mode === 'personal' && !browser.url) || browser.dialog ||
+        document.hidden || byId('screen-navegador').hidden || updating) return;
     updating = true;
     const revision = browser.revision;
     try {
       const response = await fetch(`/api/browser/frame?revision=${revision}`, {headers: {'x-app-token': token()}});
       if (response.status === 200 && revision === browser.revision) {
         const blob = await response.blob();
-        if (revision !== browser.revision) return;
+        if (revision !== browser.revision || !browser.open) return;
         const previous = frameUrl;
         frameUrl = URL.createObjectURL(blob);
         image.src = frameUrl;
@@ -91,9 +102,11 @@ export function installViewer({api, token, showError, perform}) {
     commandTail = commandTail.then(async () => {
       if (channel === lease) await api('/api/browser/input', 'POST', {...command, channel: lease});
     }).catch(error => {
-      channel = '';
-      dragging = false;
-      syncControls();
+      if (channel === lease) {
+        channel = '';
+        dragging = false;
+        syncControls();
+      }
       showError(error.message);
     });
     return commandTail;
@@ -105,6 +118,48 @@ export function installViewer({api, token, showError, perform}) {
             y: Math.min(1, Math.max(0, (event.clientY - box.top) / box.height))};
   }
 
+  function releasePersonal() {
+    if (browser.mode !== 'personal' || !channel) return;
+    const previous = channel;
+    channel = '';
+    dragging = false;
+    syncControls();
+    fetch('/api/browser/release', {method: 'POST', keepalive: true,
+      headers: {'x-app-token': token(), 'content-type': 'application/json'},
+      body: JSON.stringify({channel: previous})}).catch(() => {});
+  }
+  window.addEventListener('pagehide', releasePersonal);
+  window.addEventListener('hashchange', () => { if (location.hash !== '#navegador') releasePersonal(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releasePersonal(); });
+
+  async function acquireControl() {
+    if (acquiring) return;
+    acquiring = true;
+    const revision = browser.revision;
+    try {
+      const result = await api('/api/browser/control', 'POST', {revision});
+      if (browser.revision !== revision || document.hidden || byId('screen-navegador').hidden) {
+        await api('/api/browser/release', 'POST', {channel: result.channel});
+        return;
+      }
+      channel = result.channel;
+      image.focus();
+    } finally {
+      acquiring = false;
+      syncControls();
+    }
+  }
+  image.addEventListener('click', event => {
+    if (channel || acquiring || browser.mode !== 'personal' || !browser.manual) return;
+    const point = coords(event);
+    perform(async () => {
+      await acquireControl();
+      if (channel) {
+        await send({kind: 'down', ...point});
+        await send({kind: 'up', ...point});
+      }
+    });
+  });
   image.addEventListener('pointerdown', event => {
     if (!channel || event.button !== 0) return;
     event.preventDefault();
@@ -161,28 +216,10 @@ export function installViewer({api, token, showError, perform}) {
       channel = '';
       await api('/api/browser/release', 'POST', {channel: previous});
     } else {
-      const result = await api('/api/browser/control', 'POST', {revision: browser.revision});
-      channel = result.channel;
-      image.focus();
+      await acquireControl();
     }
     syncControls();
   }));
-  for (const [id, direction] of [['page-back', 'back'], ['page-forward', 'forward']]) {
-    byId(id).onclick = async () => {
-      if (!channel || changingPage) return;
-      changingPage = true;
-      syncControls();
-      try {
-        const result = await api('/api/browser/history', 'POST', {channel, direction});
-        update(result, jobActive);
-      } catch (error) {
-        showError(error.message);
-      } finally {
-        changingPage = false;
-        syncControls();
-      }
-    };
-  }
   byId('page-png').onclick = () => perform(async () => {
     const blob = await api('/api/browser/screenshot', 'POST', {channel});
     const url = URL.createObjectURL(blob);
@@ -232,5 +269,6 @@ export function installViewer({api, token, showError, perform}) {
     byId(id).addEventListener('click', () => perform(() => api('/api/browser/dialog', 'POST', {dialog_id: browser.dialog.id, accept})));
   }
   setInterval(frame, 360);
-  return {update};
+  return {update, hasControl: () => Boolean(channel), openPersonal: navigation.openPersonal,
+    returnToJob: navigation.returnToJob};
 }

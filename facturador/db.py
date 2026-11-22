@@ -15,6 +15,9 @@ def now() -> str:
 
 
 EDITABLE = {"new", "review", "ready", "blocked", "external"}
+AUTO_ELIGIBLE = """historical=0 AND source_path IS NOT NULL AND billing_profile IS NULL
+    AND issue_attempted=0 AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL
+    AND COALESCE(json_extract(receipt,'$.source'),'') NOT LIKE 'Ejemplo:%'"""
 
 
 class Store:
@@ -50,6 +53,14 @@ class Store:
             if 'issuance_seen' not in columns:
                 db.execute('ALTER TABLE jobs ADD COLUMN issuance_seen INTEGER NOT NULL DEFAULT 0')
                 db.execute("UPDATE jobs SET issuance_seen=1 WHERE uuid IS NOT NULL OR status IN ('verified','issued_waiting_files')")
+            if 'auto_stage' not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN auto_stage TEXT NOT NULL DEFAULT ''")
+            if 'confirmed_payment' not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN confirmed_payment TEXT NOT NULL DEFAULT ''")
+                db.execute("""UPDATE jobs SET confirmed_payment=COALESCE(json_extract(receipt, '$.payment_code'),'')
+                              WHERE (status='ready' AND message='Revisado') OR status='external'""")
+            db.execute("CREATE INDEX IF NOT EXISTS jobs_auto_inbox ON jobs(status,auto_stage,created,id) "
+                       "WHERE historical=0 AND billing_profile IS NULL")
         self.path.chmod(0o600)
 
     @contextmanager
@@ -94,6 +105,11 @@ class Store:
         with self.connect() as db:
             db.execute("INSERT INTO events(job_id,at,kind,detail) VALUES(?,?,?,?)", (key, now(), kind, detail[:5000]))
 
+    def running_message(self, key: str, message: str):
+        with self.connect() as db:
+            db.execute("UPDATE jobs SET message=?,updated=? WHERE id=? AND status='running'",
+                       (message, now(), key))
+
     def update(self, key: str, **fields):
         allowed = {"status", "message", "uuid", "pdf", "xml", "receipt", "identity"}
         if not fields or set(fields) - allowed:
@@ -106,26 +122,71 @@ class Store:
         with self.connect() as db:
             db.execute("UPDATE jobs SET " + ",".join(f"{x}=?" for x in fields) + " WHERE id=?", (*fields.values(), key))
 
-    def save_receipt(self, key: str, receipt: Receipt, ready: bool = False):
+    def auto_candidates(self, status: str, *, stage: str = ''):
+        with self.connect() as db:
+            row = db.execute(f"SELECT * FROM jobs WHERE {AUTO_ELIGIBLE} AND status=? AND auto_stage=? "
+                             "ORDER BY created,id LIMIT 1", (status, stage)).fetchone()
+            return self.decode(row) if row else None
+
+    def claim_read(self, key: str, automatic: bool):
+        claim = 'reading:' + uuid.uuid4().hex
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = self.decode(db.execute('SELECT * FROM jobs WHERE id=?', (key,)).fetchone())
+            if row['auto_stage'].startswith('reading:'):
+                raise ValueError('Ya hay una lectura en curso para este ticket.')
+            if (row['status'] not in EDITABLE or row['historical'] or row['issue_attempted']
+                    or row['human_exposed'] or row['issuance_seen'] or row['uuid']):
+                raise ValueError('Este expediente ya está en proceso o emitido.')
+            if automatic:
+                eligible = db.execute(f"SELECT 1 FROM jobs WHERE id=? AND {AUTO_ELIGIBLE} "
+                                      "AND ((status='new' AND auto_stage='') OR "
+                                      "(status='review' AND auto_stage='offline'))", (key,)).fetchone()
+                if not eligible:
+                    return None
+            db.execute('UPDATE jobs SET auto_stage=? WHERE id=?', (claim, key))
+        return row, claim
+
+    def finish_read(self, key: str, claim: str, status: str, message: str, stage: str = ''):
+        with self.connect() as db:
+            db.execute("UPDATE jobs SET auto_stage=?,status=?,message=?,updated=? WHERE id=? AND auto_stage=? "
+                       "AND status IN ('new','review','ready','external','blocked') AND issue_attempted=0 "
+                       "AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL",
+                       (stage, status, message, now(), key, claim))
+        return self.get(key)
+
+    def note_review(self, row: dict, message: str, *, keep_ready: bool = False):
+        with self.connect() as db:
+            db.execute(f"UPDATE jobs SET auto_stage='review',status=?,message=?,updated=? WHERE id=? "
+                       f"AND {AUTO_ELIGIBLE} AND auto_stage='' AND status=? AND updated=?",
+                       ('ready' if keep_ready else 'review', message, now(), row['id'], row['status'], row['updated']))
+
+    def save_receipt(self, key: str, receipt: Receipt, ready: bool = False, *, claim: str = '', note: str = '',
+                     read_stage: str = 'review'):
         identity = receipt.identity() if (receipt.ticket_number or receipt.billing_codes) else None
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row = self.decode(db.execute('SELECT * FROM jobs WHERE id=?', (key,)).fetchone())
+            if claim and claim != row['auto_stage']:
+                return row  # A human or newer operation superseded this reading.
             if row['status'] not in EDITABLE or row['issue_attempted'] or row['human_exposed'] or row['issuance_seen'] or row['uuid']:
                 raise ValueError('Este ticket ya está en proceso o tiene un intento de emisión.')
             status, message = ('ready', 'Revisado') if ready else ('review', 'Revisar datos extraídos')
+            if note:
+                message = note
             if ready and receipt.provider == 'solicitud_directa':
                 status, message = 'external', 'Solicita el CFDI al comercio y adjunta sus comprobantes aquí.'
             for other in db.execute('SELECT id, identity, receipt FROM jobs WHERE id<>?', (key,)):
                 old = Receipt.model_validate_json(other['receipt'])
-                same_codes = old.provider == receipt.provider and set(old.billing_codes).intersection(receipt.billing_codes)
-                if receipt.provider == 'solicitud_directa' and old.merchant.strip().casefold() != receipt.merchant.strip().casefold():
-                    same_codes = False
+                same_codes = old.merchant_key() == receipt.merchant_key() and set(old.billing_codes).intersection(receipt.billing_codes)
                 if (identity and other['identity'] == identity) or same_codes:
                     status, message, identity = 'duplicate', f"Ya registrado en {other['id']}", None
                     break
-            db.execute('UPDATE jobs SET receipt=?, identity=?, status=?, message=?, updated=? WHERE id=?',
-                       (receipt.model_dump_json(), identity, status, message, now(), key))
+            stage = read_stage if status == 'review' and claim else ''
+            confirmed_payment = receipt.payment_code if ready and not claim else row['confirmed_payment']
+            db.execute('UPDATE jobs SET receipt=?, identity=?, status=?, message=?, auto_stage=?, confirmed_payment=?, '
+                       'updated=? WHERE id=?',
+                       (receipt.model_dump_json(), identity, status, message, stage, confirmed_payment, now(), key))
         return self.get(key)
 
     def claim(self, key: str) -> bool:
@@ -134,12 +195,14 @@ class Store:
                                "AND issue_attempted=0 AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL", (now(), key)).rowcount
             return count == 1
 
-    def queue(self, key: str, profile=None) -> bool:
+    def queue(self, key: str, profile=None, confirmed_url: str = '') -> bool:
         with self.connect() as db:
-            return db.execute("UPDATE jobs SET status='queued',message='En cola',updated=?,billing_profile=? WHERE id=? "
+            return db.execute("UPDATE jobs SET status='queued',auto_stage='scheduled',message='En cola',updated=?,billing_profile=? WHERE id=? "
                               "AND (status='ready' OR (status='blocked' AND billing_profile IS NOT NULL)) "
-                              "AND issue_attempted=0 AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL",
-                              (now(), profile.model_dump_json() if profile else None, key)).rowcount == 1
+                              "AND auto_stage NOT LIKE 'reading:%' "
+                              "AND issue_attempted=0 AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL "
+                              "AND COALESCE(json_extract(receipt,'$.portal_url'),'')=?",
+                              (now(), profile.model_dump_json() if profile else None, key, confirmed_url)).rowcount == 1
 
     def confirm_issued(self, key: str):
         with self.connect() as db:
@@ -167,6 +230,10 @@ class Store:
 
     def recover_after_restart(self):
         with self.connect() as db:
+            db.execute("UPDATE jobs SET status='review',auto_stage='review',message=?,updated=? "
+                       "WHERE auto_stage LIKE 'reading:%' AND status IN ('new','review','ready','external','blocked') "
+                       "AND issue_attempted=0 AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL",
+                       ('La lectura se interrumpió. Revisa los datos o pulsa Leer con mi plan para repetirla.', now()))
             db.execute("UPDATE jobs SET status='issued_waiting_files',message='El portal confirmó la emisión. Recupera el PDF y el XML.',updated=? "
                        "WHERE status IN ('queued','running','issuing','needs_user') AND (issuance_seen=1 OR uuid IS NOT NULL)", (now(),))
             db.execute("UPDATE jobs SET status='uncertain',issue_attempted=1,message='Hay un intento previo. Recupera sus comprobantes.',updated=? "

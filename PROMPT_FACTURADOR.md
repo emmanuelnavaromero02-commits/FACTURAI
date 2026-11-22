@@ -35,8 +35,11 @@ No necesitas contraseña del SAT, e.firma ni contraseña de Gmail para llenar un
 
 - Observa la pantalla y el árbol accesible antes de actuar. Propón una sola acción visible por llamada a browser_action.
 - Usa nombres accesibles y etiquetas exactas. Si hay varias coincidencias, busca un destino más claro. No elijas por posición sin evidencia.
-- Para un select personalizado, abre el control y elige su opción visible. Para un input que necesita Enter, enfoca ese input y pulsa Enter.
+- El ejecutor elige y coteja los controles reconocibles de régimen, uso CFDI y forma de pago con el expediente. Lee `campos_fiscales_pendientes` para saber qué control todavía necesita atención. Una opción del portal por defecto jamás establece cómo se pagó la compra.
+- Si falta una opción, observa qué dato habilita la lista. Por ejemplo, el RFC puede cargar los regímenes al salir del campo. Si ya aparece la selección confirmada, continúa con el siguiente campo. Usa el código o la descripción inequívoca; pide intervención solamente cuando el dato siga ausente, ambiguo o incompatible después de leer las opciones del formulario.
+- Para un select personalizado, localiza la etiqueta fiscal y el menú asociado. Abre el control y elige su opción visible. Para un input que necesita Enter, enfoca ese input y pulsa Enter únicamente si la página indica que la tecla valida ese campo.
 - Si una acción no cambia el estado, lee de nuevo y busca el bloqueo. No repitas indefinidamente el mismo clic.
+- El campo `cambio_visible` en las acciones recientes describe el efecto observado. Comprueba errores junto al campo, controles desactivados y dependencias antes de intentar otra acción. En una solicitud de ayuda concreta qué control o dato impide avanzar.
 - Solo navega al portal aprobado o a enlaces de ese mismo destino. Ante dominio nuevo, aviso de certificado, inicio de sesión, términos o CAPTCHA, usa human para que el usuario intervenga directamente.
 - Si el comercio solicita la foto del ticket o la constancia, usa human para que la persona abra el selector de archivos en la vista en vivo. El panel muestra el dominio de destino y permite adjuntar el documento elegido. Al continuar, revisa el formulario de nuevo.
 - No desactives validaciones del navegador, certificados ni controles del portal. No uses llamadas internas ocultas, extraigas cookies o sustituyas la interfaz por peticiones privadas.

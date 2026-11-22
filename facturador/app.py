@@ -22,11 +22,12 @@ from PIL import UnidentifiedImageError
 from pypdf.errors import PyPdfError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .ai import AI
 from .auth import CALLBACK, ChatGPTPlan, PlanError, read_json, write_private
-from .catalog import CATALOG, provider_for_url
-from .db import EDITABLE, Store
+from .automation import TicketAutomation
+from .catalog import CATALOG, CUSTOM_PORTAL, portal_suggestions
+from .db import Store
 from .diagnostics import check_tools
+from .invoice_mail import InvoiceMailRecovery
 from .documents import browser_file, browser_files, reconcile, save_candidate
 from .gmail import GmailConnection, cfdi_parts, import_eml, import_tickets, parse_eml, recover_attachments, search_tickets, ticket_parts
 from .ingest import IMAGE_EXT, MAX_UPLOAD, save_input, save_upload, validate_document
@@ -34,6 +35,8 @@ from .local_reader import read_local_page
 from .models import Profile, Receipt
 from .runner import Runner
 from .sat import sat_router
+from .portal_accounts import portal_accounts_router
+from .portal_mail import portal_mail_router
 from .viewer import ViewerInput
 from .whatsapp import whatsapp_router
 
@@ -42,6 +45,7 @@ BASE = Path(__file__).resolve().parent.parent
 
 class RunRequest(BaseModel):
     consent: bool
+    confirmed_url: str = Field(default='', max_length=2048)
     auto_issue: bool = False
     mode: Literal['agent', 'manual'] = 'agent'
 
@@ -71,12 +75,16 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         try:
             if container_browser:
                 try:
-                    await runner.start_browser()
+                    await runner.open_personal()
                 except ValueError:
                     pass  # The inbox, reader and recovery tools stay available offline.
             wa_routes.watcher.start()
+            automation.start()
+            mail_recovery.start()
             yield
         finally:
+            await mail_recovery.close()
+            await automation.close()
             await wa_routes.watcher.close()
             await runner.close()
             plan.close()
@@ -111,8 +119,14 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
             raise ValueError("Guarda primero tus datos fiscales en el panel")
         return Profile.model_validate_json(path.read_text(encoding="utf-8"))
 
+    automation = TicketAutomation(store, runner, plan, profile)
+    mail_recovery = InvoiceMailRecovery(store, lambda: automation.enabled and gmail_connection.status() == 'connected',
+                                        lambda: runner.active_id)
+    app.state.automation = automation
     wa_routes = whatsapp_router(store, runner, profile)
     app.include_router(wa_routes)
+    app.include_router(portal_accounts_router(root, runner.viewer, profile))
+    app.include_router(portal_mail_router(root, runner.viewer, profile))
 
     @app.exception_handler(ValueError)
     async def invalid(request, exc):
@@ -151,6 +165,18 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     def viewer_script():
         return FileResponse(BASE / 'web' / 'visor.js', media_type='application/javascript')
 
+    @app.get('/navegacion.js')
+    def navigation_script():
+        return FileResponse(BASE / 'web' / 'navegacion.js', media_type='application/javascript')
+
+    @app.get('/cuentas-portal.js')
+    def portal_accounts_script():
+        return FileResponse(BASE / 'web' / 'cuentas-portal.js', media_type='application/javascript')
+
+    @app.get('/correo-portal.js')
+    def portal_mail_script():
+        return FileResponse(BASE / 'web' / 'correo-portal.js', media_type='application/javascript')
+
     @app.get('/herramientas.js')
     def receipt_tools_script():
         return FileResponse(BASE / 'web' / 'herramientas.js', media_type='application/javascript')
@@ -180,9 +206,8 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
             await runner.viewer.set_manual(False)
             if runner.context:
                 await runner.context.close()
-            await runner.start_browser()
-        await runner.open_portal()
-        return runner.viewer.state()
+            await runner.personal.close()
+        return await runner.open_personal()
 
     @app.post('/api/chatgpt/connect')
     def openai_connect(new_account: bool = Body(default=False, embed=True), consent: bool = Body(default=False, embed=True)):
@@ -253,49 +278,71 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
 
     @app.post('/api/browser/open')
     async def open_browser(provider: str | None = Body(default=None, max_length=64),
-                           url: str | None = Body(default=None, max_length=2048)):
-        await runner.open_portal(provider, url)
-        return runner.viewer.state()
+                           url: str | None = Body(default=None, max_length=2048),
+                           confirmed_origin: str = Body(default='', max_length=300)):
+        await runner.open_portal(provider, url, confirmed_origin)
+        return runner.browser_state()
+
+    @app.post('/api/browser/personal')
+    async def personal_browser(url: str | None = Body(default=None, max_length=2048),
+                               channel: str = Body(default='', max_length=64)):
+        return await runner.open_personal(url, channel)
+
+    @app.post('/api/browser/personal/tabs')
+    async def personal_tabs(action: Literal['new', 'select', 'close'] = Body(),
+                            tab_id: str | None = Body(default=None, max_length=64),
+                            channel: str = Body(default='', max_length=64)):
+        return await runner.open_personal(channel=channel, action=action, tab_id=tab_id)
+
+    @app.post('/api/browser/return')
+    async def return_to_job(channel: str = Body(default='', embed=True, max_length=64)):
+        return await runner.return_to_job(channel)
 
     @app.get('/api/browser/frame')
     async def browser_frame(revision: int):
-        value = await runner.viewer.frame(revision)
+        view = runner.screen
+        value = await view.frame(revision)
+        if view is not runner.screen:
+            value = None
         return Response(content=value, media_type='image/jpeg') if value else Response(status_code=204)
 
     @app.post('/api/browser/control')
     async def browser_control(revision: int = Body(embed=True)):
-        return {'channel': await runner.viewer.take_control(revision)}
+        return {'channel': await runner.screen.take_control(revision)}
 
     @app.post('/api/browser/release')
     async def browser_release(channel: str = Body(embed=True)):
         await runner.viewer.release(channel)
+        await runner.personal.view.release(channel)
         return {'released': True}
 
     @app.post('/api/browser/input')
     async def browser_input(value: ViewerInput):
-        await runner.viewer.send(value)
+        await runner.screen.send(value)
         return {'sent': True}
 
     @app.post('/api/browser/dialog')
     async def browser_dialog(dialog_id: str = Body(embed=True), accept: bool = Body(embed=True)):
-        await runner.viewer.answer(dialog_id, accept)
+        await runner.screen.answer(dialog_id, accept)
         return {'answered': True}
 
     @app.post('/api/browser/text')
     async def browser_text(channel: str = Body(embed=True, max_length=64)):
-        return {'text': await runner.viewer.visible_text(channel)}
+        return {'text': await runner.screen.visible_text(channel)}
 
     @app.post('/api/browser/screenshot')
     async def browser_screenshot(channel: str = Body(embed=True, max_length=64)):
-        return Response(content=await runner.viewer.screenshot(channel), media_type='image/png',
+        return Response(content=await runner.screen.screenshot(channel), media_type='image/png',
                         headers={'Content-Disposition': 'attachment; filename="captura-portal.png"'})
 
     @app.post('/api/browser/history')
-    async def browser_history(channel: str = Body(max_length=64), direction: Literal['back', 'forward'] = Body()):
-        if runner.has_active_jobs():
+    async def browser_history(channel: str = Body(default='', max_length=64), direction: Literal['back', 'forward', 'reload'] = Body()):
+        view = runner.screen
+        personal = view is runner.personal.view
+        if runner.has_active_jobs() and not personal:
             raise ValueError('El historial está disponible al navegar por cuenta propia.')
-        await runner.viewer.history(channel, direction)
-        return runner.viewer.state()
+        await view.history(channel, direction, personal=personal)
+        return runner.browser_state()
 
     @app.post('/api/browser/upload')
     async def browser_upload(channel: str = Form(max_length=64), request_id: str = Form(max_length=64),
@@ -308,7 +355,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
             if mime != mimetypes.guess_type(name)[0]:
                 raise ValueError('La extensión no coincide con el contenido del documento.')
             payload = {'name': name, 'buffer': data, 'mimeType': mime}
-        await runner.viewer.attach(channel, request_id, payload)
+        await runner.screen.attach(channel, request_id, payload)
         return {'attached': payload is not None}
 
     @app.get('/api/browser/downloads')
@@ -330,21 +377,34 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
             row.pop("source_path", None)
             row.pop("source_hash", None)
             row.pop('billing_profile', None)
+            row.pop('auto_stage', None)
+            row.pop('confirmed_payment', None)
             row["has_pdf"], row["has_xml"] = bool(row.pop("pdf")), bool(row.pop("xml"))
             row["human_kind"] = runner.pending.get(row["id"], {}).get("kind")
         return {"token": token, "profile": read_json(path), "jobs": jobs,
                 'catalog': CATALOG, 'plan': plan.status(), 'gmail': gmail_connection.status(),
-                'browser': {**runner.viewer.state(), 'engine': runner.engine}, 'active_job': runner.active_id}
+                'automation': automation.status(), 'browser': runner.browser_state(), 'active_job': runner.active_id}
+
+    @app.put('/api/automation')
+    async def configure_automation(enabled: bool = Body(embed=True, strict=True)):
+        return automation.configure(enabled)
 
     @app.put("/api/profile")
     def save_profile(value: Profile):
+        profile_path = root / 'profile.json'
+        data = value.model_dump()
+        previous = read_json(profile_path) or {}
         if any(x["status"] in {"running", "issuing", "needs_user", "queued"} for x in store.list()):
-            raise ValueError("Termina la cola antes de cambiar el perfil fiscal")
-        write_private(root / 'profile.json', value.model_dump())
+            if any(previous.get(k) != v for k, v in data.items() if k != 'whatsapp_phone'):
+                raise ValueError("Termina la cola antes de cambiar el perfil fiscal")
+        if 'whatsapp_phone' not in value.model_fields_set:
+            if previous.get('rfc') == value.rfc:
+                data['whatsapp_phone'] = previous.get('whatsapp_phone', '')
+        write_private(profile_path, data)
         return {"saved": True}
 
     @app.post('/api/profile/read-csf')
-    async def read_csf(file: UploadFile = File(...), mode: Literal['agent', 'local'] = Form('agent'),
+    async def read_csf(file: UploadFile = File(...), mode: Literal['agent', 'local', 'extract'] = Form('agent'),
                        page: int = Form(1, ge=1, le=20), rotation: int = Form(0), force_ocr: bool = Form(False)):
         suffix = Path(file.filename or '').suffix.lower()
         data = await file.read(MAX_UPLOAD + 1)
@@ -359,7 +419,8 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
             if mode == 'local':
                 reading = await asyncio.to_thread(read_local_page, document, page, rotation, force_ocr)
                 return {**reading, 'codes': [], 'portal_links': []}
-            return await asyncio.to_thread(AI(plan).tax_profile, document)
+            from .tax_document import constancia_draft
+            return await asyncio.to_thread(constancia_draft, document, plan if mode == 'agent' else None)
 
     @app.post("/api/upload")
     async def upload(files: list[UploadFile] = File(...)):
@@ -385,34 +446,23 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         return item
 
     @app.post("/api/jobs/{key}/analyze")
-    async def analyze(key: str, consent: bool = Body(embed=True)):
-        if not consent:
+    async def analyze(key: str, consent: bool = Body(default=False), mode: Literal['agent', 'local'] = Body(default='agent')):
+        if mode == 'agent' and not consent:
             raise ValueError('Autoriza la lectura de la imagen con tu plan de ChatGPT.')
-        row = store.get(key)
-        if row["status"] not in EDITABLE:
-            raise ValueError("Este expediente ya está en proceso o emitido")
-        result = await asyncio.to_thread(AI(plan).extract, Path(row['source_path']), {k: v['name'] for k, v in CATALOG.items()})
-        if not result.is_receipt:
-            store.update(key, status="blocked", message="La imagen no fue identificada como ticket: " + result.details)
-            return store.get(key)
-        receipt = Receipt(provider=result.provider, merchant=result.merchant, amount=result.amount or "", date=result.date or "",
-                          ticket_number=result.ticket_number or "", billing_codes=result.billing_codes, payment_code=result.payment_code or "",
-                          details=result.details, source=row["receipt"]["source"])
-        row = store.save_receipt(key, receipt)
-        if row["status"] != "duplicate":
-            store.update(key, message="; ".join(result.uncertainties) or "Datos extraídos; revisar antes de emitir")
-        return store.get(key)
+        return await automation.analyze(key, offline=mode == 'local')
 
     @app.put("/api/jobs/{key}")
-    def edit(key: str, receipt: Receipt):
+    async def edit(key: str, receipt: Receipt):
         errors = receipt.ready_errors()
         row = store.get(key)
         receipt.source = row['receipt']['source']
-        if receipt.provider not in CATALOG and receipt.provider != 'solicitud_directa':
-            errors.append("Selecciona un portal del catálogo")
+        if receipt.provider not in CATALOG and receipt.provider not in {CUSTOM_PORTAL, 'solicitud_directa'}:
+            errors.append("Indica el portal de facturación del comercio")
         if errors:
             raise ValueError("; ".join(errors))
-        return store.save_receipt(key, receipt, ready=True)
+        saved = store.save_receipt(key, receipt, ready=True)
+        automation.wake.set()
+        return saved
 
     @app.post("/api/jobs/{key}/run")
     async def run(key: str, value: RunRequest):
@@ -423,7 +473,9 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
             raise ValueError('Este ejemplo sirve para practicar la revisión. Sube un ticket real para abrir el portal.')
         if value.mode == 'agent' and plan.status()['status'] != 'ready':
             raise ValueError('Conecta tu plan de ChatGPT en Ajustes antes de encolar.')
-        runner.schedule(key, profile(), value.auto_issue, manual=value.mode == 'manual')
+        if row['receipt']['provider'] == CUSTOM_PORTAL and (not value.confirmed_url or value.confirmed_url != row['receipt'].get('portal_url')):
+            raise ValueError('Confirma la dirección actual del comercio antes de iniciar el trámite.')
+        runner.schedule(key, profile(), value.auto_issue, manual=value.mode == 'manual', confirmed_url=value.confirmed_url)
         return {"queued": True}
 
     @app.post("/api/jobs/{key}/decision")
@@ -460,7 +512,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     def read_original(key: str, page: int = Body(default=1, ge=1, le=20),
                       rotation: Literal[0, 90, 180, 270] = Body(default=0), force_ocr: bool = Body(default=False)):
         result = read_local_page(original_path(key), page, rotation, force_ocr)
-        result['portal_links'] = [code for code in result['codes'] if provider_for_url(code)]
+        result['portal_links'] = portal_suggestions(result['codes'], result.get('text', ''))
         return result
 
     def recovery_profile(key: str) -> Profile:

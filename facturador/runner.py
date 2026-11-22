@@ -7,19 +7,24 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
 from playwright.async_api import Error as BrowserError
 
 from .ai import AI
+from .account_flow import PortalAccountFlow, SECRET_SCREEN
 from .auth import ChatGPTPlan, PlanError
-from .catalog import CATALOG, allowed_url, provider_for_url
+from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, provider_for_url, public_portal_origin, resolves_publicly
 from .cfdi import UUID_RE
 from .db import Store
 from .documents import job_candidates, reconcile
+from .fiscal_choices import NAMES as FISCAL_FIELDS, fiscal_choices
 from .models import Action, Profile, Receipt
-from .portals import capufe_proof, normalize
+from .personal_browser import PersonalBrowser
+from .profile_lock import launch_chrome
+from .portals import capufe_proof, capufe_recipient, normalize
 from .viewer import BrowserView
 
 ISSUE = re.compile(r'\b(facturar|emitir|timbrar|generar\s+(?:mi\s+)?(?:factura|cfdi)|solicitar\s+factura|enviar\s+(?:mi\s+)?(?:factura|cfdi)|s[ií] estoy seguro|confirmar (?:la )?emisi[oó]n)\b', re.I)
@@ -30,6 +35,18 @@ CHALLENGE_TEXT = re.compile(r'no soy un robot|verifica que eres humano|verify (?
 ACCESS_DENIED = re.compile(r'access denied|error 16\b|blocked by our security service|acceso denegado|err_cert_', re.I)
 SUCCESS = re.compile(r'factura\s+(?:emitida|generada)\b|cfdi\s+(?:emitido|generado)\b|timbrad[ao]\s+correctamente|resultado facturaci[oó]n[^\n]*\n[\s\S]{0,130}facturas generadas|se gener[oó]\s+exitosamente', re.I)
 DOWNLOAD = re.compile(r'descargar|download|\bpdf\b|\bxml\b|imprimir', re.I)
+ALREADY_BILLED = re.compile(
+    r'^(?:(?:el|este|su) )?(?:ticket|boleto|c[oó]digo|comprobante)(?: ingresado| [A-Z0-9]{18})? '
+    r'ya (?:(?:fue|ha sido|est[áa]|se encuentra) )?facturad[oa]\b', re.I)
+RECOVERY_LINK = re.compile(r'\b(?:recuperar|consultar|reencontrar)\b.*\b(?:factura|cfdi|comprobante)\b', re.I)
+
+
+def already_billed(snapshot: str) -> bool:
+    for line in snapshot.splitlines():
+        message = re.sub(r'^\s*-?\s*(?:(?:alert|status|text|generic|paragraph|heading)\s*[:"]\s*)?', '', line).strip('" ')
+        if ALREADY_BILLED.match(message):
+            return True
+    return False
 MANUAL = {'captcha', 'login', 'terms', 'unknown', 'blocked', 'confirm', 'attachment', 'operator'}
 
 
@@ -45,7 +62,7 @@ def action_risk(action: Action) -> str:
         return 'captcha'
     if action.kind == 'press' and (action.value or '').lower() in {'enter', 'return'} and name.strip().upper() != 'RFC':
         return 'unknown'
-    if ISSUE.search(name) or action.risk == 'issue':
+    if (action.kind in {'click', 'press'} and ISSUE.search(name)) or action.risk == 'issue':
         return 'issue'
     if action.kind == 'click' and re.fullmatch(r'aceptar|confirmar|enviar|submit|s[ií]', name.strip(), re.I):
         return 'confirm'
@@ -66,9 +83,17 @@ async def visible_challenge(page, snapshot: str) -> str | None:
     if any(CHALLENGE_TEXT.search(line) and not ('checkbox' in line and '[checked]' in line)
            for line in snapshot.splitlines()):
         return 'captcha'
+    if SECRET_SCREEN.search(snapshot):
+        return 'login'
     if hasattr(page, 'frames'):
-        if await page.locator('input[type="password"]:visible').count():
+        credential_inputs = ('input[type="password"]:visible, input[autocomplete~="one-time-code"]:visible, '
+                             'input[autocomplete~="username"]:visible, input[name*="otp" i]:visible')
+        if any(re.search(r'\b(?:contraseña temporal|temporary password|verification code|código de (?:verificación|acceso)|one.time (?:code|password))\b', line, re.I)
+               for line in snapshot.splitlines()):
             return 'login'
+        for frame in page.frames:
+            if await frame.locator(credential_inputs).count():
+                return 'login'
         frames = page.locator('iframe[src*="/bframe"]:visible, iframe[title*="challenge" i]:visible, iframe[title*="desafío" i]:visible')
         if await frames.count():
             return 'captcha'
@@ -89,6 +114,8 @@ class Runner:
         self.plan = plan or ChatGPTPlan(store.root)
         self.owns_plan = plan is None
         self.viewer = BrowserView()
+        self.personal = PersonalBrowser(store.root, lambda download: self.track_download(download, None))
+        self.personal_at_revision = None
         self.context = None
         self.engine = ''
         self.playwright = None
@@ -102,6 +129,7 @@ class Runner:
         self.active_id: str | None = None
         self.whatsapp = None
         self.portal_page = None
+        self.page_portal_origins = weakref.WeakKeyDictionary()
         self.manual_download_error = ''
 
     async def start_browser(self):
@@ -110,22 +138,29 @@ class Runner:
                 return
             from playwright.async_api import async_playwright
 
-            settings = {'headless': True, 'accept_downloads': True, 'service_workers': 'block',
+            settings = {'accept_downloads': True, 'service_workers': 'block',
                         'viewport': {'width': 1280, 'height': 850}, 'timeout': 15_000}
+            headed_chrome = os.getenv('FACTURADOR_CHROME_HEADED') == '1'
             try:
                 if self.playwright is None:
                     self.playwright = await async_playwright().start()
-                try:
-                    self.context = await self.playwright.chromium.launch_persistent_context(
-                        self.store.root / 'browser_profile', chromium_sandbox=True,
-                        executable_path=os.getenv('FACTURADOR_CHROMIUM_PATH'), **settings)
-                    self.engine = 'Chromium'
-                except BrowserError:
-                    # Repair existing profiles. Disabling Firefox's API also disables request interception;
-                    # Playwright blocks worker registration separately via the shared context policy.
-                    self.context = await self.playwright.firefox.launch_persistent_context(
-                        self.store.root / 'browser_profile_firefox', firefox_user_prefs={'dom.serviceWorkers.enabled': True}, **settings)
-                    self.engine = 'Firefox'
+                if headed_chrome:
+                    self.context = await launch_chrome(self.playwright.chromium.launch_persistent_context,
+                        self.store.root / 'browser_profile_chrome', executable_path='/usr/bin/google-chrome-stable',
+                        headless=False, chromium_sandbox=True, **settings)
+                    self.engine = 'Google Chrome'
+                else:
+                    try:
+                        self.context = await self.playwright.chromium.launch_persistent_context(
+                            self.store.root / 'browser_profile', executable_path=os.getenv('FACTURADOR_CHROMIUM_PATH'), headless=True,
+                            chromium_sandbox=True, **settings)
+                        self.engine = 'Chromium'
+                    except BrowserError:
+                        # Keep interception available in Firefox; Playwright blocks worker registration separately.
+                        self.context = await self.playwright.firefox.launch_persistent_context(
+                            self.store.root / 'browser_profile_firefox', headless=True,
+                            firefox_user_prefs={'dom.serviceWorkers.enabled': True}, **settings)
+                        self.engine = 'Firefox'
             except Exception as exc:
                 if self.playwright is not None:
                     try:
@@ -134,7 +169,9 @@ class Runner:
                         pass
                     finally:
                         self.playwright = None
-                raise ValueError('No se pudo iniciar el navegador interno. Revisa Chromium y Firefox en la instalación o reconstruye el contenedor.') from exc
+                if headed_chrome:
+                    raise ValueError('No se pudo iniciar Google Chrome. Comprueba que Google Chrome estable esté instalado y que la pantalla gráfica esté disponible.') from exc
+                raise ValueError('No se pudo iniciar el navegador interno. Revisa los navegadores instalados o reconstruye el contenedor.') from exc
             self.context.set_default_timeout(7000)
             def context_closed(context):
                 if self.context is context:
@@ -150,12 +187,12 @@ class Runner:
         def on_download(download):
             key = self.page_job.get(page)
             if key or (page is self.portal_page and page is self.viewer.page and self.viewer.manual):
-                task = asyncio.create_task(self.save_download(download, key))
-                self.downloads.add(task)
-                task.add_done_callback(self.downloads.discard)
+                self.track_download(download, key)
 
         async def on_popup(popup):
             key = self.page_job.get(page)
+            if page in self.page_portal_origins:
+                self.page_portal_origins[popup] = self.page_portal_origins[page]
             if key and key == self.active_id:
                 self.page_job[popup] = key
                 await self.viewer.show(popup, self.viewer.title, manual=self.viewer.manual)
@@ -168,7 +205,14 @@ class Runner:
             await self.viewer.receive_dialog(page, dialog)
 
         async def on_file_request(chooser):
-            if any(allowed_url(page.url, key) for key in CATALOG) or urlsplit(page.url).netloc == 'web.whatsapp.com':
+            if self.active_id:
+                ticket = self.store.get(self.active_id)['receipt']
+                approved = allowed_url(page.url, ticket['provider'], ticket.get('portal_url', ''))
+            elif page in self.page_portal_origins:
+                approved = public_portal_origin(page.url) == self.page_portal_origins[page]
+            else:
+                approved = any(allowed_url(page.url, key) for key in CATALOG) or urlsplit(page.url).netloc == 'web.whatsapp.com'
+            if approved:
                 await self.viewer.receive_file_request(page, chooser)
 
         page.on('download', on_download)
@@ -194,15 +238,31 @@ class Runner:
         if urlsplit(request.url).scheme not in {'https', 'blob'} or private_destination(request.url):
             await route.abort()
             return
+        try:
+            frame = request.frame
+            owner = frame.page
+            main_frame = frame == owner.main_frame
+        except BrowserError:
+            owner, main_frame = None, True
+        ticket = self.store.get(self.active_id)['receipt'] if self.active_id else None
+        custom_origin = self.page_portal_origins.get(owner) if owner is not None else None
+        if ticket and ticket['provider'] == CUSTOM_PORTAL:
+            custom_origin = public_portal_origin(ticket.get('portal_url', ''))
+        if custom_origin and urlsplit(request.url).scheme == 'https':
+            if not await resolves_publicly(request.url):
+                await route.abort()
+                return
+            if request.method not in {'GET', 'HEAD', 'OPTIONS'} and public_portal_origin(request.url) != custom_origin:
+                await route.abort()
+                return
         if request.is_navigation_request():
-            try:
-                main_frame = request.frame == request.frame.page.main_frame
-            except Exception:
-                main_frame = True
-            if main_frame and self.active_id:
-                provider = self.store.get(self.active_id)['receipt']['provider']
-                if not allowed_url(request.url, provider):
+            if main_frame and ticket:
+                if not allowed_url(request.url, ticket['provider'], ticket.get('portal_url', '')):
                     self.store.event(self.active_id, 'navigation_blocked', 'Navegación fuera del portal registrado')
+                    await route.abort()
+                    return
+            elif main_frame and custom_origin:
+                if public_portal_origin(request.url) != custom_origin:
                     await route.abort()
                     return
             elif main_frame and not (any(allowed_url(request.url, key) for key in CATALOG)
@@ -210,6 +270,11 @@ class Runner:
                 await route.abort()
                 return
         await route.continue_()
+
+    def track_download(self, download, key):
+        task = asyncio.create_task(self.save_download(download, key))
+        self.downloads.add(task)
+        task.add_done_callback(self.downloads.discard)
 
     async def save_download(self, download, key: str | None):
         directory = self.store.root / 'downloads' / key if key else self.store.root / 'descargas-navegador'
@@ -248,11 +313,61 @@ class Runner:
     def has_active_jobs(self) -> bool:
         return bool(self.job_tasks)
 
-    async def open_portal(self, provider: str | None = None, url: str | None = None):
+    @property
+    def screen(self):
+        if self.personal_at_revision is not None and self.personal.context and (
+            self.personal_at_revision == self.viewer.revision or self.personal.interacting
+        ):
+            return self.personal.view
+        return self.viewer
+
+    def browser_state(self):
+        if self.screen is self.personal.view:
+            return {**self.personal.state(), 'engine': self.engine, 'return_job_id': self.active_id}
+        state = self.viewer.state()
+        job = self.page_job.get(self.viewer.page)
+        mode = 'idle' if not state['open'] else 'job' if job else 'whatsapp' if self.viewer.page is self.whatsapp else 'portal'
+        return {**state, 'mode': mode, 'engine': self.engine, 'job_id': job, 'return_job_id': None, 'tabs': []}
+
+    async def open_personal(self, url=None, channel='', *, action=None, tab_id=None):
+        async with self.personal.lock:
+            previous = self.screen
+            if previous.dialog or previous.file_request:
+                raise ValueError('Resuelve el aviso o selector de archivo antes de cambiar de página.')
+            if previous.channel and not secrets.compare_digest(previous.channel, channel):
+                raise ValueError('La página está bajo el control de otra ventana del panel.')
+            if previous is self.viewer:
+                await previous.release(channel)
+                await self.personal.view.release(self.personal.view.channel)
+            revision = self.viewer.revision
+            await self.start_browser()
+            await self.personal.start(self.playwright, self.engine)
+            if action:
+                await self.personal.change_tab(action, tab_id)
+            else:
+                await self.personal.open(url)
+            self.personal_at_revision = revision
+        return self.browser_state()
+
+    async def return_to_job(self, channel):
+        if self.screen is self.personal.view:
+            self.personal.check_control(channel)
+            await self.personal.view.release(channel)
+        self.personal_at_revision = None
+        return self.browser_state()
+
+    async def open_portal(self, provider: str | None = None, url: str | None = None, confirmed_origin: str = ''):
+        custom_origin = None
         if url is not None:
             provider = provider or provider_for_url(url)
-            if provider is None or not allowed_url(url, provider):
-                raise ValueError('La liga del ticket debe pertenecer a un portal HTTPS del catálogo.')
+            if provider is None:
+                custom_origin = public_portal_origin(url)
+                if not custom_origin or confirmed_origin != custom_origin:
+                    raise ValueError('Confirma el dominio HTTPS público del comercio antes de abrirlo.')
+                if not await resolves_publicly(url):
+                    raise ValueError('El dominio debe resolver a una dirección pública accesible.')
+            elif not allowed_url(url, provider):
+                raise ValueError('La liga del ticket debe pertenecer al portal seleccionado.')
         if provider is not None and provider not in CATALOG:
             raise ValueError('Selecciona un portal del catálogo.')
         if self.has_active_jobs():
@@ -264,8 +379,13 @@ class Runner:
             if self.portal_page is None or self.portal_page.is_closed():
                 self.portal_page = await self.context.new_page()
             page = self.portal_page
+            self.personal_at_revision = None
             await self.viewer.set_manual(False)
-            if provider is None:
+            if custom_origin:
+                self.page_portal_origins[page] = custom_origin
+            else:
+                self.page_portal_origins.pop(page, None)
+            if provider is None and url is None:
                 await page.goto('about:blank')
                 links = [f'<li><a href="{html.escape(item["url"], quote=True)}">{html.escape(item["name"])}</a></li>'
                          for item in sorted(CATALOG.values(), key=lambda item: item['name'].casefold())]
@@ -273,12 +393,16 @@ class Runner:
                 await page.set_content(template.replace('<!--PORTALES-->', '\n'.join(links)))
                 await self.viewer.show(page, 'Portales de facturación', manual=True)
             else:
-                item = CATALOG[provider]
+                item = CATALOG[provider] if provider else {'name': custom_origin, 'url': url}
                 try:
                     await page.goto(url or item['url'], wait_until='domcontentloaded', timeout=30_000)
                 except Exception as exc:
                     await self.viewer.show(page, item['name'], manual=True)
                     raise ValueError(f'No se pudo cargar {item["name"]}. Revisa la página en el navegador.') from exc
+                if custom_origin and public_portal_origin(page.url) != custom_origin:
+                    await page.goto('about:blank')
+                    await self.viewer.show(page, item['name'], manual=False)
+                    raise ValueError('La dirección redirigió a otro dominio. Introduce la dirección final para confirmarla.')
                 await self.viewer.show(page, item['name'], manual=True)
 
     async def open_whatsapp(self):
@@ -288,6 +412,7 @@ class Runner:
         if self.whatsapp is None or self.whatsapp.is_closed():
             self.whatsapp = await self.context.new_page()
             await self.whatsapp.goto('https://web.whatsapp.com/', wait_until='domcontentloaded')
+        self.personal_at_revision = None
         await self.viewer.show(self.whatsapp, 'WhatsApp Web', manual=True)
 
     async def capture_whatsapp_media(self) -> list[dict]:
@@ -311,9 +436,11 @@ class Runner:
         finally:
             await self.viewer.set_manual(True)
 
-    def schedule(self, key: str, profile: Profile, auto_issue: bool = False, manual: bool = False):
-        if not self.store.queue(key, profile):
+    def schedule(self, key: str, profile: Profile, auto_issue: bool = False, manual: bool = False, confirmed_url: str = ''):
+        if not self.store.queue(key, profile, confirmed_url):
             raise ValueError('Solo se puede encolar un ticket revisado y sin emisión previa.')
+        if not self.personal.interacting:
+            self.personal_at_revision = None
         task = asyncio.create_task(self.run(key, profile, auto_issue, manual))
         self.job_tasks[key] = task
         task.add_done_callback(lambda _: self.job_tasks.pop(key, None))
@@ -384,25 +511,14 @@ class Runner:
         method = {'label': 'get_by_label', 'text': 'get_by_text', 'placeholder': 'get_by_placeholder'}[target.by]
         return getattr(page, method)(target.name, exact=target.exact)
 
-    async def execute(self, page, action: Action, receipt: Receipt):
-        if action.kind == 'goto':
-            if not allowed_url(action.value or '', receipt.provider):
-                raise ValueError('Destino fuera del portal registrado.')
-            await page.goto(action.value, wait_until='domcontentloaded')
-            return
-        if action.kind == 'wait':
-            await asyncio.sleep(1)
-            return
-        if action.kind == 'scroll':
-            await page.mouse.wheel(0, max(-1800, min(1800, int(action.value or '600'))))
-            return
+    async def action_control(self, page, action, receipt):
         locator = self.locator(page, action.target)
         if hasattr(locator, 'filter'):
             visible = locator.filter(visible=True)
             if await visible.count() != 1:
                 candidates = []
                 for frame in page.frames:
-                    if frame.parent_frame and not allowed_url(frame.url, receipt.provider):
+                    if frame.parent_frame and not allowed_url(frame.url, receipt.provider, receipt.portal_url):
                         continue
                     candidate = self.locator(frame, action.target).filter(visible=True)
                     found = await candidate.count()
@@ -416,10 +532,31 @@ class Runner:
             locator = visible
         elif await locator.count() != 1:
             raise ValueError('La etiqueta no identifica un único control visible.')
+        return locator
+
+    async def execute(self, page, action: Action, receipt: Receipt):
+        if receipt.provider == CUSTOM_PORTAL and not allowed_url(page.url, receipt.provider, receipt.portal_url):
+            raise ValueError('La página cambió de dominio. Revisa el nuevo destino antes de continuar.')
+        if action.kind == 'goto':
+            if not allowed_url(action.value or '', receipt.provider, receipt.portal_url):
+                raise ValueError('Destino fuera del portal registrado.')
+            await page.goto(action.value, wait_until='domcontentloaded')
+            return
+        if action.kind == 'wait':
+            await asyncio.sleep(1)
+            return
+        if action.kind == 'scroll':
+            await page.mouse.wheel(0, max(-1800, min(1800, int(action.value or '600'))))
+            return
+        locator = await self.action_control(page, action, receipt)
         if action.kind == 'click':
             await locator.click()
         elif action.kind == 'fill':
-            await locator.fill((action.value or '')[:1000])
+            value = (action.value or '')[:1000]
+            await locator.fill(value)
+            actual = await locator.evaluate("e => e.isContentEditable ? e.innerText : e.value")
+            if actual != value:
+                raise ValueError('El portal modificó o rechazó el valor escrito. Revisa la máscara y el mensaje del campo.')
         elif action.kind == 'select':
             value = action.value or ''
             choices = await locator.locator('option').evaluate_all('(options) => options.map(o => [o.value, o.label])')
@@ -428,6 +565,8 @@ class Runner:
             if len(matches) != 1:
                 raise ValueError('La lista del portal no tiene una opción única que coincida.')
             await locator.select_option(value=matches[0])
+            if await locator.input_value() != matches[0]:
+                raise ValueError('El portal no conservó la opción seleccionada.')
         elif action.kind == 'press' and action.value in {'Enter', 'Tab', 'ArrowDown', 'ArrowUp', 'Escape', 'Space'}:
             await locator.press(action.value)
         else:
@@ -513,35 +652,52 @@ class Runner:
         committed = issued = False
         receipt = Receipt(**self.store.get(key)['receipt'])
         errors = receipt.ready_errors()
-        if errors or receipt.provider not in CATALOG:
+        if errors or (receipt.provider not in CATALOG and receipt.provider != CUSTOM_PORTAL):
             raise ValueError(' · '.join(errors) or 'Portal sin configurar.')
         ai = AI(self.plan)
-        provider = CATALOG[receipt.provider]
+        if receipt.provider == CUSTOM_PORTAL:
+            if not await resolves_publicly(receipt.portal_url):
+                raise ValueError('El dominio del ticket debe resolver a una dirección pública accesible.')
+            provider = {'name': receipt.merchant, 'url': receipt.portal_url,
+                        'guide': 'Usa solo el origen autorizado. Entrega accesos, verificaciones y la emisión al operador.'}
+        else:
+            provider = CATALOG[receipt.provider]
         await self.start_browser()
         page = await self.context.new_page()
         self.page_job[page] = key
+        if receipt.provider == CUSTOM_PORTAL:
+            self.page_portal_origins[page] = public_portal_origin(receipt.portal_url)
         await self.viewer.show(page, provider['name'])
         arrival = await page.goto(provider['url'], wait_until='domcontentloaded')
         if arrival and arrival.status in {403, 429} and not await visible_challenge(page, await page.locator('body').aria_snapshot()):
             raise ValueError(f'El portal respondió HTTP {arrival.status}. El ticket quedó pendiente.')
+        if receipt.provider == CUSTOM_PORTAL and not allowed_url(page.url, receipt.provider, receipt.portal_url):
+            raise ValueError('El portal redirigió a otro dominio. Confirma la dirección final en la revisión del ticket.')
         if manual:
             return await self.manual_job(key, page, profile)
         prompt = (Path(__file__).resolve().parent.parent / 'PROMPT_FACTURADOR.md').read_text(encoding='utf-8')
-        instructions = prompt + '\n' + json.dumps({'perfil': profile.model_dump(), 'ticket': receipt.model_dump(),
-                                                  'portal': provider}, ensure_ascii=False)
+        ticket_fields = receipt.model_dump(exclude={'portal_url'})
+        instructions = prompt + '\n' + json.dumps({'perfil': profile.model_dump(exclude={'whatsapp_phone'}), 'ticket': ticket_fields,
+                                                  'portal': {**provider, 'url': public_portal_origin(provider['url'])}}, ensure_ascii=False)
         recent = []
         last_error = ''
+        before_action = None
+        accounts = PortalAccountFlow(self.store.root, provider['url'], profile, key,
+                                     progress=lambda message: self.store.running_message(key, message))
         for number in range(65):
             page = self.viewer.page
             status = self.store.get(key)['status']
             if status in {'verified', 'duplicate', 'historical'}:
                 return
-            if page.is_closed() or not allowed_url(page.url, receipt.provider):
-                raise ValueError('El portal se cerró o cambió a un destino fuera del catálogo.')
+            if page.is_closed() or not allowed_url(page.url, receipt.provider, receipt.portal_url):
+                raise ValueError('El portal se cerró o cambió a un dominio distinto del autorizado.')
             snapshot = await page.locator('body').aria_snapshot()
+            if before_action is not None and recent:
+                recent[-1]['cambio_visible'] = before_action != (page.url, snapshot)
+                before_action = None
             if ACCESS_DENIED.search(snapshot):
                 raise ValueError('El portal rechazó el acceso a este navegador. El ticket quedó pendiente.')
-            issued = issued or bool(SUCCESS.search(snapshot))
+            issued = issued or bool(SUCCESS.search(snapshot)) or already_billed(snapshot)
             if issued:
                 self.store.confirm_issued(key)
                 uuids = set(value.upper() for value in UUID_RE.findall(snapshot))
@@ -552,23 +708,62 @@ class Runner:
                 if await self.recover(key, profile):
                     return
             challenge = await visible_challenge(page, snapshot)
+            if not committed and not issued and challenge not in {'captcha', 'attachment'}:
+                account_step = await accounts.step(page, snapshot, challenge)
+                if account_step:
+                    kind, message = account_step
+                    if kind == 'advanced':
+                        self.store.event(key, 'portal_account', message)
+                    else:
+                        await self.human(key, page, kind, message)
+                    continue
             if challenge:
                 message = {'captcha': 'Completa la verificación en este navegador.',
                            'login': 'Inicia sesión en el portal y regresa al trámite.',
                            'attachment': 'Toma el control y abre el selector del portal. Elige el documento en el panel y pulsa Adjuntar al portal.'}[challenge]
                 await self.human(key, page, challenge, message)
                 continue
-            observation = json.dumps({'url': page.url, 'paso': number, 'emision_intentada': committed,
+            if accounts.private_observation(snapshot):
+                await self.human(key, page, 'login', 'El portal muestra una credencial. Ocúltala o avanza en la misma página para continuar.')
+                continue
+            pending_fields = []
+            if not committed and not issued:
+                if (receipt.provider == 'capufe' and
+                        urlsplit(page.url).path.rstrip('/').lower() == '/capufe/facturacionrapida'):
+                    try:
+                        field = await capufe_recipient(page, profile)
+                    except BrowserError:
+                        field = None
+                    if field:
+                        self.store.event(key, 'campo_verificado', 'Campo cotejado: ' + field)
+                        continue
+                changed, pending_fields = await fiscal_choices(page, profile, receipt, apply=True)
+                if changed:
+                    self.store.event(key, 'campo_verificado', 'Selección cotejada: ' + FISCAL_FIELDS[changed])
+                    continue
+            # Accessibility snapshots include complete hrefs on separate /url: lines.
+            model_snapshot = '\n'.join(line for line in snapshot.splitlines() if not line.lstrip().startswith('- /url:'))
+            observation = json.dumps({'url': public_portal_origin(page.url), 'paso': number, 'emision_intentada': committed,
                                       'emision_visible': issued, 'acciones_recientes': recent[-6:],
-                                      'ultimo_error': last_error, 'estado_visible': snapshot[:26_000]}, ensure_ascii=False)
+                                      'ultimo_error': last_error, 'campos_fiscales_pendientes': pending_fields,
+                                      'estado_visible': model_snapshot[:26_000]}, ensure_ascii=False)
             try:
                 try:
-                    image = await page.screenshot(type='jpeg', quality=76, scale='css', timeout=6000)
+                    # Once a credential has been used, pixels could echo it outside the
+                    # accessibility tree (canvas, QR or a transient toast). Use verified text.
+                    image = None if accounts.credential_values else await page.screenshot(
+                        type='jpeg', quality=76, scale='css', timeout=6000)
                 except BrowserError:
                     if page.is_closed() or page in self.lost_pages or self.context is None:
                         raise
                     image = None
                     self.store.event(key, 'text_navigation', 'El navegador no produjo la captura. Se usó el árbol visible.')
+                # A portal may render a verification challenge while producing its frame.
+                # Discard both observations and reclassify the current page before sharing.
+                latest = await page.locator('body').aria_snapshot()
+                if (latest != snapshot or accounts.private_observation(latest) or await visible_challenge(page, latest) or
+                        self.viewer.page is not page or not allowed_url(page.url, receipt.provider, receipt.portal_url)):
+                    continue
                 action = await asyncio.to_thread(ai.next_action, instructions, observation, image)
             except PlanError as exc:
                 decision = await self.human(key, page, 'plan', str(exc))
@@ -589,19 +784,40 @@ class Runner:
                 await self.recover(key, profile)
                 return
             if risk in MANUAL or action.kind == 'human':
-                decision = await self.human(key, page, risk if risk in MANUAL else 'unknown', 'Revisa el paso pendiente en el navegador.')
+                detail = ('El portal aún no refleja ' + ', '.join(pending_fields) + '. Revisa el formulario.' if pending_fields
+                          else 'Revisa el paso pendiente en el navegador.')
+                decision = await self.human(key, page, risk if risk in MANUAL else 'unknown', detail)
                 if decision == 'manual':
                     return await self.manual_job(key, page, profile)
                 continue
             preparing_capufe = (receipt.provider == 'capufe' and normalize(name) == 'FACTURAR CONCEPTOS' and
-                               action.kind == 'click' and not committed and not issued and
-                               urlsplit(page.url).path.rstrip('/').lower() == '/capufe/facturacionrapida' and
-                               await capufe_proof(page, profile, receipt))
+                                action.kind == 'click' and not committed and not issued and
+                                urlsplit(page.url).path.rstrip('/').lower() == '/capufe/facturacionrapida')
+            if preparing_capufe and not await capufe_proof(page, profile, receipt, preparation=True):
+                last_error = 'CAPUFE aún no refleja los datos fiscales, agrupación, códigos, fecha o total del expediente.'
+                if recent and recent[-1].get('bloqueo') == last_error:
+                    await self.human(key, page, 'blocked', last_error)
+                recent.append({'bloqueo': last_error})
+                continue
             if risk == 'issue' and not preparing_capufe:
                 if committed or issued:
                     raise ValueError('Ya hubo un intento de emisión. Consulta o recupera ese CFDI.')
                 if action.kind != 'click' or not action.target.exact:
                     last_error = 'Para emitir, elige el botón o enlace exacto de la confirmación.'
+                    continue
+                _, pending_fields = await fiscal_choices(page, profile, receipt)
+                if pending_fields:
+                    last_error = 'Antes de emitir, el portal debe reflejar ' + ', '.join(pending_fields) + '.'
+                    await self.human(key, page, 'blocked', last_error)
+                    continue
+                try:
+                    issue_button = await self.action_control(page, action, receipt)
+                    await issue_button.click(trial=True, timeout=1500)
+                except (ValueError, BrowserError):
+                    detail = 'El botón de emisión está deshabilitado, cubierto o ya cambió. Revisa los campos obligatorios y los avisos del portal.'
+                    if last_error == detail:
+                        await self.human(key, page, 'blocked', detail)
+                    last_error = detail
                     continue
                 valid = auto_issue and normalize(name) in {'SI ESTOY SEGURO', 'SÍ ESTOY SEGURO'} and await capufe_proof(page, profile, receipt)
                 if not valid:
@@ -610,24 +826,35 @@ class Runner:
                     if approved_at != (page.url, await page.locator('body').aria_snapshot()):
                         last_error = 'La página cambió durante la revisión. Lee el formulario nuevamente.'
                         continue
+                    _, pending_fields = await fiscal_choices(page, profile, receipt)
+                    if pending_fields:
+                        last_error = 'La selección fiscal cambió durante la revisión.'
+                        continue
                 self.store.begin_emission(key, name)
                 committed = True
             elif committed or issued:
-                if action.kind not in {'wait', 'scroll'} and not (action.kind == 'click' and DOWNLOAD.search(name)):
+                recovery_link = issued and action.kind == 'click' and RECOVERY_LINK.search(name)
+                recovery_field = (issued and action.kind == 'fill' and
+                                  re.search(r'folio|ticket|c[oó]digo|\brfc\b', name, re.I) and
+                                  action.value in {receipt.ticket_number, *receipt.billing_codes, profile.rfc})
+                if (action.kind not in {'wait', 'scroll'} and not recovery_link and not recovery_field and
+                        not (action.kind == 'click' and DOWNLOAD.search(name))):
                     if action.kind == 'click' and re.fullmatch(r'continuar', name.strip(), re.I) and not issued:
                         await self.human(key, page, 'confirm', 'Revisa la confirmación que muestra el portal y completa ese paso si coincide con tu ticket.')
                         continue
                     raise ValueError('Revisa o recupera la factura del intento actual.')
             try:
+                before_action = page.url, snapshot
                 await self.execute(page, action, receipt)
                 last_error = ''
-            except Exception:
+            except Exception as exc:
                 if committed:
                     raise ValueError('El portal no confirmó el resultado del intento de emisión. Busca el CFDI antes de repetir.')
-                last_error = 'No se completó el paso. Revisa la pantalla y el control.'
+                last_error = str(exc) if isinstance(exc, ValueError) else 'No se completó el paso. Revisa la pantalla y el control.'
             recent.append({'tipo': action.kind, 'control': name[:120]})
             self.store.event(key, 'action', action.kind + ' · ' + name[:120])
-            if len(recent) >= 4 and recent[-4:].count(recent[-1]) == 4:
+            if len(recent) >= 4 and all(event.get('tipo') == action.kind and event.get('control') == name[:120]
+                                        and event.get('cambio_visible') is False for event in recent[-4:-1]):
                 decision = await self.human(key, page, 'blocked', 'El portal no avanzó tras varios pasos. Toma el control para revisar.')
                 if decision == 'manual':
                     return await self.manual_job(key, page, profile)
@@ -642,6 +869,7 @@ class Runner:
             await self.viewer.answer(self.viewer.dialog_key, False)
         if self.context:
             await self.context.close()
+        await self.personal.close()
         if self.downloads:
             await asyncio.gather(*self.downloads, return_exceptions=True)
         if self.playwright:

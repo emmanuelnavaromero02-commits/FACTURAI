@@ -1,4 +1,5 @@
 import {installViewer} from './visor.js';
+import {installPortalMail} from './correo-portal.js';
 import {installReceiptTools} from './herramientas.js';
 import {installSAT, installWhatsApp} from './seguimiento.js';
 
@@ -28,6 +29,11 @@ let gmailJob = null;
 let profileDirty = false;
 let rowSignature = '';
 let taskSignature = '';
+let refreshNumber = 0;
+let appliedRefresh = 0;
+let savingAutomation = false;
+let lastLiveJob = null;
+const handledLiveJobs = new Set();
 
 function el(tag, content = '', ...classes) {
   const value = document.createElement(tag);
@@ -108,7 +114,9 @@ function openScreen() {
   if (activeScreen === 'portales') renderPortals();
 }
 
-const viewer = installViewer({api, token: () => state.token, showError: error => notify(error, true), perform});
+const viewer = installViewer({api, token: () => state.token, showError: error => notify(error, true), perform,
+  accountEmail: () => state.profile?.email || state.plan?.email || ''});
+installPortalMail({api, gmailState: () => state.gmail});
 const receiptTools = installReceiptTools({api, el, button, link, perform, currentTicket: () => editing,
   gmailConnected: () => state.gmail === 'connected', openSettings: () => {
     route('ajustes');
@@ -124,19 +132,32 @@ function blank(title, description, mark = '▤') {
   return box;
 }
 
-function edit(row) {
+function edit(row, focusField) {
   editing = row;
   const form = $('receipt-form');
+  form.reset();
   const {provider} = form.elements;
-  provider.replaceChildren(new Option('Selecciona un comercio', ''));
-  for (const [id, value] of Object.entries(state.catalog)) provider.add(new Option(value.name, id));
+  provider.replaceChildren(new Option('Portal que aparece en mi ticket', 'portal_ticket'));
+  const saved = document.createElement('optgroup');
+  saved.label = 'Comercios guardados';
+  for (const [id, value] of Object.entries(state.catalog)) saved.append(new Option(value.name, id));
+  provider.append(saved);
   provider.add(new Option('Otro comercio · solicitar directamente', 'solicitud_directa'));
+  form.elements.portal_url.value = '';
   for (const [key, value] of Object.entries(row.receipt)) {
     if (form.elements.namedItem(key)) form.elements[key].value = key === 'billing_codes' ? value.join('\n') : value;
   }
-  if (!state.catalog[row.receipt.provider] && row.receipt.provider !== 'solicitud_directa') provider.value = '';
+  if (!state.catalog[row.receipt.provider] && row.receipt.provider !== 'solicitud_directa') provider.value = 'portal_ticket';
+  provider.onchange = () => {
+    const custom = provider.value === 'portal_ticket';
+    $('receipt-portal-row').hidden = !custom;
+    form.elements.portal_url.disabled = !custom;
+    form.elements.portal_url.required = custom;
+  };
+  provider.onchange();
   $('view-source').href = `/api/jobs/${row.id}/source`;
   $('editor').showModal();
+  if (focusField) form.elements.namedItem(focusField)?.focus();
 }
 
 function prepare(rows) {
@@ -146,7 +167,8 @@ function prepare(rows) {
   }
   prepared = rows.filter(row => (row.status === 'ready' || row.can_retry) && !row.receipt.source.startsWith('Ejemplo:'));
   if (!prepared.length) return notify('No hay tickets reales revisados para preparar.');
-  const names = [...new Set(prepared.map(row => state.catalog[row.receipt.provider]?.name))];
+  const names = [...new Set(prepared.map(({receipt}) => receipt.provider === 'portal_ticket'
+    ? receipt.merchant + ' (' + new URL(receipt.portal_url).origin + ')' : state.catalog[receipt.provider]?.name))];
   $('prepare-summary').textContent = `${prepared.length} ${prepared.length === 1 ? 'ticket' : 'tickets'} en ${names.join(', ')}.`;
   $('prepare-form').reset();
   $('run-mode').querySelector('[value=agent]').disabled = state.plan.status !== 'ready';
@@ -187,40 +209,106 @@ function recoverGmail(row) {
 }
 
 function readTicket(row) {
-  const readLocal = () => {
-    edit(row);
-    $('local-reader').click();
-  };
-  if (state.plan.status !== 'ready') {
-    readLocal();
-    return;
+  const agent = state.plan.status === 'ready';
+  if (agent && !window.confirm('¿Leer el original con tu plan de ChatGPT?')) return;
+  return perform(async () => {
+    const result = await api('/api/jobs/' + row.id + '/analyze', 'POST', {mode: agent ? 'agent' : 'local', consent: agent});
+    if (result.status === 'review') edit(result);
+    return result.message;
+  });
+}
+
+function reading(row) {
+  return state.automation?.phase === 'reading' && state.automation.current_id === row.id;
+}
+
+function isLive(row) {
+  return state.browser.open && row.id === state.active_job && row.id === state.browser.job_id &&
+    ['running', 'issuing', 'needs_user'].includes(row.status);
+}
+
+function liveJob() {
+  return state.active_job ? state.jobs.find(isLive) : null;
+}
+
+function showLive(row) {
+  handledLiveJobs.add(row.id);
+  lastLiveJob = row.id;
+  route('navegador');
+  if (state.browser.mode === 'personal' && state.browser.return_job_id === row.id) viewer.returnToJob();
+}
+
+function trackLive(interacting) {
+  const row = liveJob();
+  if (!row || handledLiveJobs.has(row.id)) return;
+  handledLiveJobs.add(row.id);
+  if (activeScreen === 'navegador') lastLiveJob = row.id;
+  if (state.automation?.enabled && !interacting && activeScreen === 'bandeja') showLive(row);
+}
+
+function renderAutomation() {
+  const automation = state.automation;
+  const control = $('automation-enabled');
+  control.disabled = !automation || savingAutomation;
+  if (!savingAutomation) control.checked = Boolean(automation?.enabled);
+  const ticket = state.jobs.find(row => row.id === automation?.current_id);
+  const name = ticket?.receipt.merchant || ticket?.receipt.source;
+  const progress = automation?.message || '';
+  const text = name && progress ? name + ' · ' + progress : progress;
+  if ($('automation-status').textContent !== text) $('automation-status').textContent = text;
+  const reviewButton = $('automation-review');
+  const action = automation?.enabled && automation.phase === 'review' && ticket?.status === 'review' ? reviewAction(ticket) : null;
+  reviewButton.hidden = !action;
+  if (action) {
+    if (reviewButton.textContent !== action.label) reviewButton.textContent = action.label;
+    reviewButton.onclick = () => edit(ticket, action.field);
   }
-  if (window.confirm('¿Leer el original con tu plan de ChatGPT?')) {
-    perform(async () => {
-      let result;
-      try {
-        result = await api(`/api/jobs/${row.id}/analyze`, 'POST', {consent: true});
-      } catch (error) {
-        readLocal();
-        return error.message + ' Se abrió el lector local.';
-      }
-      if (result.status === 'review') edit(result);
-      return result.message;
-    });
+}
+
+function reviewAction(row) {
+  if (!row.receipt.payment_code && (/forma de pago/i.test(row.message) || (row.receipt.merchant && row.receipt.date && row.receipt.amount))) {
+    return {label: 'Completar forma de pago', field: 'payment_code'};
   }
+  if (row.receipt.provider === 'portal_ticket' && row.receipt.portal_url && state.automation?.enabled) {
+    return {label: 'Revisar portal', field: 'portal_url'};
+  }
+  return {label: 'Revisar'};
+}
+
+function primaryAction(row, realTicket) {
+  if (isLive(row) || row.id === state.browser.return_job_id) return button('Ver en vivo', () => showLive(row), 'primary');
+  if (reading(row)) return null;
+  if (row.status === 'new' && realTicket) {
+    if (!state.automation?.enabled) return button(state.plan.status === 'ready' ? 'Leer con ChatGPT' : 'Leer en el contenedor',
+      () => readTicket(row), 'primary');
+    if (state.plan.status !== 'ready') return button('Conectar ChatGPT', () => route('ajustes'));
+    return null;
+  }
+  if (row.status === 'review') {
+    const action = reviewAction(row);
+    return button(action.label, () => edit(row, action.field), 'primary');
+  }
+  if (row.status === 'new') return button('Revisar', () => edit(row), 'primary');
+  if (realTicket && ['external', 'whatsapp_preparing'].includes(row.status)) {
+    return button(row.issue_attempted || row.status === 'whatsapp_preparing' ? 'Ver solicitud WhatsApp' : 'Solicitar por WhatsApp',
+      () => showWhatsApp(row), 'primary');
+  }
+  if (row.status === 'external') return button('Preparar solicitud', () => request(row), 'primary');
+  if (row.can_retry) return button('Reintentar', () => prepare([row]), 'primary');
+  if (row.status === 'ready' && realTicket) {
+    const custom = row.receipt.provider === 'portal_ticket';
+    if (!state.profile) return button('Completar perfil fiscal', () => route('ajustes'));
+    if (custom || !state.automation?.enabled) return button(custom ? 'Confirmar portal' : 'Preparar', () => prepare([row]), 'primary');
+    if (state.plan.status !== 'ready') return button('Conectar ChatGPT', () => route('ajustes'));
+  }
+  return null;
 }
 
 function rowActions(row) {
   const group = el('div', '', 'row-actions');
   const realTicket = !row.historical && !row.receipt.source.startsWith('Ejemplo:');
   const whatsappPrimary = realTicket && ['external', 'whatsapp_preparing'].includes(row.status);
-  const primary = row.status === 'new' || row.status === 'review' ? button('Revisar', () => edit(row)) :
-    whatsappPrimary ? button(row.issue_attempted || row.status === 'whatsapp_preparing' ? 'Ver solicitud WhatsApp' : 'Solicitar por WhatsApp',
-      () => showWhatsApp(row), 'primary') :
-    row.status === 'external' ? button('Preparar solicitud', () => request(row), 'primary') :
-    row.can_retry ? button('Reintentar', () => prepare([row]), 'primary') :
-    row.status === 'ready' && !row.receipt.source.startsWith('Ejemplo:') ? button('Preparar', () => prepare([row]), 'primary') :
-    ['running', 'needs_user', 'issuing'].includes(row.status) ? button('Ver trámite', () => route('navegador')) : null;
+  const primary = primaryAction(row, realTicket);
   if (primary) group.append(primary);
   if (row.status === 'verified' && row.has_pdf && row.has_xml) group.append(button('Vigencia SAT', () => showSAT(row)));
   for (const format of ['pdf', 'xml']) {
@@ -233,9 +321,13 @@ function rowActions(row) {
   const toggle = el('summary', '⋯');
   toggle.setAttribute('aria-label', 'Más acciones para ' + (row.receipt.merchant || 'el ticket'));
   const panel = el('div', '', 'more-panel');
-  if (review.has(row.status) && !row.issue_attempted) {
-    panel.append(button(state.plan.status === 'ready' ? 'Leer con ChatGPT' : 'Leer en el contenedor', () => readTicket(row), 'plain'));
-    if (row.status !== 'review' && row.status !== 'new') panel.append(button('Editar datos', () => edit(row), 'plain'));
+  if (review.has(row.status) && !row.issue_attempted && !reading(row)) {
+    const readLabel = state.plan.status === 'ready' ? 'Leer con ChatGPT' : 'Leer en el contenedor';
+    if (primary?.textContent !== readLabel) panel.append(button(readLabel, () => readTicket(row), 'plain'));
+    if (row.status !== 'review') panel.append(button('Editar datos', () => edit(row), 'plain'));
+    if (row.status === 'ready' && realTicket && row.receipt.provider !== 'portal_ticket' && state.automation?.enabled) {
+      panel.append(button('Preparar', () => prepare([row]), 'plain'));
+    }
   }
   if (!row.historical) {
     const original = link('Ver original ↗', `/api/jobs/${row.id}/source`, 'plain button-link');
@@ -269,9 +361,18 @@ function rowActions(row) {
 
 function table(container, rows, isDocs = false) {
   if (!rows.length) {
-    container.replaceChildren(blank(isDocs ? 'Aún no hay comprobantes' : 'Aquí llegan tus tickets',
-      isDocs ? 'Los CFDI y las emisiones pendientes aparecerán cuando avances en un trámite.' :
-        state.jobs.length ? 'Prueba otra búsqueda o cambia el filtro.' : 'Sube tu primer recibo o carga un ejemplo para practicar.'));
+    if (!isDocs && state.jobs.length) {
+      const empty = blank('Sin tickets con estos filtros', 'Prueba con otro comercio o folio.');
+      empty.append(button('Mostrar todos los tickets', () => {
+        $('ticket-search').value = '';
+        document.querySelector('[data-filter="all"]').click();
+      }));
+      container.replaceChildren(empty);
+    } else {
+      container.replaceChildren(isDocs
+        ? blank('Aún no hay comprobantes', 'Los CFDI y las emisiones pendientes aparecerán cuando avances en un trámite.')
+        : blank('Aquí llegan tus tickets', 'Sube tu primer recibo o carga un ejemplo para practicar.'));
+    }
     return;
   }
   const wrap = el('div', '', 'table-wrap');
@@ -289,7 +390,9 @@ function table(container, rows, isDocs = false) {
       row.uuid ? `UUID ${row.uuid}` : null].filter(Boolean).join(' · ') || receipt.source, 'ticket-meta'));
     if (row.message) info.append(el('p', row.message, 'ticket-note'));
     const stateCell = el('td');
-    const statusLabel = row.status === 'external' && row.issue_attempted ? 'Solicitud en seguimiento' : jobLabels[row.status];
+    const statusLabel = reading(row) ? 'Leyendo con ChatGPT' :
+      row.status === 'new' && state.automation?.enabled && !row.historical && state.plan.status === 'ready' ? 'En cola de lectura' :
+      row.status === 'external' && row.issue_attempted ? 'Solicitud en seguimiento' : jobLabels[row.status];
     stateCell.append(el('span', statusLabel || row.status, 'job-status', row.status));
     const actions = el('td');
     actions.append(rowActions(row));
@@ -303,8 +406,11 @@ function table(container, rows, isDocs = false) {
 }
 
 function renderTickets(force = false) {
-  const query = $('ticket-search').value.trim().toLowerCase();
-  const signature = JSON.stringify([filter, query, state.jobs]);
+  const search = $('ticket-search');
+  $('clear-ticket-search').hidden = !search.value;
+  const query = search.value.trim().toLowerCase();
+  const signature = JSON.stringify([filter, query, state.jobs, state.automation?.enabled, state.automation?.current_id,
+    state.automation?.phase, liveJob()?.id, state.plan.status, Boolean(state.profile)]);
   if (!force && signature === rowSignature) return;
   rowSignature = signature;
   const rows = state.jobs.filter(row => (filter === 'all' || filter === 'review' && review.has(row.status) && !row.issue_attempted ||
@@ -321,13 +427,20 @@ function renderTickets(force = false) {
 }
 
 function renderBrowser() {
-  viewer.update(state.browser, Boolean(state.active_job));
-  $('browser-open').disabled = $('wa-open').disabled = Boolean(state.active_job);
-  $('browser-open').textContent = state.browser.open ? 'Ver comercios' : 'Abrir navegador';
-  const row = state.jobs.find(job => job.id === state.active_job);
-  const signature = JSON.stringify([row, state.profile?.rfc, state.plan.status]);
+  const personal = state.browser.mode === 'personal';
+  const opening = !personal && state.active_job && state.browser.job_id !== state.active_job;
+  const browser = opening ? {open: false, revision: state.browser.revision} : state.browser;
+  viewer.update(browser, Boolean(state.active_job));
+  $('browser-empty').querySelector('h3').textContent = opening ? 'Abriendo el portal del ticket…' :
+    personal ? 'Nueva pestaña' : 'Sin página abierta';
+  $('browser-empty').querySelector('p').textContent = opening ? 'Aquí verás a Chrome en cuanto abra el portal.' :
+    'Escribe una dirección o abre tu cuenta de Google.';
+  const previous = !state.browser.open || state.browser.job_id === lastLiveJob ? lastLiveJob : null;
+  const row = state.jobs.find(job => job.id === (state.active_job || previous));
+  const signature = JSON.stringify([row, state.active_job, personal, state.profile?.rfc, state.plan.status]);
   if (signature === taskSignature) return;
   taskSignature = signature;
+  $('browser-task-title').textContent = row && !state.active_job ? 'Último trámite' : 'Trámite actual';
   const target = $('browser-task');
   if (!row) {
     target.replaceChildren(el('p', 'Los datos del ticket y las intervenciones aparecerán aquí.', 'muted'));
@@ -344,7 +457,13 @@ function renderBrowser() {
   }
   target.replaceChildren(el('span', jobLabels[row.status], 'job-status', row.status), detail, el('p', row.message, 'muted'));
   const actions = el('div', '', 'buttons');
-  if (row.human_kind) {
+  if (row.id !== state.active_job) {
+    if (row.has_pdf || row.has_xml) actions.append(link('Ver comprobantes', '#comprobantes', 'secondary button-link'));
+    actions.append(link('Volver a la bandeja', '#bandeja', 'secondary button-link'));
+    target.append(actions);
+    return;
+  }
+  if (row.human_kind && !personal) {
     const issue = row.human_kind === 'issue';
     const label = issue ? 'Aprobar emisión' : row.human_kind === 'operator' ? 'Terminar y cotejar' : 'Continuar';
     const resume = button(label, () => perform(() =>
@@ -366,7 +485,9 @@ function renderSettings() {
   $('read-csf').disabled = state.plan.status !== 'ready';
   $('restart-browser').disabled = Boolean(state.active_job);
   if (state.profile && !profileDirty && !document.activeElement.closest('#profile')) {
-    for (const [key, value] of Object.entries(state.profile)) $('profile').elements[key].value = value;
+    for (const [key, value] of Object.entries(state.profile)) {
+      if ($('profile').elements[key]) $('profile').elements[key].value = value || '';
+    }
   }
   const plan = state.plan;
   const labels = planLabels[plan.status] || 'Por conectar';
@@ -403,7 +524,15 @@ function renderPortals() {
 }
 
 async function refresh() {
-  state = await api('/api/state');
+  const request = ++refreshNumber;
+  const latest = await api('/api/state');
+  if (request < appliedRefresh) return;
+  appliedRefresh = request;
+  const interacting = document.hidden || viewer.hasControl() || Boolean(document.querySelector('dialog[open], .row-actions details[open]')) ||
+    Boolean(document.activeElement?.matches('input:not([type=checkbox]):not([type=file]), select, textarea, [contenteditable=true]'));
+  state = latest;
+  trackLive(interacting);
+  renderAutomation();
   renderTickets();
   renderBrowser();
   renderSettings();
@@ -417,13 +546,30 @@ function upload(files) {
     for (const file of files) data.append('files', file);
     const rows = await api('/api/upload', 'POST', data);
     const count = rows.filter(row => row.created).length;
-    return `Tickets añadidos: ${count}. Ya registrados: ${rows.length - count}.`;
+    const duplicates = rows.length - count;
+    const readingSoon = count && state.automation?.enabled ? ' La bandeja mostrará el avance.' : '';
+    return `${count} ${count === 1 ? 'ticket añadido' : 'tickets añadidos'}.` +
+      (duplicates ? ` Ya registrados: ${duplicates}.` : '') + readingSoon;
   });
 }
 
 for (const id of ['primary-upload', 'choose-file']) $(id).onclick = () => $('file-upload').click();
 $('file-upload').onchange = event => {upload([...event.target.files]); event.target.value = '';};
 $('batch').onclick = () => prepare(state.jobs.filter(row => row.status === 'ready'));
+$('automation-enabled').onchange = async event => {
+  const enabled = event.target.checked;
+  savingAutomation = true;
+  renderAutomation();
+  try {
+    await api('/api/automation', 'PUT', {enabled});
+    await refresh();
+  } catch (error) {
+    notify(error.message, true);
+  } finally {
+    savingAutomation = false;
+    renderAutomation();
+  }
+};
 $('add-sample').onclick = () => perform(async () => {
   await api('/api/demo', 'POST');
   return 'Ticket de ejemplo disponible para revisar.';
@@ -444,10 +590,15 @@ for (const node of document.querySelectorAll('[data-filter]')) node.onclick = ()
   renderTickets(true);
 };
 $('ticket-search').oninput = () => renderTickets(true);
+$('clear-ticket-search').onclick = () => {
+  $('ticket-search').value = '';
+  $('ticket-search').focus();
+  renderTickets(true);
+};
 $('portal-search').oninput = renderPortals;
 $('profile').oninput = () => {profileDirty = true;};
-let csfMode = 'local';
-for (const [id, mode] of [['read-csf-local', 'local'], ['read-csf', 'agent']]) $(id).onclick = () => {
+let csfMode = 'extract';
+for (const [id, mode] of [['upload-csf', 'extract'], ['read-csf-local', 'local'], ['read-csf', 'agent']]) $(id).onclick = () => {
   csfMode = mode;
   $('csf-file').click();
 };
@@ -456,22 +607,49 @@ $('csf-file').onchange = event => {
   event.target.value = '';
   if (!file) return;
   if (csfMode === 'local') return receiptTools.openReader(file);
-  if (!window.confirm('¿Usar tu plan de ChatGPT para leer esta constancia fiscal?')) return;
+  const mode = csfMode;
+  if (mode === 'agent' && !window.confirm('¿Usar tu plan de ChatGPT para leer esta constancia fiscal?')) return;
   perform(async () => {
     const data = new FormData();
     data.append('file', file);
+    data.append('mode', mode);
+    $('csf-status').textContent = 'Leyendo la constancia…';
     let draft;
     try {
       draft = await api('/api/profile/read-csf', 'POST', data);
     } catch (error) {
-      receiptTools.openReader(file);
-      return error.message + ' Se abrió la lectura local de la constancia.';
+      $('csf-status').textContent = error.message;
+      throw error;
+    }
+    const fields = $('profile').elements;
+    const previousRFC = fields.rfc.value.trim().toUpperCase();
+    if (previousRFC && !draft.rfc) {
+      $('csf-status').textContent = 'No se pudo cotejar el RFC. Revisa el documento o usa Leer con ChatGPT.';
+      return;
     }
     profileDirty = true;
-    for (const key of ['rfc', 'name', 'postal_code', 'regime']) $('profile').elements[key].value = draft[key] || '';
-    return ['Comprueba los datos y pulsa Guardar datos fiscales.', ...draft.uncertainties].join(' ');
+    if (previousRFC && previousRFC !== draft.rfc) {
+      for (const name of ['name','postal_code','regime','email','cfdi_use','whatsapp_phone']) fields[name].value = '';
+    }
+    for (const key of ['rfc', 'name', 'postal_code', 'regime', 'email']) {
+      if (draft[key]) fields[key].value = draft[key];
+    }
+    const options = draft.regime_options || [];
+    const selector = $('csf-regimes');
+    selector.replaceChildren(new Option('Elige el régimen para facturar', ''));
+    for (const option of options) selector.add(new Option(option.code + ' · ' + option.name, option.code));
+    $('csf-regime-row').hidden = options.length < 2;
+    selector.required = options.length > 1;
+    if (selector.required && !options.some(option => option.code === fields.regime.value)) fields.regime.value = '';
+    selector.value = fields.regime.value;
+    const required = {rfc:'RFC', name:'nombre', postal_code:'CP fiscal', regime:'régimen', email:'correo de entrega', cfdi_use:'uso del CFDI'};
+    const missing = Object.entries(required).filter(([key]) => !fields[key].value.trim()).map(([,label]) => label);
+    $('csf-status').textContent = [...(draft.uncertainties || []), missing.length ? 'Completa ' + missing.join(', ') + '.' : '',
+      'Revisa los campos y pulsa Guardar datos fiscales.'].filter(Boolean).join(' ');
   });
 };
+$('csf-regimes').onchange = event => { $('profile').elements.regime.value = event.target.value; };
+$('profile').elements.regime.oninput = event => { $('csf-regimes').value = event.target.value; };
 $('profile').onsubmit = event => {
   event.preventDefault();
   const data = Object.fromEntries(new FormData(event.target));
@@ -488,6 +666,10 @@ $('receipt-form').onsubmit = event => {
   perform(async () => {
     const result = await api(`/api/jobs/${editing.id}`, 'PUT', values);
     $('editor').close();
+    if (state.automation?.enabled && state.profile && result.status === 'ready' && result.receipt.provider === 'portal_ticket') {
+      prepare([result]);
+      return 'Revisión guardada. Confirma el dominio para abrir el portal.';
+    }
     return result.status === 'duplicate' ? result.message : 'Revisión guardada.';
   });
 };
@@ -501,7 +683,8 @@ $('prepare-form').onsubmit = event => {
   const data = new FormData(event.target);
   perform(async () => {
     for (const row of prepared) await api(`/api/jobs/${row.id}/run`, 'POST',
-      {consent: data.has('consent'), mode: data.get('mode'), auto_issue: data.get('mode') === 'agent' && data.has('auto_issue') && row.receipt.provider === 'capufe'});
+      {consent: data.has('consent'), mode: data.get('mode'), confirmed_url: row.receipt.portal_url || '',
+        auto_issue: data.get('mode') === 'agent' && data.has('auto_issue') && row.receipt.provider === 'capufe'});
     $('prepare-dialog').close();
     route('navegador');
     return 'Trámite en cola.';
@@ -509,11 +692,29 @@ $('prepare-form').onsubmit = event => {
 };
 function openBrowser(provider = null, url = null) {
   return perform(async () => {
+    let confirmed_origin = '';
+    if (url) {
+      const target = new URL(url);
+      if (target.protocol !== 'https:' || target.username || target.password) throw new Error('Introduce un enlace HTTPS público del comercio.');
+      if (!window.confirm('¿Abrir el portal de este comercio en ' + target.origin + '?')) return;
+      confirmed_origin = target.origin;
+    }
     route('navegador');
-    await api('/api/browser/open', 'POST', {provider, url});
+    await api('/api/browser/open', 'POST', {provider, url, confirmed_origin});
   });
 }
-$('browser-open').onclick = () => openBrowser();
+$('open-catalog').onclick = () => openBrowser();
+function resumePersonalIfIdle() {
+  if (activeScreen === 'navegador' && state.token && !state.active_job && state.browser.mode !== 'personal') {
+    viewer.openPersonal();
+  }
+}
+document.querySelector('[data-nav="navegador"]').addEventListener('click', event => {
+  if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  route('navegador');
+  resumePersonalIfIdle();
+});
 $('check-tools').onclick = async () => {
   $('check-tools').disabled = true;
   $('tools-status').textContent = 'Comprobando herramientas…';
@@ -609,7 +810,18 @@ $('copy-request').onclick = async () => {
   catch { $('request-text').select(); }
 };
 for (const close of document.querySelectorAll('[data-close]')) close.onclick = () => $(close.dataset.close).close();
-window.addEventListener('hashchange', openScreen);
+window.addEventListener('hashchange', () => {
+  const selected = location.hash.slice(1);
+  if (selected !== activeScreen) {
+    for (const row of state.jobs) {
+      if (row.id === state.automation?.current_id || ['ready', 'queued', 'running', 'issuing', 'needs_user'].includes(row.status)) {
+        handledLiveJobs.add(row.id);
+      }
+    }
+    if (selected === 'navegador' && liveJob()) lastLiveJob = liveJob().id;
+  }
+  openScreen();
+});
 openScreen();
 const outcome = new URLSearchParams(location.search).get('conexion');
 if (outcome) {
@@ -617,7 +829,10 @@ if (outcome) {
   if (outcome.endsWith('-error')) notify('La conexión no se completó. Puedes volver a iniciarla.', true);
   else notify(outcome.startsWith('chatgpt') ? 'Conexión con ChatGPT guardada. Revisa el estado de tu plan.' : 'Gmail conectado en modo lectura.');
 }
-refresh().then(() => {if (activeScreen === 'portales') renderPortals();}).catch(error => notify(error.message, true));
+refresh().then(() => {
+  if (activeScreen === 'portales') renderPortals();
+  resumePersonalIfIdle();
+}).catch(error => notify(error.message, true));
 setInterval(() => {
   if (!busy && !document.hidden) refresh().catch(error => notify(error.message, true));
 }, 1250);

@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException
 
 from .cfdi import MAX_FILE, NS, UUID_RE
 from .db import Store, now
+from .read_http import read_with_retry
 
 ENDPOINT = 'https://consultaqr.facturaelectronica.sat.gob.mx/ConsultaCFDIService.svc'
 SOAP = 'http://schemas.xmlsoap.org/soap/envelope/'
@@ -94,7 +95,7 @@ def _read_status(data: bytes) -> tuple[str, str]:
 
 def query_sat(payload: bytes) -> tuple[str, str]:
     headers = {'SOAPAction': f'"{ACTION}"', 'Content-Type': 'text/xml; charset=utf-8', 'Accept': 'text/xml'}
-    try:
+    def lookup():
         with httpx.stream('POST', ENDPOINT, content=payload, headers=headers, timeout=12, follow_redirects=False) as reply:
             reply.raise_for_status()
             data = bytearray()
@@ -103,6 +104,8 @@ def query_sat(payload: bytes) -> tuple[str, str]:
                 if len(data) > MAX_REPLY:
                     raise ValueError('La respuesta del SAT excedió el tamaño esperado.')
         return _read_status(bytes(data))
+    try:
+        return read_with_retry(lookup)
     except httpx.HTTPError:
         return 'no_disponible', 'No se pudo consultar el servicio del SAT. Puedes volver a intentarlo.'
     except ValueError as exc:

@@ -163,6 +163,9 @@ async def smoke():
         async with async_playwright() as playwright:
             if os.getenv('FACTURADOR_SMOKE_FIREFOX') == '1':
                 browser = await playwright.firefox.launch()
+            elif os.getenv('FACTURADOR_CHROME_HEADED') == '1':
+                browser = await playwright.chromium.launch(executable_path='/usr/bin/google-chrome-stable',
+                                                           chromium_sandbox=True, headless=False)
             else:
                 browser = await playwright.chromium.launch(executable_path=os.getenv('FACTURADOR_CHROMIUM_PATH'),
                                                            chromium_sandbox=True)

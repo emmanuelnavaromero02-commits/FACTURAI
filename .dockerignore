@@ -8,6 +8,7 @@
 !web/*.js
 !facturador/
 !facturador/*.py
+!facturador/portal_form.js
 !apps/
 !apps/api/
 !apps/api/src/

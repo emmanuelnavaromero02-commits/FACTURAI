@@ -59,7 +59,7 @@ class SatChecks(unittest.TestCase):
 
     def test_queries_sat_persists_and_retains_last_confirmation(self):
         self.archive()
-        replies = iter([(200, acuse('S - obtenido', 'Vigente')), (200, acuse('S - obtenido', 'CANCELADO')), (503, b'')])
+        replies = iter([(200, acuse('S - obtenido', 'Vigente')), (200, acuse('S - obtenido', 'CANCELADO'))] + [(503, b'')] * 3)
         def service(request):
             self.assertEqual(request.method, 'POST')
             self.assertEqual(str(request.url), sat.ENDPOINT)
@@ -75,7 +75,7 @@ class SatChecks(unittest.TestCase):
             status, content = next(replies)
             return httpx.Response(status, content=content)
         with httpx.Client(transport=httpx.MockTransport(service)) as http:
-            with patch.object(sat.httpx, 'stream', http.stream):
+            with patch.object(sat.httpx, 'stream', http.stream), patch('facturador.read_http.time.sleep'):
                 self.assertEqual(self.client.post(self.url).json()['status'], 'vigente')
                 canceled = self.client.post(self.url).json()
                 self.assertEqual(canceled['status'], 'cancelado')

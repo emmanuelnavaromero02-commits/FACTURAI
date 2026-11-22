@@ -59,6 +59,10 @@ async def smoke():
                     ui = await operator.new_page(viewport={'width': 1500, 'height': 1000})
                     await ui.goto(f'http://127.0.0.1:{port}/#portales')
                     await ui.locator('#ticket-url').fill(origin + '/')
+                    async def confirm_merchant(dialog):
+                        assert dialog.type == 'confirm' and origin in dialog.message
+                        await dialog.accept()
+                    ui.once('dialog', confirm_merchant)
                     await ui.get_by_role('button', name='Abrir enlace en el navegador').click()
                     screen = ui.locator('#browser-image')
                     await expect(screen).to_be_visible(timeout=20_000)
