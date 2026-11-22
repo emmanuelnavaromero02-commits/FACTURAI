@@ -1,11 +1,13 @@
+import asyncio
 import os
 import socket
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
-from facturador.profile_lock import lock_profile, release_stale_links
+from facturador.profile_lock import close_context, launch_chrome, lock_profile, release_stale_links
 
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux Chrome singleton sockets')
@@ -49,3 +51,33 @@ class ChromeLockTests(unittest.TestCase):
                 lock.symlink_to(socket.gethostname() + '-32')
                 (profile/'SingletonSocket').symlink_to(profile/'previous-tmp'/'SingletonSocket')
                 self.assertFalse(release_stale_links(profile, lease, shared, socket.gethostname()))
+
+
+@unittest.skipUnless(sys.platform.startswith('linux'), 'Linux Chrome singleton sockets')
+class ChromeCloseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_close_event_waits_for_the_original_local_process_to_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp)
+            child = await asyncio.create_subprocess_exec(sys.executable, '-c', 'import time; time.sleep(30)')
+            context = Mock(close=AsyncMock(), is_closed=Mock(return_value=True))
+            async def launch(directory, **options):
+                (directory/'SingletonLock').symlink_to(f'{socket.gethostname()}-{child.pid}')
+                (directory/'SingletonSocket').symlink_to(directory/'retired-socket')
+                return context
+            try:
+                await launch_chrome(launch, profile)
+                closing = asyncio.create_task(close_context(context))
+                await asyncio.sleep(.3)
+                self.assertFalse(closing.done())
+                with self.assertRaisesRegex(ValueError, 'Otra instancia'):
+                    lock_profile(profile)
+                child.terminate()
+                await child.wait()
+                await asyncio.wait_for(closing, timeout=2)
+                with lock_profile(profile):
+                    pass
+                context.close.assert_not_awaited()
+            finally:
+                if child.returncode is None:
+                    child.kill()
+                    await child.wait()

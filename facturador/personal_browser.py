@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 from playwright.async_api import Error as BrowserError
 
 from .catalog import public_portal_origin, resolves_publicly
-from .profile_lock import launch_chrome
+from .profile_lock import close_context, launch_chrome
 from .viewer import BrowserView
 
 
@@ -52,7 +52,7 @@ class PersonalBrowser:
             await context.route('**/*', self.guard_request)
             await context.route_web_socket('**/*', self.guard_websocket)
         except Exception:
-            await context.close()
+            await close_context(context)
             raise
         self.context = context
         context.set_default_timeout(7000)
@@ -133,7 +133,7 @@ class PersonalBrowser:
                 if self.view.dialog:
                     await self.view.answer(self.view.dialog_key, False)
                 if self.context:
-                    await self.context.close()
+                    await close_context(self.context)
             finally:
                 self.closing = False
 

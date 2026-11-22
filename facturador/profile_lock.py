@@ -1,15 +1,19 @@
 """Keep Chrome's Linux profile exclusion effective across container replacements."""
 import argparse
+import asyncio
 import errno
 import os
 import re
 import socket
 import sys
+import weakref
 from pathlib import Path
+from playwright.async_api import Error as BrowserError
 
 
 LINKS = ('SingletonSocket', 'SingletonCookie', 'SingletonLock')
 PROFILES = ('browser_profile_chrome', 'browser_personal_chrome')
+_context_leases = weakref.WeakKeyDictionary()
 
 
 def lock_profile(directory):
@@ -32,6 +36,69 @@ def socket_unavailable(path):
         except OSError as exc:
             return exc.errno in (errno.ENOENT, errno.ECONNREFUSED)
     return False
+
+
+class ChromeLease:
+    def __init__(self, handle, directory):
+        self.handle = handle
+        self.closed = asyncio.Event()
+        self.pid = None
+        self.socket = None
+        lock, endpoint = directory/'SingletonLock', directory/'SingletonSocket'
+        if lock.is_symlink() and endpoint.is_symlink():
+            owner = re.fullmatch(re.escape(socket.gethostname()) + r'-([1-9]\d*)', os.readlink(lock))
+            if owner:
+                self.pid = int(owner[1])
+                self.socket = Path(os.readlink(endpoint))
+
+    def release(self, *_):
+        self.handle.close()
+        self.closed.set()
+
+    def process_gone(self):
+        if self.pid is None:
+            return False
+        try:
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
+            return socket_unavailable(self.socket)
+        except PermissionError:
+            pass
+        return False
+
+
+async def close_context(context):
+    lease = _context_leases.get(context)
+    if lease is None:
+        try:
+            await context.close()
+        except BrowserError:
+            if context.is_closed() is not True:
+                raise
+        return
+    if lease.closed.is_set():
+        return
+    # Playwright's is_closed() is also true while a concurrent close is in
+    # progress. The profile remains owned until Chrome has finished closing.
+    try:
+        async with asyncio.timeout(10):
+            if context.is_closed() is not True:
+                try:
+                    await context.close()
+                except BrowserError:
+                    if context.is_closed() is not True and not lease.process_gone():
+                        raise
+            while not lease.closed.is_set():
+                try:
+                    await asyncio.wait_for(lease.closed.wait(), .25)
+                except TimeoutError:
+                    if lease.process_gone():
+                        lease.release()
+    except TimeoutError as exc:
+        if lease.closed.is_set() or lease.process_gone():
+            lease.release()
+            return
+        raise ValueError('Google Chrome sigue cerrando el perfil. Espera a que termine para reabrirlo.') from exc
 
 
 def release_stale_links(directory, handle, shared_tmp, retired_host=None):
@@ -83,7 +150,9 @@ async def launch_chrome(launch, directory, **options):
         if len(os.fsencode(tmp)) + len('/com.google.Chrome.XXXXXX/SingletonSocket') < 108:
             options['env'] = {**os.environ, **options.get('env', {}), 'TMPDIR': str(tmp)}
         context = await launch(directory, **options)
-        context.on('close', lambda _: handle.close())
+        lease = ChromeLease(handle, directory)
+        _context_leases[context] = lease
+        context.on('close', lease.release)
         lock = directory/'SingletonLock'
         if lock.is_symlink():
             handle.seek(0)

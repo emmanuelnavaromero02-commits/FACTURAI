@@ -23,7 +23,7 @@ from .documents import job_candidates, reconcile
 from .fiscal_choices import NAMES as FISCAL_FIELDS, fiscal_choices
 from .models import Action, Profile, Receipt
 from .personal_browser import PersonalBrowser
-from .profile_lock import launch_chrome
+from .profile_lock import close_context, launch_chrome
 from .portals import capufe_proof, capufe_recipient, normalize
 from .viewer import BrowserView
 
@@ -623,13 +623,9 @@ class Runner:
                             raise
                         failed_context = self.context
                         if failed_context:
-                            try:
-                                await failed_context.close()
-                            except BrowserError:
-                                pass  # The close event may be in flight when the job wakes up.
-                            finally:
-                                if self.context is failed_context:
-                                    self.context = None
+                            await close_context(failed_context)
+                            if self.context is failed_context:
+                                self.context = None
                         self.store.update(key, status='running', message='Reabriendo el portal tras perder la sesión.')
                         self.store.event(key, 'browser_reopened', 'Nueva sesión antes de la emisión')
             except (Exception, asyncio.CancelledError) as exc:
@@ -868,7 +864,7 @@ class Runner:
         if self.viewer.dialog:
             await self.viewer.answer(self.viewer.dialog_key, False)
         if self.context:
-            await self.context.close()
+            await close_context(self.context)
         await self.personal.close()
         if self.downloads:
             await asyncio.gather(*self.downloads, return_exceptions=True)

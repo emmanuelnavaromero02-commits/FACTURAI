@@ -7,6 +7,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from unittest.mock import patch
 
+from playwright.async_api import Error as BrowserError
+
 from facturador.auth import PlanError
 from facturador.catalog import CATALOG
 from facturador.db import Store
@@ -106,7 +108,13 @@ async def smoke():
                     task = runner.job_tasks[key]
                     first = await pending(key, 'issue', task)
                     assert not submissions and not store.get(key)['issue_attempted']
-                    await runner.context.close()
+                    ticket_page = runner.viewer.page
+                    try:
+                        await runner.context.close()
+                    except BrowserError as exc:
+                        # The runner can close this same context after its ticket page closes.
+                        if not ticket_page.is_closed() or 'Target page, context or browser has been closed' not in exc.message:
+                            raise
                     await pending(key, 'issue', task, first['future'])
                     assert len(contexts) == 2 and not submissions
                     assert sum(e['kind'] == 'browser_reopened' for e in store.events(key)) == 1
