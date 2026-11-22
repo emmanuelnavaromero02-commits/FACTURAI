@@ -10,7 +10,7 @@ import re
 import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
-from playwright.async_api import Error as BrowserError, TimeoutError as BrowserTimeout
+from playwright.async_api import Error as BrowserError
 
 from .ai import AI
 from .auth import ChatGPTPlan, PlanError
@@ -555,9 +555,11 @@ class Runner:
             try:
                 try:
                     image = await page.screenshot(type='jpeg', quality=76, scale='css', timeout=6000)
-                except BrowserTimeout:
+                except BrowserError:
+                    if page.is_closed() or page in self.lost_pages or self.context is None:
+                        raise
                     image = None
-                    self.store.event(key, 'text_navigation', 'La captura tardó demasiado. Se usó el árbol visible.')
+                    self.store.event(key, 'text_navigation', 'El navegador no produjo la captura. Se usó el árbol visible.')
                 action = await asyncio.to_thread(ai.next_action, instructions, observation, image)
             except PlanError as exc:
                 decision = await self.human(key, page, 'plan', str(exc))

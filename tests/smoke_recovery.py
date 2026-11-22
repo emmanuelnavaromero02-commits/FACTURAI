@@ -52,6 +52,15 @@ async def smoke():
         store = Store(Path(folder))
         runner = Runner(store)
         start = runner.start_browser
+        run_session = runner._session
+        session_errors = []
+
+        async def observe_session(*args):
+            try:
+                return await run_session(*args)
+            except Exception as exc:
+                session_errors.append(exc)
+                raise
 
         async def start_test_browser():
             await start()
@@ -74,7 +83,8 @@ async def smoke():
                         return item
                     if task.done():
                         await task
-                        raise AssertionError((kind, store.get(key)['status'], store.get(key)['message'], store.events(key)))
+                        failure = AssertionError((kind, store.get(key)['status'], store.get(key)['message'], store.events(key)))
+                        raise failure from (session_errors[-1] if session_errors else None)
                     await asyncio.sleep(.04)
 
         def infer(instructions, state, screenshot):
@@ -83,7 +93,7 @@ async def smoke():
             return action('click', 'button', 'Facturar')
 
         try:
-            with patch.object(runner, 'start_browser', start_test_browser):
+            with patch.object(runner, 'start_browser', start_test_browser), patch.object(runner, '_session', observe_session):
                 key = ticket('primera')
                 with patch('facturador.runner.AI.next_action', side_effect=infer):
                     runner.schedule(key, PROFILE)
