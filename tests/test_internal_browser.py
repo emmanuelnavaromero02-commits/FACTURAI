@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,14 +29,19 @@ class BrowserStartupTests(unittest.IsolatedAsyncioTestCase):
                                       firefox=Mock(launch_persistent_context=self.firefox))
 
     async def test_headed_chrome_uses_its_native_identity_and_own_persistent_profile(self):
+        profile = self.runner.store.root / 'browser_profile_chrome'
         with patch.dict(os.environ, FACTURADOR_CHROME_HEADED='1'):
+            expected_env = {'env': {**os.environ, 'TMPDIR': str(profile.resolve() / '.runtime')}} if sys.platform.startswith('linux') else {}
             await self.runner.start_browser()
             await self.runner.start_browser()
+        for registration in self.context.on.call_args_list:
+            if registration.args[0] == 'close':
+                self.addCleanup(registration.args[1], self.context)
         self.assertEqual(self.runner.engine, 'Google Chrome')
         self.chromium.assert_awaited_once_with(
-            self.runner.store.root / 'browser_profile_chrome', executable_path='/usr/bin/google-chrome-stable',
+            profile, executable_path='/usr/bin/google-chrome-stable',
             headless=False, chromium_sandbox=True, accept_downloads=True, service_workers='block',
-            viewport={'width': 1280, 'height': 850}, timeout=15_000)
+            viewport={'width': 1280, 'height': 850}, timeout=15_000, **expected_env)
         self.context.route.assert_awaited_once_with('**/*', self.runner.guard_navigation)
 
     async def test_explicit_chrome_reports_its_failure_without_substituting_another_browser(self):
