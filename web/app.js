@@ -1,11 +1,13 @@
 import {installViewer} from './visor.js';
 import {installReceiptTools} from './herramientas.js';
+import {installSAT, installWhatsApp} from './seguimiento.js';
 
 const $ = id => document.getElementById(id);
 const sections = {bandeja: 'Bandeja', navegador: 'Navegador', comprobantes: 'Comprobantes', portales: 'Portales', ajustes: 'Ajustes'};
 const jobLabels = {new: 'Por leer', review: 'Por revisar', external: 'Solicitar al comercio', ready: 'Listo', queued: 'En cola', running: 'En el portal',
   issuing: 'Emisión en trámite', needs_user: 'Requiere tu intervención', issued_waiting_files: 'Emitido · recuperar',
-  verified: 'Comprobado', blocked: 'Pendiente', uncertain: 'Resultado incierto', duplicate: 'Duplicado', historical: 'Histórico'};
+  verified: 'Comprobado', blocked: 'Pendiente', uncertain: 'Resultado incierto', duplicate: 'Duplicado', historical: 'Histórico',
+  whatsapp_preparing: 'Preparando WhatsApp'};
 const planLabels = {disconnected: 'Por conectar', ready: 'Plan conectado', limit: 'Cupo en pausa',
   identity_only: 'Autoriza el uso del plan', reconnect: 'Vuelve a conectar'};
 const payments = {'01': 'Efectivo', '03': 'Transferencia', '04': 'Crédito', '28': 'Débito', '99': 'Por definir'};
@@ -112,6 +114,9 @@ const receiptTools = installReceiptTools({api, el, button, link, perform, curren
     route('ajustes');
     notify('Conecta Gmail para elegir el correo que contiene el ticket.');
   }});
+const showSAT = installSAT({api, currency});
+const showWhatsApp = installWhatsApp({api, currency, profile: () => state.profile,
+  showBrowser: () => route('navegador'), showSettings: () => route('ajustes')});
 
 function blank(title, description, mark = '▤') {
   const box = el('div', '', 'empty');
@@ -207,12 +212,17 @@ function readTicket(row) {
 
 function rowActions(row) {
   const group = el('div', '', 'row-actions');
+  const realTicket = !row.historical && !row.receipt.source.startsWith('Ejemplo:');
+  const whatsappPrimary = realTicket && ['external', 'whatsapp_preparing'].includes(row.status);
   const primary = row.status === 'new' || row.status === 'review' ? button('Revisar', () => edit(row)) :
+    whatsappPrimary ? button(row.issue_attempted || row.status === 'whatsapp_preparing' ? 'Ver solicitud WhatsApp' : 'Solicitar por WhatsApp',
+      () => showWhatsApp(row), 'primary') :
     row.status === 'external' ? button('Preparar solicitud', () => request(row), 'primary') :
     row.can_retry ? button('Reintentar', () => prepare([row]), 'primary') :
     row.status === 'ready' && !row.receipt.source.startsWith('Ejemplo:') ? button('Preparar', () => prepare([row]), 'primary') :
     ['running', 'needs_user', 'issuing'].includes(row.status) ? button('Ver trámite', () => route('navegador')) : null;
   if (primary) group.append(primary);
+  if (row.status === 'verified' && row.has_pdf && row.has_xml) group.append(button('Vigencia SAT', () => showSAT(row)));
   for (const format of ['pdf', 'xml']) {
     if (!row[`has_${format}`]) continue;
     const file = link(format.toUpperCase(), `/api/jobs/${row.id}/files/${format}`, 'secondary button-link');
@@ -245,7 +255,12 @@ function rowActions(row) {
       }), 'plain'));
   }
   if (working.has(row.status)) panel.append(button('Detener', () => perform(() => api(`/api/jobs/${row.id}/stop`, 'POST')), 'plain'));
-  if (!terminal.has(row.status) && !working.has(row.status) && row.status !== 'external') panel.append(button('Preparar solicitud', () => request(row), 'plain'));
+  if (realTicket && !whatsappPrimary && (row.status === 'ready' || row.issue_attempted) && !working.has(row.status)) {
+    panel.append(button(row.issue_attempted ? 'Ver solicitud WhatsApp' : 'Solicitar por WhatsApp', () => showWhatsApp(row), 'plain'));
+  }
+  if (!row.issue_attempted && !terminal.has(row.status) && !working.has(row.status) && row.status !== 'whatsapp_preparing') {
+    panel.append(button('Copiar solicitud al comercio', () => request(row), 'plain'));
+  }
   panel.append(button('Ver actividad', () => perform(() => logs(row)), 'plain'));
   menu.append(toggle, panel);
   group.append(menu);
@@ -274,7 +289,8 @@ function table(container, rows, isDocs = false) {
       row.uuid ? `UUID ${row.uuid}` : null].filter(Boolean).join(' · ') || receipt.source, 'ticket-meta'));
     if (row.message) info.append(el('p', row.message, 'ticket-note'));
     const stateCell = el('td');
-    stateCell.append(el('span', jobLabels[row.status] || row.status, 'job-status', row.status));
+    const statusLabel = row.status === 'external' && row.issue_attempted ? 'Solicitud en seguimiento' : jobLabels[row.status];
+    stateCell.append(el('span', statusLabel || row.status, 'job-status', row.status));
     const actions = el('td');
     actions.append(rowActions(row));
     const tr = el('tr');
@@ -291,11 +307,13 @@ function renderTickets(force = false) {
   const signature = JSON.stringify([filter, query, state.jobs]);
   if (!force && signature === rowSignature) return;
   rowSignature = signature;
-  const rows = state.jobs.filter(row => (filter === 'all' || filter === 'review' && review.has(row.status) ||
-    filter === 'working' && working.has(row.status)) && [row.receipt.merchant, row.receipt.ticket_number,
+  const rows = state.jobs.filter(row => (filter === 'all' || filter === 'review' && review.has(row.status) && !row.issue_attempted ||
+    filter === 'working' && (working.has(row.status) || row.status === 'whatsapp_preparing' || row.status === 'external' && row.issue_attempted))
+    && [row.receipt.merchant, row.receipt.ticket_number,
       row.receipt.amount, row.receipt.source, ...row.receipt.billing_codes].join(' ').toLowerCase().includes(query));
   table($('tickets'), rows);
-  table($('documents'), state.jobs.filter(row => documents.has(row.status) || row.has_pdf || row.has_xml), true);
+  table($('documents'), state.jobs.filter(row => documents.has(row.status) || row.has_pdf || row.has_xml ||
+    row.status === 'external' && row.issue_attempted), true);
   $('count-total').textContent = state.jobs.length;
   $('count-pending').textContent = state.jobs.filter(row => !terminal.has(row.status)).length;
   $('count-verified').textContent = state.jobs.filter(row => row.status === 'verified').length;

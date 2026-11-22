@@ -33,7 +33,9 @@ from .ingest import IMAGE_EXT, MAX_UPLOAD, save_input, save_upload, validate_doc
 from .local_reader import read_local_page
 from .models import Profile, Receipt
 from .runner import Runner
+from .sat import sat_router
 from .viewer import ViewerInput
+from .whatsapp import whatsapp_router
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -72,8 +74,10 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
                     await runner.start_browser()
                 except ValueError:
                     pass  # The inbox, reader and recovery tools stay available offline.
+            wa_routes.watcher.start()
             yield
         finally:
+            await wa_routes.watcher.close()
             await runner.close()
             plan.close()
 
@@ -82,6 +86,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     app.state.runner = runner
     app.state.plan = plan
     app.state.csrf_token = token
+    app.include_router(sat_router(store))
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
 
     @app.middleware("http")
@@ -105,6 +110,9 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         if not path.exists():
             raise ValueError("Guarda primero tus datos fiscales en el panel")
         return Profile.model_validate_json(path.read_text(encoding="utf-8"))
+
+    wa_routes = whatsapp_router(store, runner, profile)
+    app.include_router(wa_routes)
 
     @app.exception_handler(ValueError)
     async def invalid(request, exc):
@@ -146,6 +154,10 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     @app.get('/herramientas.js')
     def receipt_tools_script():
         return FileResponse(BASE / 'web' / 'herramientas.js', media_type='application/javascript')
+
+    @app.get('/seguimiento.js')
+    def tracking_script():
+        return FileResponse(BASE / 'web' / 'seguimiento.js', media_type='application/javascript')
 
     @app.get('/healthz')
     async def health():

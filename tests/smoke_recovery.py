@@ -1,4 +1,4 @@
-"""Pérdida real del contexto Chromium y de la disponibilidad del modelo en un comercio sintético."""
+"""Pérdida real de Chromium o Firefox y de la disponibilidad del modelo en un comercio sintético."""
 
 import asyncio
 import os
@@ -50,6 +50,11 @@ async def smoke():
 
     with tempfile.TemporaryDirectory() as folder, patch.dict(CATALOG, {'prueba': provider}):
         store = Store(Path(folder))
+        if os.getenv('EXPECTED_ENGINE') == 'Firefox':
+            # Keep the regression reproducible for existing volumes with the previous browser preference.
+            old_profile = store.root / 'browser_profile_firefox'
+            old_profile.mkdir()
+            (old_profile / 'prefs.js').write_text('user_pref("dom.serviceWorkers.enabled", false);\n', encoding='utf-8')
         runner = Runner(store)
         start = runner.start_browser
         run_session = runner._session

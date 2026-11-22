@@ -170,6 +170,53 @@
     <div class="dialog-actions"><button class="secondary" type="button" data-close="prepare-dialog">Cancelar</button><button class="primary">Iniciar facturación</button></div>
   </form></dialog>
 
+  <dialog id="sat-dialog" aria-labelledby="sat-title"><div class="dialog-body">
+    <div class="dialog-heading"><div><h2 id="sat-title">Vigencia del CFDI en el SAT</h2><p id="sat-ticket"></p></div>
+      <button type="button" class="icon-button" data-close="sat-dialog" aria-label="Cerrar consulta del SAT">×</button></div>
+    <p id="sat-uuid" class="fiscal-uuid"></p>
+    <div aria-live="polite" aria-atomic="true" class="followup-result"><strong id="sat-state"></strong>
+      <p id="sat-detail"></p><p class="muted" id="sat-date" hidden></p><p id="sat-last" hidden></p></div>
+    <div class="dialog-actions"><button type="button" class="primary" id="sat-query">Consultar al SAT</button></div>
+  </div></dialog>
+
+  <dialog id="wa-job-dialog" aria-labelledby="wa-job-title"><div class="dialog-body">
+    <div class="dialog-heading"><div><h2 id="wa-job-title">Factura por WhatsApp</h2><p id="wa-job-ticket"></p></div>
+      <button type="button" class="icon-button" data-close="wa-job-dialog" aria-label="Cerrar solicitud por WhatsApp">×</button></div>
+    <div class="followup-result" aria-live="polite" aria-atomic="true">
+      <strong id="wa-job-state"></strong><p id="wa-job-message"></p><p class="muted" id="wa-job-record" hidden></p>
+    </div>
+    <form id="wa-job-form" hidden>
+      <fieldset id="wa-job-fields" class="followup-fields">
+        <legend>Solicitud al comercio</legend>
+        <label>Número de WhatsApp del comercio, con código de país
+          <input id="wa-job-phone" name="phone" type="tel" required maxlength="30" placeholder="+52 664 123 4567" autocomplete="off"></label>
+        <div class="fields">
+          <label>Constancia fiscal (opcional)<input name="csf" type="file" accept=".pdf,.jpg,.jpeg,.png,.webp"></label>
+          <label>Comprobante de pago (opcional)<input name="voucher" type="file" accept=".pdf,.jpg,.jpeg,.png,.webp"></label>
+        </div>
+        <p id="wa-job-profile" class="muted"></p>
+        <label class="check-row"><input name="consent" type="checkbox" required>
+          <span>Autorizo enviar a este número el ticket original, mis datos fiscales, mi correo y los archivos que seleccioné.</span></label>
+        <label class="check-row"><input name="watch" type="checkbox" checked>
+          <span>Buscar automáticamente la respuesta de este comercio y guardar los comprobantes de este ticket. Requiere Docker en ejecución y WhatsApp Web vinculado.</span></label>
+        <div class="buttons"><button class="primary" type="submit">Enviar solicitud por WhatsApp</button></div>
+      </fieldset>
+    </form>
+    <p class="muted" id="wa-job-hint" hidden></p>
+    <div id="wa-job-tracking" class="followup-fields" hidden>
+      <label class="check-row"><input id="wa-job-auto" type="checkbox" aria-describedby="wa-job-tracking-detail">
+        <span>Buscar automáticamente el PDF y XML de este ticket</span></label>
+      <p id="wa-job-tracking-detail" class="muted"></p>
+    </div>
+    <div class="buttons followup-actions">
+      <button type="button" id="wa-job-recover" class="primary" hidden>Buscar PDF y XML en el chat</button>
+      <button type="button" id="wa-job-chat" class="secondary" hidden>Abrir conversación</button>
+      <button type="button" id="wa-job-link" class="secondary" hidden>Vincular WhatsApp Web</button>
+      <button type="button" id="wa-job-settings" class="secondary" hidden>Completar datos fiscales</button>
+      <button type="button" id="wa-job-refresh" class="plain">Actualizar estado</button>
+    </div>
+  </div></dialog>
+
   <dialog id="logs-dialog"><div class="dialog-body"><div class="dialog-heading"><div><h2>Actividad del ticket</h2><p id="logs-label"></p></div><button type="button" class="icon-button" data-close="logs-dialog" aria-label="Cerrar actividad">×</button></div><div id="logs"></div></div></dialog>
   <dialog id="model-dialog"><form id="model-form" class="dialog-body"><div class="dialog-heading"><h2>Elegir modelo</h2><button type="button" data-close="model-dialog" class="icon-button" aria-label="Cerrar">×</button></div><label>Modelos de tu plan<select name="model" required></select></label><div class="dialog-actions"><button class="primary">Usar modelo</button></div></form></dialog>
   <dialog id="gmail-dialog"><form id="gmail-form" class="dialog-body"><div class="dialog-heading"><div><h2>Recuperar de Gmail</h2><p id="gmail-job"></p></div><button class="icon-button" type="button" data-close="gmail-dialog" aria-label="Cerrar">×</button></div><label>Búsqueda por fecha, remitente o folio<input name="query" required maxlength="400"></label><div class="dialog-actions"><button class="primary">Buscar comprobante</button></div></form></dialog>

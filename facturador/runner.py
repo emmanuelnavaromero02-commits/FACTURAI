@@ -121,8 +121,10 @@ class Runner:
                         executable_path=os.getenv('FACTURADOR_CHROMIUM_PATH'), **settings)
                     self.engine = 'Chromium'
                 except BrowserError:
+                    # Repair existing profiles. Disabling Firefox's API also disables request interception;
+                    # Playwright blocks worker registration separately via the shared context policy.
                     self.context = await self.playwright.firefox.launch_persistent_context(
-                        self.store.root / 'browser_profile_firefox', firefox_user_prefs={'dom.serviceWorkers.enabled': False}, **settings)
+                        self.store.root / 'browser_profile_firefox', firefox_user_prefs={'dom.serviceWorkers.enabled': True}, **settings)
                     self.engine = 'Firefox'
             except Exception as exc:
                 if self.playwright is not None:
@@ -469,9 +471,16 @@ class Runner:
                         row = self.store.get(key)
                         if row['status'] in {'verified', 'duplicate'}:
                             return
+                        if row['issue_attempted'] or row['human_exposed'] or row['uuid'] or row['issuance_seen']:
+                            # The browser can disappear after saving both files but before the next page snapshot.
+                            if self.downloads:
+                                await asyncio.wait(tuple(self.downloads), timeout=12)
+                            if await self.recover(key, profile):
+                                return
+                            raise
                         page = self.viewer.page
                         lost = self.context is None or page in self.lost_pages or (page and page.is_closed())
-                        if attempt or not lost or row['issue_attempted'] or row['human_exposed'] or row['uuid'] or row['issuance_seen']:
+                        if attempt or not lost:
                             raise
                         failed_context = self.context
                         if failed_context:

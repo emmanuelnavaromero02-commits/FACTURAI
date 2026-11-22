@@ -125,8 +125,10 @@ async def check_tools(runner, gmail):
         item('Gmail', 'configured' if gmail_state == 'connected' else 'pending',
              'Autorización guardada.' if gmail_state == 'connected' else 'Gmail requiere vinculación.',
              'Importa el correo .eml o los archivos de la factura.'),
-        item('WhatsApp Web', 'manual', 'La vinculación se comprueba en la pantalla de WhatsApp.',
-             'Importa fotos o el ZIP exportado del chat.'),
+        item('WhatsApp Web', 'manual', 'Abre la sesión vinculada para enviar una solicitud al comercio o buscar su respuesta.',
+             'Puedes adjuntar al expediente los comprobantes recibidos por otro canal.'),
+        item('Vigencia del CFDI en el SAT', 'manual', 'La consulta se inicia desde un expediente con PDF y XML cotejados.',
+             'Si el SAT no responde, vuelve a consultar el mismo UUID desde el expediente.'),
         item('Portales y CAPTCHA', 'manual', 'El comercio verifica el ticket y la sesión al iniciar cada trámite.',
              'Toma el control del navegador, o recupera la factura existente por correo.'),
     ])
