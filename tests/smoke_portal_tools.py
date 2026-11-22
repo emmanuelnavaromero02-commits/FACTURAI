@@ -76,6 +76,7 @@ async def smoke():
 
                     await click_in_portal(remote.get_by_text('Documentos', exact=True))
                     await expect(remote.get_by_role('heading')).to_have_text('Documentos de prueba')
+                    await expect(ui.locator('#browser-address')).to_have_text(origin + '/documentos')
                     await ui.get_by_role('button', name='Atrás', exact=True).click()
                     await expect(remote.get_by_text('Documentos', exact=True)).to_be_visible()
                     await expect(ui.locator('#browser-address')).to_have_text(origin + '/')

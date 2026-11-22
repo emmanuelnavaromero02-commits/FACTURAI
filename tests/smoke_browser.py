@@ -7,8 +7,11 @@ import os
 from PIL import Image, ImageChops
 from playwright.async_api import async_playwright, expect
 
+from facturador.local_reader import ocr_languages
+
 
 async def smoke():
+    assert set(ocr_languages().split('+')) == {'spa', 'eng'}, 'Faltan los idiomas de OCR de la imagen Docker'
     async with async_playwright() as playwright:
         # Separate browser for the operator. The server launches its own persistent Chromium.
         operator = await playwright.chromium.launch(

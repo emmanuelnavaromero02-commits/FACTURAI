@@ -10,6 +10,7 @@ export function installViewer({api, token, showError, perform}) {
   let lastMove = 0;
   let updating = false;
   let jobActive = false;
+  let changingPage = false;
   let uploadId = '';
 
   function releaseFrame() {
@@ -24,7 +25,7 @@ export function installViewer({api, token, showError, perform}) {
     image.classList.toggle('controlling', Boolean(channel));
     byId('paste-form').hidden = !channel;
     byId('browser-tools').hidden = !channel;
-    byId('page-back').disabled = byId('page-forward').disabled = jobActive;
+    byId('page-back').disabled = byId('page-forward').disabled = jobActive || changingPage;
     const currentUpload = channel ? (browser.upload?.id || '') : '';
     if (uploadId !== currentUpload) byId('portal-file').value = '';
     uploadId = currentUpload;
@@ -166,7 +167,20 @@ export function installViewer({api, token, showError, perform}) {
     syncControls();
   }));
   for (const [id, direction] of [['page-back', 'back'], ['page-forward', 'forward']]) {
-    byId(id).onclick = () => perform(() => api('/api/browser/history', 'POST', {channel, direction}));
+    byId(id).onclick = async () => {
+      if (!channel || changingPage) return;
+      changingPage = true;
+      syncControls();
+      try {
+        const result = await api('/api/browser/history', 'POST', {channel, direction});
+        update(result, jobActive);
+      } catch (error) {
+        showError(error.message);
+      } finally {
+        changingPage = false;
+        syncControls();
+      }
+    };
   }
   byId('page-png').onclick = () => perform(async () => {
     const blob = await api('/api/browser/screenshot', 'POST', {channel});
