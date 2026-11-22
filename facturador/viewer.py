@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 import re
 import secrets
-from typing import Literal
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from playwright.async_api import FileChooser, Frame
 
 KEY = re.compile(r'(?:Backspace|Delete|Tab|Enter|Escape|Home|End|PageUp|PageDown|Arrow(?:Up|Down|Left|Right)|Space|(?:ControlOrMeta|Control)\+[aAzZyY])')
 
@@ -21,6 +25,14 @@ class ViewerInput(BaseModel):
     value: str = Field(default='', max_length=2000)
 
 
+@dataclass(frozen=True)
+class PortalUpload:
+    id: str
+    chooser: FileChooser
+    frame: Frame
+    origin: str
+
+
 class BrowserView:
     def __init__(self):
         self.page = None
@@ -31,6 +43,7 @@ class BrowserView:
         self.pointer_down = False
         self.dialog = None
         self.dialog_key = ''
+        self.file_request: PortalUpload | None = None
         self.commands = asyncio.Lock()
         self.capture = asyncio.Lock()
 
@@ -43,6 +56,7 @@ class BrowserView:
         url = address._replace(query='', fragment='').geturl() if address else ''
         return {'open': self.open, 'revision': self.revision, 'label': self.title,
                 'url': url, 'manual': self.manual and self.open,
+                'upload': {'id': self.file_request.id, 'origin': self.file_request.origin} if self.file_request else None,
                 'dialog': {'id': self.dialog_key, 'type': self.dialog.type, 'text': self.dialog.message[:400]}
                 if self.dialog else None}
 
@@ -62,6 +76,7 @@ class BrowserView:
 
     async def _release(self):
         self.channel = ''
+        self.file_request = None
         if self.pointer_down and self.open and not self.dialog:
             try:
                 await self.page.mouse.up()
@@ -95,8 +110,7 @@ class BrowserView:
 
     async def send(self, request: ViewerInput):
         async with self.commands:
-            if not self.open or not self.manual or not self.channel or self.dialog or not secrets.compare_digest(request.channel, self.channel):
-                raise ValueError('El control de esta página ya terminó. Vuelve a tomarlo desde el panel.')
+            self.require_control(request.channel)
             page = self.page
             if request.kind in {'down', 'move', 'up', 'wheel'}:
                 viewport = page.viewport_size
@@ -117,6 +131,62 @@ class BrowserView:
                 await page.keyboard.insert_text(request.value)
             elif request.kind == 'key' and KEY.fullmatch(request.value):
                 await page.keyboard.press(request.value)
+
+    def require_control(self, channel: str):
+        if not self.open or not self.manual or not self.channel or self.dialog or not secrets.compare_digest(channel, self.channel):
+            raise ValueError('El control de esta página ya terminó. Vuelve a tomarlo desde el panel.')
+
+    async def visible_text(self, channel: str) -> str:
+        async with self.commands:
+            self.require_control(channel)
+            return (await self.page.locator('body').inner_text(timeout=4000))[:40_000]
+
+    async def screenshot(self, channel: str) -> bytes:
+        async with self.commands, self.capture:
+            self.require_control(channel)
+            return await self.page.screenshot(type='png', scale='css', timeout=6000)
+
+    async def history(self, channel: str, direction: Literal['back', 'forward']):
+        async with self.commands:
+            self.require_control(channel)
+            navigate = self.page.go_back if direction == 'back' else self.page.go_forward
+            try:
+                await navigate(wait_until='domcontentloaded', timeout=10_000)
+            except Exception as exc:
+                raise ValueError('El portal no completó el cambio de página.') from exc
+
+    async def receive_file_request(self, page, chooser):
+        channel = self.channel
+        if page is not self.page or not channel or not self.manual:
+            return
+        frame = await chooser.element.owner_frame()
+        url = urlsplit(page.url)
+        frame_url = urlsplit(frame.url) if frame else None
+        if not frame_url or url.scheme != 'https' or (frame_url.scheme, frame_url.netloc) != (url.scheme, url.netloc):
+            return
+        if channel == self.channel and page is self.page:
+            self.file_request = PortalUpload(secrets.token_urlsafe(20), chooser, frame, f'https://{url.netloc}')
+
+    def invalidate_file_request(self, page, frame):
+        if page is self.page and self.file_request and (frame is page.main_frame or frame is self.file_request.frame):
+            self.file_request = None
+
+    async def attach(self, channel: str, request_id: str, payload: dict | None):
+        async with self.commands:
+            self.require_control(channel)
+            pending = self.file_request
+            if not pending or not secrets.compare_digest(request_id, pending.id):
+                raise ValueError('El selector ya cambió. Abre Adjuntar en el portal.')
+            self.file_request = None
+            if payload is None:
+                return
+            origins = [urlsplit(url) for url in (self.page.url, pending.frame.url)]
+            if pending.frame.is_detached() or any(f'{url.scheme}://{url.netloc}' != pending.origin for url in origins):
+                raise ValueError('La página que solicitó el archivo ya cambió.')
+            try:
+                await pending.chooser.set_files(payload, timeout=6000)
+            except Exception as exc:
+                raise ValueError('El portal cerró el selector de archivos. Ábrelo otra vez.') from exc
 
     async def receive_dialog(self, page, dialog):
         # The user reads and answers native dialogs in the panel. Never guess a response.

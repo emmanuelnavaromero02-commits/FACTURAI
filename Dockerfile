@@ -8,6 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates chromium libatomic1 fonts-liberation fonts-noto-color-emoji \
+        tesseract-ocr tesseract-ocr-spa tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 facturador \
     && install -d -m 0700 -o facturador -g facturador /data

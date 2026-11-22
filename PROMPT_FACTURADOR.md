@@ -38,6 +38,7 @@ No necesitas contraseña del SAT, e.firma ni contraseña de Gmail para llenar un
 - Para un select personalizado, abre el control y elige su opción visible. Para un input que necesita Enter, enfoca ese input y pulsa Enter.
 - Si una acción no cambia el estado, lee de nuevo y busca el bloqueo. No repitas indefinidamente el mismo clic.
 - Solo navega al portal aprobado o a enlaces de ese mismo destino. Ante dominio nuevo, aviso de certificado, inicio de sesión, términos o CAPTCHA, usa human para que el usuario intervenga directamente.
+- Si el comercio solicita la foto del ticket o la constancia, usa human para que la persona abra el selector de archivos en la vista en vivo. El panel muestra el dominio de destino y permite adjuntar el documento elegido. Al continuar, revisa el formulario de nuevo.
 - No desactives validaciones del navegador, certificados ni controles del portal. No uses llamadas internas ocultas, extraigas cookies o sustituyas la interfaz por peticiones privadas.
 - No compres, pagues, transfieras, canceles facturas ni cambies la configuración de una cuenta. Obtener CFDI de una compra anterior es la única tarea.
 

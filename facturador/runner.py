@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from .ai import AI
 from .auth import ChatGPTPlan, PlanError
-from .catalog import CATALOG, allowed_url
+from .catalog import CATALOG, allowed_url, provider_for_url
 from .cfdi import UUID_RE
 from .db import Store
 from .documents import reconcile
@@ -28,7 +28,7 @@ CHALLENGE_TEXT = re.compile(r'no soy un robot|verifica que eres humano|verify (?
 ACCESS_DENIED = re.compile(r'access denied|error 16\b|blocked by our security service|acceso denegado|err_cert_', re.I)
 SUCCESS = re.compile(r'factura\s+(?:emitida|generada)\b|cfdi\s+(?:emitido|generado)\b|timbrad[ao]\s+correctamente|resultado facturaci[oó]n[^\n]*\n[\s\S]{0,130}facturas generadas|se gener[oó]\s+exitosamente', re.I)
 DOWNLOAD = re.compile(r'descargar|download|\bpdf\b|\bxml\b|imprimir', re.I)
-MANUAL = {'captcha', 'login', 'terms', 'unknown', 'blocked', 'confirm'}
+MANUAL = {'captcha', 'login', 'terms', 'unknown', 'blocked', 'confirm', 'attachment'}
 
 
 def action_risk(action: Action) -> str:
@@ -61,9 +61,8 @@ def private_destination(url: str) -> bool:
 
 
 async def visible_challenge(page, snapshot: str) -> str | None:
-    if any('checkbox' in line and 'checked' in line and CHALLENGE_TEXT.search(line) for line in snapshot.splitlines()):
-        return None
-    if CHALLENGE_TEXT.search(snapshot):
+    if any(CHALLENGE_TEXT.search(line) and not ('checkbox' in line and '[checked]' in line)
+           for line in snapshot.splitlines()):
         return 'captcha'
     if hasattr(page, 'frames'):
         if await page.locator('input[type="password"]:visible').count():
@@ -77,6 +76,8 @@ async def visible_challenge(page, snapshot: str) -> str | None:
                 checked = frame.locator('[role="checkbox"][aria-checked="false"]:visible')
                 if await checked.count():
                     return 'captcha'
+        if await page.locator('input[type="file"][required]:invalid:visible').count():
+            return 'attachment'
     return None
 
 
@@ -97,6 +98,7 @@ class Runner:
         self.active_id: str | None = None
         self.whatsapp = None
         self.portal_page = None
+        self.manual_download_error = ''
 
     async def start_browser(self):
         async with self.browser_start:
@@ -131,7 +133,7 @@ class Runner:
     def register_page(self, page):
         def on_download(download):
             key = self.page_job.get(page)
-            if key:
+            if key or (page is self.portal_page and page is self.viewer.page and self.viewer.manual):
                 task = asyncio.create_task(self.save_download(download, key))
                 self.downloads.add(task)
                 task.add_done_callback(self.downloads.discard)
@@ -149,7 +151,13 @@ class Runner:
         async def on_dialog(dialog):
             await self.viewer.receive_dialog(page, dialog)
 
+        async def on_file_request(chooser):
+            if any(allowed_url(page.url, key) for key in CATALOG) or urlsplit(page.url).netloc == 'web.whatsapp.com':
+                await self.viewer.receive_file_request(page, chooser)
+
         page.on('download', on_download)
+        page.on('filechooser', on_file_request)
+        page.on('framenavigated', lambda frame: self.viewer.invalidate_file_request(page, frame))
         page.on('popup', on_popup)
         page.on('dialog', on_dialog)
         page.on('close', lambda _: self.page_job.pop(page, None))
@@ -176,13 +184,17 @@ class Runner:
                 return
         await route.continue_()
 
-    async def save_download(self, download, key: str):
-        directory = self.store.root / 'downloads' / key
+    async def save_download(self, download, key: str | None):
+        directory = self.store.root / 'downloads' / key if key else self.store.root / 'descargas-navegador'
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        name = re.sub(r'[^\w.()-]', '_', Path(download.suggested_filename.replace('\\', '/')).name)[:150]
-        if Path(name).suffix.lower() not in {'.pdf', '.xml', '.zip'}:
+        original = Path(download.suggested_filename.replace('\\', '/')).name
+        suffix = Path(original).suffix.lower()
+        if suffix not in {'.pdf', '.xml', '.zip'}:
             await download.cancel()
             return
+        stem = re.sub(r'[^\w.()-]', '_', Path(original).stem) or 'comprobante'
+        # Bound the UTF-8 byte length as well as the character count for the filesystem.
+        name = stem.encode('utf-8')[:145].decode('utf-8', errors='ignore') + suffix
         from tempfile import NamedTemporaryFile
 
         with NamedTemporaryFile(dir=directory, prefix='pending_', delete=False) as stream:
@@ -193,16 +205,27 @@ class Runner:
                 raise ValueError('Descarga supera 50 MB')
             digest = hashlib.sha256(temporary.read_bytes()).hexdigest()[:16]
             temporary.replace(directory / (digest + '_' + name))
-            self.store.event(key, 'download', name)
+            if key:
+                self.store.event(key, 'download', name)
+            else:
+                self.manual_download_error = ''
         except Exception:
-            self.store.event(key, 'download_error', 'La descarga del comprobante no terminó.')
+            message = 'La descarga del comprobante no terminó.'
+            if key:
+                self.store.event(key, 'download_error', message)
+            else:
+                self.manual_download_error = message
         finally:
             temporary.unlink(missing_ok=True)
 
     def has_active_jobs(self) -> bool:
         return bool(self.job_tasks)
 
-    async def open_portal(self, provider: str | None = None):
+    async def open_portal(self, provider: str | None = None, url: str | None = None):
+        if url is not None:
+            provider = provider or provider_for_url(url)
+            if provider is None or not allowed_url(url, provider):
+                raise ValueError('La liga del ticket debe pertenecer a un portal HTTPS del catálogo.')
         if provider is not None and provider not in CATALOG:
             raise ValueError('Selecciona un portal del catálogo.')
         if self.has_active_jobs():
@@ -225,7 +248,7 @@ class Runner:
             else:
                 item = CATALOG[provider]
                 try:
-                    await page.goto(item['url'], wait_until='domcontentloaded', timeout=30_000)
+                    await page.goto(url or item['url'], wait_until='domcontentloaded', timeout=30_000)
                 except Exception as exc:
                     await self.viewer.show(page, item['name'], manual=True)
                     raise ValueError(f'No se pudo cargar {item["name"]}. Revisa la página en el navegador.') from exc
@@ -308,10 +331,11 @@ class Runner:
                 raise ValueError('Revisa la acción que solicita el panel.')
             if self.viewer.dialog:
                 raise ValueError('Responde primero al aviso del portal.')
-            if kind in {'captcha', 'login'}:
+            if kind in {'captcha', 'login', 'attachment'}:
                 page = self.viewer.page
-                if await visible_challenge(page, await page.locator('body').aria_snapshot()):
-                    raise ValueError('El portal todavía muestra la verificación. Complétala y pulsa Continuar.')
+                if await visible_challenge(page, await page.locator('body').aria_snapshot()) == kind:
+                    message = 'Todavía falta el archivo que pide el portal.' if kind == 'attachment' else 'El portal todavía muestra la verificación.'
+                    raise ValueError(message + ' Completa el paso y pulsa Continuar.')
             if kind == 'plan' and self.plan.status()['status'] != 'ready':
                 raise ValueError('Conecta ChatGPT o revisa el cupo antes de continuar.')
         await self.viewer.set_manual(False)
@@ -413,7 +437,9 @@ class Runner:
                             return
                     challenge = await visible_challenge(page, snapshot)
                     if challenge:
-                        message = 'Completa la verificación en este navegador.' if challenge == 'captcha' else 'Inicia sesión en el portal y regresa al trámite.'
+                        message = {'captcha': 'Completa la verificación en este navegador.',
+                                   'login': 'Inicia sesión en el portal y regresa al trámite.',
+                                   'attachment': 'Toma el control y abre el selector del portal. Elige el documento en el panel y pulsa Adjuntar al portal.'}[challenge]
                         await self.human(key, page, challenge, message)
                         continue
                     observation = json.dumps({'url': page.url, 'paso': number, 'emision_intentada': committed,

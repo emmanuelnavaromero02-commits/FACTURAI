@@ -123,3 +123,7 @@ def allowed_url(url: str, provider: str) -> bool:
         return parts.netloc.lower() in CATALOG[provider]["hosts"]
     except (ValueError, KeyError):
         return False
+
+
+def provider_for_url(url: str) -> str | None:
+    return next((key for key in CATALOG if allowed_url(url, key)), None)

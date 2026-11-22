@@ -32,6 +32,7 @@ async def smoke():
         if path == '/':
             await route.fulfill(content_type='text/html; charset=utf-8', body=(
                 '<form method="post" action="/emision"><label>RFC<input name="rfc" required></label>'
+                '<label>Constancia<input type="file" required></label>'
                 '<button>Facturar</button></form>'))
         elif path == '/emision' and route.request.method == 'POST':
             submissions.append(parse_qs(route.request.post_data or ''))
@@ -67,6 +68,18 @@ async def smoke():
                 async with asyncio.timeout(30):
                     while key not in runner.pending and not task.done():
                         await asyncio.sleep(0.05)
+                assert runner.pending[key]['kind'] == 'attachment'
+                lease = await runner.viewer.take_control(runner.viewer.revision)
+                await runner.viewer.page.get_by_label('Constancia').click()
+                async with asyncio.timeout(8):
+                    while not runner.viewer.state()['upload']:
+                        await asyncio.sleep(.05)
+                await runner.viewer.attach(lease, runner.viewer.state()['upload']['id'],
+                                           {'name': 'ejemplo.pdf', 'mimeType': 'application/pdf', 'buffer': pdf})
+                await runner.continue_job(key, 'resume')
+                async with asyncio.timeout(30):
+                    while runner.pending.get(key, {}).get('kind') != 'issue' and not task.done():
+                        await asyncio.sleep(0.05)
                 assert key in runner.pending and runner.pending[key]['kind'] == 'issue', store.get(key)['message']
                 assert not submissions
                 await runner.continue_job(key, 'approve')
@@ -83,7 +96,7 @@ async def smoke():
             assert result['status'] == 'verified', result['message']
             assert result['uuid'] == FISCAL_UUID
             assert Path(result['xml']).read_bytes() == xml and Path(result['pdf']).read_bytes() == pdf
-            print('OK: Chromium llenó el RFC, esperó aprobación, descargó el ZIP y cotejó PDF/XML sintéticos.')
+            print('OK: la cola pidió el adjunto, Chromium llenó el RFC, esperó aprobación, descargó y cotejó PDF/XML sintéticos.')
         finally:
             await runner.close()
 

@@ -7,8 +7,11 @@ import os
 from PIL import Image, ImageChops
 from playwright.async_api import async_playwright, expect
 
+from facturador.local_reader import ocr_languages
+
 
 async def smoke():
+    assert set(ocr_languages().split('+')) == {'spa', 'eng'}, 'Faltan los idiomas de OCR de la imagen Docker'
     async with async_playwright() as playwright:
         # Separate browser for the operator. The server launches its own persistent Chromium.
         operator = await playwright.chromium.launch(
@@ -23,6 +26,10 @@ async def smoke():
             await page.get_by_role('button', name='Cargar ticket de ejemplo').click()
             await page.get_by_role('button', name='Revisar', exact=True).click()
             await expect(page.get_by_role('dialog').get_by_role('link', name='Ver original ↗')).to_be_visible()
+            await page.get_by_role('button', name='Leer texto, QR y barras en el contenedor').click()
+            await expect(page.locator('#reader-text')).to_contain_text('CAPUFE', timeout=25_000)
+            await expect(page.locator('#reader-text')).to_contain_text('50.00')
+            await page.get_by_role('button', name='Cerrar lectura').click()
             await page.keyboard.press('Escape')
             await page.get_by_role('link', name='Navegador', exact=True).click()
             await page.get_by_role('button', name='Abrir navegador', exact=True).click()
@@ -66,9 +73,19 @@ async def smoke():
                 await asyncio.sleep(0.1)
             else:
                 raise AssertionError('El teclado del panel no cambió el contenido de Chromium.')
+            await page.get_by_role('button', name='Leer página', exact=True).click()
+            await page.get_by_role('searchbox', name='Buscar en la página').fill('CAPUFE')
+            await page.get_by_role('button', name='Buscar siguiente').click()
+            assert await page.locator('#page-content').evaluate('(e) => e.value.slice(e.selectionStart, e.selectionEnd).toUpperCase()') == 'CAPUFE'
+            await page.get_by_role('button', name='Cerrar texto').click()
+            async with page.expect_download() as saved_png:
+                await page.get_by_role('button', name='Guardar captura PNG').click()
+            capture = await saved_png.value
+            with Image.open(await capture.path()) as png:
+                assert png.format == 'PNG' and png.size == (1280, 850)
             await page.get_by_role('button', name='Devolver control').click()
             await expect(page.get_by_role('button', name='Tomar control')).to_be_visible()
-            print('OK: bandeja, ticket, Chromium del servidor, JPEG, teclado y devolución del control.')
+            print('OK: OCR local, ticket, Chromium interno, teclado, búsqueda en el texto visible y captura PNG.')
         finally:
             await operator.close()
 

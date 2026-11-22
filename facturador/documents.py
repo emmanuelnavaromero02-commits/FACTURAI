@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 import sqlite3
 from pathlib import Path
@@ -8,6 +9,32 @@ from pathlib import Path
 from .cfdi import collect_documents, find_valid_pair
 from .db import Store
 from .models import Profile, Receipt
+
+
+def browser_file(root: Path, file_id: str) -> Path:
+    if not re.fullmatch(r'[0-9a-f]{16}_[\w.()-]{1,150}', file_id):
+        raise ValueError('Descarga desconocida.')
+    path = root / 'descargas-navegador' / file_id
+    if path.suffix.lower() not in {'.pdf', '.xml', '.zip'} or path.is_symlink() or not path.is_file():
+        raise ValueError('Descarga desconocida.')
+    return path
+
+
+def browser_files(root: Path) -> list[dict]:
+    directory = root / 'descargas-navegador'
+    if not directory.exists():
+        return []
+    files = []
+    for entry in directory.iterdir():
+        if entry.name.startswith('pending_'):
+            continue
+        try:
+            path = browser_file(root, entry.name)
+            info = path.stat()
+        except (OSError, ValueError):
+            continue
+        files.append({'id': path.name, 'name': path.name[17:], 'size': info.st_size, 'at': info.st_mtime})
+    return sorted(files, key=lambda item: item['at'], reverse=True)
 
 
 def reconcile(store: Store, key: str, profile: Profile, paths: list[Path]) -> dict:
