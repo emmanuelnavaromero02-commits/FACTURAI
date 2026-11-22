@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import csv
-import hashlib
 import io
 import json
 import mimetypes
@@ -27,8 +26,9 @@ from .ai import AI
 from .auth import CALLBACK, ChatGPTPlan, PlanError, read_json, write_private
 from .catalog import CATALOG, provider_for_url
 from .db import EDITABLE, Store
-from .documents import browser_file, browser_files, reconcile
-from .gmail import GmailConnection, import_tickets, recover_attachments, search_tickets, ticket_parts
+from .diagnostics import check_tools
+from .documents import browser_file, browser_files, reconcile, save_candidate
+from .gmail import GmailConnection, cfdi_parts, import_eml, import_tickets, parse_eml, recover_attachments, search_tickets, ticket_parts
 from .ingest import IMAGE_EXT, MAX_UPLOAD, save_input, save_upload, validate_document
 from .local_reader import read_local_page
 from .models import Profile, Receipt
@@ -41,6 +41,7 @@ BASE = Path(__file__).resolve().parent.parent
 class RunRequest(BaseModel):
     consent: bool
     auto_issue: bool = False
+    mode: Literal['agent', 'manual'] = 'agent'
 
 
 class HistoryItem(BaseModel):
@@ -59,6 +60,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     runner = Runner(store, plan)
     container_browser = os.getenv("FACTURADOR_CONTAINER") == "1"
     token = secrets.token_urlsafe(32)
+    diagnostics_lock = asyncio.Lock()
     permitted_origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}", "http://testserver"}
 
     @asynccontextmanager
@@ -66,7 +68,10 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         store.recover_after_restart()
         try:
             if container_browser:
-                await runner.start_browser()
+                try:
+                    await runner.start_browser()
+                except ValueError:
+                    pass  # The inbox, reader and recovery tools stay available offline.
             yield
         finally:
             await runner.close()
@@ -148,8 +153,27 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
             try:
                 await runner.start_browser()
             except ValueError:
-                return PlainTextResponse('Chromium no está disponible', status_code=503)
+                return {'status': 'degraded', 'browser': 'unavailable'}
         return {'status': 'ok'}
+
+    @app.post('/api/tools/check')
+    async def tools_check():
+        if diagnostics_lock.locked():
+            raise ValueError('Ya hay una comprobación en curso.')
+        async with diagnostics_lock:
+            return await check_tools(runner, gmail_connection)
+
+    @app.post('/api/browser/restart')
+    async def restart_browser():
+        if runner.has_active_jobs() or runner.lock.locked():
+            raise ValueError('Termina el trámite del navegador para poder reiniciarlo.')
+        async with runner.lock:
+            await runner.viewer.set_manual(False)
+            if runner.context:
+                await runner.context.close()
+            await runner.start_browser()
+        await runner.open_portal()
+        return runner.viewer.state()
 
     @app.post('/api/chatgpt/connect')
     def openai_connect(new_account: bool = Body(default=False, embed=True), consent: bool = Body(default=False, embed=True)):
@@ -292,6 +316,8 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         path = root / "profile.json"
         jobs = store.list()
         for row in jobs:
+            row['can_retry'] = bool(row['status'] == 'blocked' and row['billing_profile'] and
+                                    not (row['issue_attempted'] or row['human_exposed'] or row['issuance_seen'] or row['uuid']))
             row.pop("source_path", None)
             row.pop("source_hash", None)
             row.pop('billing_profile', None)
@@ -326,7 +352,9 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         result = []
         for file in files:
             data = await file.read(MAX_UPLOAD + 1)
-            result += await asyncio.to_thread(save_upload, store, file.filename or "archivo", data)
+            name = file.filename or 'archivo'
+            importer = import_eml if Path(name).suffix.lower() == '.eml' else save_upload
+            result += await asyncio.to_thread(importer, store, name, data)
         return result
 
     @app.post('/api/demo')
@@ -364,7 +392,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         errors = receipt.ready_errors()
         row = store.get(key)
         receipt.source = row['receipt']['source']
-        if receipt.provider not in CATALOG:
+        if receipt.provider not in CATALOG and receipt.provider != 'solicitud_directa':
             errors.append("Selecciona un portal del catálogo")
         if errors:
             raise ValueError("; ".join(errors))
@@ -377,14 +405,14 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         row = store.get(key)
         if row['receipt']['source'].startswith('Ejemplo:'):
             raise ValueError('Este ejemplo sirve para practicar la revisión. Sube un ticket real para abrir el portal.')
-        if plan.status()['status'] != 'ready':
+        if value.mode == 'agent' and plan.status()['status'] != 'ready':
             raise ValueError('Conecta tu plan de ChatGPT en Ajustes antes de encolar.')
-        runner.schedule(key, profile(), value.auto_issue)
+        runner.schedule(key, profile(), value.auto_issue, manual=value.mode == 'manual')
         return {"queued": True}
 
     @app.post("/api/jobs/{key}/decision")
     async def decision(key: str, decision: str = Body(embed=True)):
-        if decision not in {"approve", "resume", "cancel"}:
+        if decision not in {"approve", "resume", "cancel", "manual"}:
             raise ValueError("Decisión inválida")
         await runner.continue_job(key, decision)
         return {"continued": True}
@@ -440,38 +468,40 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         buyer = recovery_profile(key)
         if len(files) > 30:
             raise ValueError("Límite de 30 comprobantes")
-        dest = root / "downloads" / key / "manual"
-        dest.mkdir(parents=True, exist_ok=True, mode=0o700)
-        paths = []
         for file in files:
             suffix = Path(file.filename or "").suffix.lower()
             data = await file.read(MAX_UPLOAD + 1)
-            if suffix not in {".pdf", ".xml", ".zip"} or len(data) > MAX_UPLOAD:
-                raise ValueError("Solo PDF/XML/ZIP de hasta 25 MB")
-            path = dest / (hashlib.sha256(data).hexdigest() + suffix)
-            path.write_bytes(data)
-            paths.append(path)
-        all_paths = paths + [p for p in (root / "downloads" / key).rglob("*") if p.is_file() and "extracted" not in p.parts]
-        return await asyncio.to_thread(reconcile, store, key, buyer, all_paths)
+            if suffix == '.eml':
+                parts = list(cfdi_parts(parse_eml(data)))
+                if not parts or len(parts) > 30:
+                    raise ValueError('El correo debe contener de 1 a 30 adjuntos PDF, XML o ZIP.')
+            elif suffix in {'.pdf', '.xml', '.zip'} and len(data) <= MAX_UPLOAD:
+                parts = [(file.filename, data)]
+            else:
+                raise ValueError("Elige archivos PDF, XML, ZIP o EML de hasta 25 MB.")
+            for name, document_data in parts:
+                await asyncio.to_thread(save_candidate, store, key, name, document_data)
+        return await asyncio.to_thread(reconcile, store, key, buyer)
 
     @app.post("/api/jobs/{key}/recover-local")
     async def recover_local(key: str):
         buyer = recovery_profile(key)
-        paths = [p for p in (root / "downloads" / key).rglob("*") if p.is_file() and "extracted" not in p.parts]
-        return await asyncio.to_thread(reconcile, store, key, buyer, paths)
+        return await asyncio.to_thread(reconcile, store, key, buyer)
 
     @app.post('/api/jobs/{key}/recover-browser')
     def recover_browser(key: str, files: list[str] = Body(embed=True, min_length=1, max_length=30)):
         buyer = recovery_profile(key)
-        return reconcile(store, key, buyer, [browser_file(root, file_id) for file_id in dict.fromkeys(files)])
+        selected = [browser_file(root, file_id) for file_id in dict.fromkeys(files)]
+        copies = [save_candidate(store, key, p.name, p.read_bytes()) for p in selected]
+        return reconcile(store, key, buyer, copies, include_partners=True)
 
     @app.post("/api/jobs/{key}/gmail")
     async def gmail(key: str, query: str = Body(embed=True)):
         buyer = recovery_profile(key)
         if not query.strip():
             raise ValueError("Acota la búsqueda por fecha, remitente o folio")
-        paths = await asyncio.to_thread(recover_attachments, root, key, query)
-        return await asyncio.to_thread(reconcile, store, key, buyer, paths)
+        await asyncio.to_thread(recover_attachments, root, key, query)
+        return await asyncio.to_thread(reconcile, store, key, buyer)
 
     @app.post("/api/whatsapp/open")
     async def whatsapp_open():

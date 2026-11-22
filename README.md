@@ -16,9 +16,9 @@ Abre [la bandeja](http://127.0.0.1:8765/#bandeja). En Windows también puedes de
 
 1. En **Navegador → Abrir navegador** aparece el directorio de comercios dentro de Chromium. Pulsa **Tomar control** para buscar y abrir un portal. También puedes abrirlo desde la ficha del comercio en **Portales**. Esto funciona antes de conectar cuentas.
 2. Para probar la bandeja, pulsa **Cargar ticket de ejemplo** y **Revisar**. El ejemplo usa datos ficticios y queda fuera de la cola de emisión.
-3. Para procesar compras, guarda tu perfil fiscal en **Ajustes**, vincula tu plan y sube un ticket. Las pantallas de acceso o verificación del comercio se atienden en ese mismo navegador.
+3. Para procesar compras, guarda tu perfil fiscal en **Ajustes** y sube un ticket. En **Preparar** elige operar el portal a mano o usar tu plan de ChatGPT vinculado. Las pantallas de acceso y verificación se atienden en el navegador del contenedor.
 
-Docker comprueba que la aplicación y Chromium estén listos antes de dar por terminado el arranque. El volumen `expedientes` conserva la cola, los archivos y el perfil de Chromium al reiniciar. El puerto 8765 se publica en el equipo local. Para detenerlo ejecuta `docker compose stop`; para reanudarlo, `docker compose up -d`.
+Docker inicia Chromium y comprueba que responda el panel. Si el navegador falla, la bandeja, la lectura local y la recuperación de archivos siguen disponibles. El volumen `expedientes` conserva la cola, los archivos y el perfil de Chromium al reiniciar. El puerto 8765 se publica en el equipo local. Puedes detenerlo con `docker compose stop` y reanudarlo con `docker compose up -d`.
 
 ## Herramientas del contenedor
 
@@ -33,6 +33,21 @@ Docker comprueba que la aplicación y Chromium estén listos antes de dar por te
 | Navegador → Abrir WhatsApp Web | Vincular el dispositivo, abrir la foto del ticket y llevarla a la bandeja. |
 
 ChatGPT recibe imágenes y texto para las operaciones de IA que elijas. El OCR, lector PDF, decodificador de QR y barras, controles de Playwright, descargas y cotejo se ejecutan en el contenedor. Las verificaciones interactivas del comercio se completan en la vista en vivo.
+
+## Recuperación ante fallos
+
+Abre **Ajustes → Herramientas y recuperación → Comprobar herramientas**. Se prueban lectura y escritura en SQLite, OCR, QR, barras, PDF, ZIP, datos de un CFDI sintético y control de Chromium. El diagnóstico distingue las pruebas locales del estado de las cuentas vinculadas. Durante un trámite conserva la página activa y muestra el navegador como ocupado.
+
+| Qué ocurrió | Cómo continuar con el mismo ticket |
+| --- | --- |
+| ChatGPT quedó sin cuota o perdió conexión | **Continuar a mano** abre los controles en la misma página. Al terminar pulsa **Terminar y cotejar**. También puedes iniciar en modo manual desde **Preparar**. |
+| Se cerró Chromium | Antes de la emisión y de ceder el control, el trámite intenta reabrir el portal una vez. Después de un posible envío se recupera el CFDI existente. Si el portal ya confirmó la emisión, el expediente recuerda esa confirmación incluso sin UUID visible. En **Ajustes** se puede reiniciar Chromium cuando esté libre. |
+| La foto o la lectura con IA falló | El lector local ofrece OCR, rotación, códigos o texto digital del PDF. Se puede corregir cualquier campo en **Revisar**. Si solo falla la captura de la pantalla del portal, el agente puede leer sus controles accesibles. |
+| El PDF y el XML llegaron por canales distintos | Adjunta el que tengas y conserva el expediente. Después recupera el otro de Gmail, de las descargas de Chromium, de un correo exportado `.eml` o de tus archivos. Se cotejan UUID, RFC, importe y datos fiscales. Un PDF escaneado se intenta leer con OCR en sus primeras cuatro páginas. |
+| Gmail o WhatsApp están desconectados | En **Bandeja** sube el correo `.eml`, las fotos, el PDF o un ZIP exportado de WhatsApp. Para recuperar una factura de un correo, usa **Adjuntar PDF/XML, ZIP o correo** en el ticket. |
+| El comercio carece de portal en el catálogo | En **Revisar** selecciona **Otro comercio · solicitar directamente**. Prepara el mensaje, envíalo por el canal del comercio y añade la respuesta al expediente para cotejar sus archivos. |
+
+Si la conexión se pierde mientras alguien controla el trámite, se conserva como pendiente de recuperación. Un archivo aislado o una captura de la página de éxito todavía requieren el cotejo de la pareja PDF/XML.
 
 ### Código de este repositorio
 
@@ -84,7 +99,7 @@ node --check web/herramientas.js
 docker compose config
 ```
 
-Las pruebas cubren lectura local, importación selectiva de mensajes, deduplicación y recuperación de sesión. GitHub Actions construye la imagen y recorre tres flujos en Chromium. El primero verifica OCR, teclado, lectura de página y captura PNG. El segundo usa un comercio simulado para aprobar un trámite y cotejar el PDF y XML. El tercero usa el panel para navegar por el historial, adjuntar un documento y descargarlo de un portal simulado. Se comprueban los bytes entregados en ambos sentidos.
+GitHub Actions construye la imagen y recorre cuatro flujos con Chromium real. Verifica el lector y el diagnóstico desde el panel, la aprobación y descarga de una factura sintética, el intercambio de adjuntos y la recuperación ante fallos. En el último flujo se cierra Chromium antes y después del envío, se comprueba cuántas solicitudes recibió el comercio simulado y se completa otra compra a mano tras agotar la cuota simulada del modelo.
 
 La conexión con una cuenta real se verifica desde **Ajustes** con autorización de su titular. Las facturas de ejemplo se usan para revisión sin abrir un portal comercial.
 

@@ -3,14 +3,14 @@ import {installReceiptTools} from './herramientas.js';
 
 const $ = id => document.getElementById(id);
 const sections = {bandeja: 'Bandeja', navegador: 'Navegador', comprobantes: 'Comprobantes', portales: 'Portales', ajustes: 'Ajustes'};
-const jobLabels = {new: 'Por leer', review: 'Por revisar', ready: 'Listo', queued: 'En cola', running: 'En el portal',
+const jobLabels = {new: 'Por leer', review: 'Por revisar', external: 'Solicitar al comercio', ready: 'Listo', queued: 'En cola', running: 'En el portal',
   issuing: 'Emisión en trámite', needs_user: 'Requiere tu intervención', issued_waiting_files: 'Emitido · recuperar',
   verified: 'Comprobado', blocked: 'Pendiente', uncertain: 'Resultado incierto', duplicate: 'Duplicado', historical: 'Histórico'};
 const planLabels = {disconnected: 'Por conectar', ready: 'Plan conectado', limit: 'Cupo en pausa',
   identity_only: 'Autoriza el uso del plan', reconnect: 'Vuelve a conectar'};
 const payments = {'01': 'Efectivo', '03': 'Transferencia', '04': 'Crédito', '28': 'Débito', '99': 'Por definir'};
 const working = new Set(['queued', 'running', 'needs_user', 'issuing']);
-const review = new Set(['new', 'review', 'ready', 'blocked']);
+const review = new Set(['new', 'review', 'ready', 'blocked', 'external']);
 const documents = new Set(['verified', 'issued_waiting_files', 'uncertain', 'historical']);
 const terminal = new Set(['verified', 'duplicate', 'historical']);
 const amountFormat = new Intl.NumberFormat('es-MX', {style: 'currency', currency: 'MXN'});
@@ -125,10 +125,11 @@ function edit(row) {
   const {provider} = form.elements;
   provider.replaceChildren(new Option('Selecciona un comercio', ''));
   for (const [id, value] of Object.entries(state.catalog)) provider.add(new Option(value.name, id));
+  provider.add(new Option('Otro comercio · solicitar directamente', 'solicitud_directa'));
   for (const [key, value] of Object.entries(row.receipt)) {
     if (form.elements.namedItem(key)) form.elements[key].value = key === 'billing_codes' ? value.join('\n') : value;
   }
-  if (!state.catalog[row.receipt.provider]) provider.value = '';
+  if (!state.catalog[row.receipt.provider] && row.receipt.provider !== 'solicitud_directa') provider.value = '';
   $('view-source').href = `/api/jobs/${row.id}/source`;
   $('editor').showModal();
 }
@@ -138,16 +139,14 @@ function prepare(rows) {
     route('ajustes');
     return notify('Guarda tus datos fiscales antes de iniciar el trámite.');
   }
-  if (state.plan.status !== 'ready') {
-    route('ajustes');
-    return notify('Conecta el plan de ChatGPT antes de iniciar.', true);
-  }
-  prepared = rows.filter(row => row.status === 'ready' && !row.receipt.source.startsWith('Ejemplo:'));
+  prepared = rows.filter(row => (row.status === 'ready' || row.can_retry) && !row.receipt.source.startsWith('Ejemplo:'));
   if (!prepared.length) return notify('No hay tickets reales revisados para preparar.');
   const names = [...new Set(prepared.map(row => state.catalog[row.receipt.provider]?.name))];
   $('prepare-summary').textContent = `${prepared.length} ${prepared.length === 1 ? 'ticket' : 'tickets'} en ${names.join(', ')}.`;
   $('prepare-form').reset();
-  $('auto-row').hidden = !prepared.some(row => row.receipt.provider === 'capufe');
+  $('run-mode').querySelector('[value=agent]').disabled = state.plan.status !== 'ready';
+  $('run-mode').value = state.plan.status === 'ready' ? 'agent' : 'manual';
+  $('run-mode').onchange();
   $('prepare-dialog').showModal();
 }
 
@@ -183,13 +182,23 @@ function recoverGmail(row) {
 }
 
 function readTicket(row) {
+  const readLocal = () => {
+    edit(row);
+    $('local-reader').click();
+  };
   if (state.plan.status !== 'ready') {
-    route('ajustes');
-    return notify('Conecta tu plan para leerlo con ChatGPT.');
+    readLocal();
+    return;
   }
   if (window.confirm('¿Leer el original con tu plan de ChatGPT?')) {
     perform(async () => {
-      const result = await api(`/api/jobs/${row.id}/analyze`, 'POST', {consent: true});
+      let result;
+      try {
+        result = await api(`/api/jobs/${row.id}/analyze`, 'POST', {consent: true});
+      } catch (error) {
+        readLocal();
+        return error.message + ' Se abrió el lector local.';
+      }
       if (result.status === 'review') edit(result);
       return result.message;
     });
@@ -199,6 +208,8 @@ function readTicket(row) {
 function rowActions(row) {
   const group = el('div', '', 'row-actions');
   const primary = row.status === 'new' || row.status === 'review' ? button('Revisar', () => edit(row)) :
+    row.status === 'external' ? button('Preparar solicitud', () => request(row), 'primary') :
+    row.can_retry ? button('Reintentar', () => prepare([row]), 'primary') :
     row.status === 'ready' && !row.receipt.source.startsWith('Ejemplo:') ? button('Preparar', () => prepare([row]), 'primary') :
     ['running', 'needs_user', 'issuing'].includes(row.status) ? button('Ver trámite', () => route('navegador')) : null;
   if (primary) group.append(primary);
@@ -213,7 +224,7 @@ function rowActions(row) {
   toggle.setAttribute('aria-label', 'Más acciones para ' + (row.receipt.merchant || 'el ticket'));
   const panel = el('div', '', 'more-panel');
   if (review.has(row.status) && !row.issue_attempted) {
-    panel.append(button('Leer con ChatGPT', () => readTicket(row), 'plain'));
+    panel.append(button(state.plan.status === 'ready' ? 'Leer con ChatGPT' : 'Leer en el contenedor', () => readTicket(row), 'plain'));
     if (row.status !== 'review' && row.status !== 'new') panel.append(button('Editar datos', () => edit(row), 'plain'));
   }
   if (!row.historical) {
@@ -225,16 +236,16 @@ function rowActions(row) {
       panel.append(button('Usar descargas del navegador', () => perform(() => receiptTools.showDownloads(row)), 'plain'));
     }
   }
-  if (documents.has(row.status) || row.status === 'blocked') {
+  if (!row.historical && !working.has(row.status) && row.status !== 'duplicate') {
     panel.append(button('Recuperar de Gmail', () => recoverGmail(row), 'plain'),
-      button('Adjuntar PDF/XML', () => {attachJob = row.id; $('cfdi-file').click();}, 'plain'),
+      button('Adjuntar PDF/XML, ZIP o correo', () => {attachJob = row.id; $('cfdi-file').click();}, 'plain'),
       button('Revisar descargas', () => perform(async () => {
         await api(`/api/jobs/${row.id}/recover-local`, 'POST');
         return 'Comprobantes cotejados.';
       }), 'plain'));
   }
   if (working.has(row.status)) panel.append(button('Detener', () => perform(() => api(`/api/jobs/${row.id}/stop`, 'POST')), 'plain'));
-  if (!terminal.has(row.status) && !working.has(row.status)) panel.append(button('Preparar solicitud', () => request(row), 'plain'));
+  if (!terminal.has(row.status) && !working.has(row.status) && row.status !== 'external') panel.append(button('Preparar solicitud', () => request(row), 'plain'));
   panel.append(button('Ver actividad', () => perform(() => logs(row)), 'plain'));
   menu.append(toggle, panel);
   group.append(menu);
@@ -317,9 +328,16 @@ function renderBrowser() {
   const actions = el('div', '', 'buttons');
   if (row.human_kind) {
     const issue = row.human_kind === 'issue';
-    const resume = button(issue ? 'Aprobar emisión' : 'Continuar', () => perform(() =>
+    const label = issue ? 'Aprobar emisión' : row.human_kind === 'operator' ? 'Terminar y cotejar' : 'Continuar';
+    const resume = button(label, () => perform(() =>
       api(`/api/jobs/${row.id}/decision`, 'POST', {decision: issue ? 'approve' : 'resume'})), 'primary');
     actions.append(resume);
+    if (['plan', 'blocked', 'unknown'].includes(row.human_kind)) {
+      actions.append(button('Continuar a mano', () => perform(async () => {
+        await api(`/api/jobs/${row.id}/decision`, 'POST', {decision: 'manual'});
+        return 'El expediente registrará la operación manual y cotejará las descargas.';
+      })));
+    }
     if (row.human_kind === 'plan') actions.append(link('Revisar conexión', '#ajustes'));
   }
   actions.append(button('Detener', () => perform(() => api(`/api/jobs/${row.id}/stop`, 'POST'))));
@@ -327,6 +345,7 @@ function renderBrowser() {
 }
 
 function renderSettings() {
+  $('restart-browser').disabled = Boolean(state.active_job);
   if (state.profile && !profileDirty && !document.activeElement.closest('#profile')) {
     for (const [key, value] of Object.entries(state.profile)) $('profile').elements[key].value = value;
   }
@@ -444,12 +463,17 @@ $('receipt-form').onsubmit = event => {
     return result.status === 'duplicate' ? result.message : 'Revisión guardada.';
   });
 };
+$('run-mode').onchange = () => {
+  const manual = $('run-mode').value === 'manual';
+  $('manual-notice').hidden = !manual;
+  $('auto-row').hidden = manual || !prepared.some(row => row.receipt.provider === 'capufe');
+};
 $('prepare-form').onsubmit = event => {
   event.preventDefault();
   const data = new FormData(event.target);
   perform(async () => {
     for (const row of prepared) await api(`/api/jobs/${row.id}/run`, 'POST',
-      {consent: data.has('consent'), auto_issue: data.has('auto_issue') && row.receipt.provider === 'capufe'});
+      {consent: data.has('consent'), mode: data.get('mode'), auto_issue: data.get('mode') === 'agent' && data.has('auto_issue') && row.receipt.provider === 'capufe'});
     $('prepare-dialog').close();
     route('navegador');
     return 'Trámite en cola.';
@@ -462,6 +486,31 @@ function openBrowser(provider = null, url = null) {
   });
 }
 $('browser-open').onclick = () => openBrowser();
+$('check-tools').onclick = async () => {
+  $('check-tools').disabled = true;
+  $('tools-status').textContent = 'Comprobando herramientas…';
+  try {
+    const report = await api('/api/tools/check', 'POST');
+    const entries = [];
+    const labels = {ok: 'Comprobado', error: 'Requiere atención', busy: 'En uso',
+      configured: 'Configurado', pending: 'Por conectar', manual: 'Verificación manual'};
+    for (const tool of report) {
+      entries.push(el('dt', tool.name + ' · ' + labels[tool.status]), el('dd', tool.detail + ' ' + tool.fallback));
+    }
+    $('tools-report').replaceChildren(...entries);
+    $('tools-status').textContent = 'Comprobación terminada.';
+  } catch (error) {
+    $('tools-status').textContent = error.message;
+  } finally {
+    $('check-tools').disabled = false;
+  }
+};
+$('restart-browser').onclick = () => perform(async () => {
+  if (state.browser.open && !window.confirm('Se cerrarán las pestañas de Chromium. ¿Reiniciar el navegador?')) return;
+  await api('/api/browser/restart', 'POST');
+  route('navegador');
+  return 'Chromium está listo.';
+});
 $('portal-link-form').onsubmit = event => {
   event.preventDefault();
   openBrowser(null, $('ticket-url').value.trim());

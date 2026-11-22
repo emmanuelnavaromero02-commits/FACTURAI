@@ -85,7 +85,12 @@ async def smoke():
                 assert png.format == 'PNG' and png.size == (1280, 850)
             await page.get_by_role('button', name='Devolver control').click()
             await expect(page.get_by_role('button', name='Tomar control')).to_be_visible()
-            print('OK: OCR local, ticket, Chromium interno, teclado, búsqueda en el texto visible y captura PNG.')
+            await page.get_by_role('link', name='Ajustes', exact=True).click()
+            await page.get_by_role('button', name='Comprobar herramientas').click()
+            await expect(page.locator('#tools-status')).to_have_text('Comprobación terminada.', timeout=30_000)
+            for name in ('OCR local', 'QR y códigos de barras', 'Chromium y Playwright', 'Expedientes y almacenamiento', 'PDF y ZIP', 'Datos del CFDI 4.0'):
+                await expect(page.locator('#tools-report')).to_contain_text(name + ' · Comprobado')
+            print('OK: OCR, teclado, página, captura PNG y diagnóstico del contenedor desde Ajustes.')
         finally:
             await operator.close()
 

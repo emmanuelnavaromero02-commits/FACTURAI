@@ -32,8 +32,8 @@ export function installReceiptTools({api, el, button, link, perform, gmailConnec
       $('reader-page').replaceChildren(...Array.from({length: result.pages}, (_, n) => new Option(String(n + 1), n + 1)));
       $('reader-page').value = String(result.page);
       $('reader-ocr').disabled = $('reader-rotation').disabled = result.method === 'email';
-      const source = {pdf: 'Texto del PDF', ocr: 'OCR local', email: 'Texto del correo'}[result.method];
-      $('reader-status').textContent = source + ' · Página ' + result.page + ' de ' + result.pages;
+      const source = {pdf: 'Texto del PDF', ocr: 'OCR local', email: 'Texto del correo', codes: 'Códigos impresos'}[result.method];
+      $('reader-status').textContent = [source, 'Página ' + result.page + ' de ' + result.pages, result.notice].filter(Boolean).join(' · ');
       $('reader-text').textContent = result.text || 'No se encontró texto legible.';
       for (const code of result.codes) {
         const row = el('div', '', 'tool-entry');

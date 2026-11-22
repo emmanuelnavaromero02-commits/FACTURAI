@@ -125,7 +125,8 @@ class Receipt(BaseModel):
     def identity(self) -> str:
         # No normalizar O/0, I/1 ni eliminar guiones de un código comercial.
         keys = sorted(set(x.strip() for x in self.billing_codes if x.strip()))
-        identity = [self.provider, keys or [self.ticket_number.strip()], self.date]
+        provider_key = self.provider if self.provider != 'solicitud_directa' else [self.provider, self.merchant.strip().casefold()]
+        identity = [provider_key, keys or [self.ticket_number.strip()], self.date]
         return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
 
 

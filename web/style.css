@@ -203,4 +203,7 @@ textarea { resize: vertical; }
 .tool-list { display: grid; gap: 8px; }
 .tool-list label, .tool-list .tool-entry { display: flex; align-items: center; gap: 10px; overflow-wrap: anywhere; }
 .tool-list input[type=checkbox] { width: auto; }
+.diagnostic-list { margin: 8px 0 0; }
+.diagnostic-list dt { margin-top: 12px; font-weight: 650; }
+.diagnostic-list dd { margin: 3px 0 0; font-size: .9rem; }
 .tool-list .tool-entry span { flex: 1; }

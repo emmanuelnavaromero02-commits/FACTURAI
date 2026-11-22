@@ -6,8 +6,6 @@ import threading
 from functools import lru_cache
 from pathlib import Path
 
-import pypdfium2 as pdfium
-import zxingcpp
 from PIL import Image, ImageOps
 from pypdf import PdfReader
 
@@ -24,10 +22,18 @@ def prepare_image(image: Image.Image) -> Image.Image:
 
 
 def printed_codes(image: Image.Image) -> list[str]:
-    return [code[:2048] for code in read_codes(image, zxingcpp)[:16]]
+    try:
+        import zxingcpp
+        return [code[:2048] for code in read_codes(image, zxingcpp)[:16]]
+    except (ImportError, OSError, RuntimeError):
+        return []
 
 
 def render_pdf_page(path: Path, index: int) -> Image.Image:
+    try:
+        import pypdfium2 as pdfium
+    except (OSError, ImportError) as exc:
+        raise ValueError('El renderizador de PDF no está disponible.') from exc
     # PDFium requires serialized calls even when the documents are different.
     with _pdf_renderer, pdfium.PdfDocument(path) as pdf:
         page = pdf[index]
@@ -85,7 +91,13 @@ def read_local_page(path: Path, number: int = 1, rotation: int = 0, force_ocr: b
         if not 1 <= number <= pages:
             raise ValueError('La página seleccionada está fuera del documento.')
         text = (reader.pages[number - 1].extract_text() or '').strip()[:24_000]
-        image = render_pdf_page(path, number - 1)
+        try:
+            image = render_pdf_page(path, number - 1)
+        except (ValueError, RuntimeError, OSError):
+            if not text:
+                raise ValueError('El PDF requiere una imagen de la página. Sube una foto o captura.')
+            return {'page': number, 'pages': pages, 'method': 'pdf', 'text': text, 'codes': [],
+                    'notice': 'Se conservó el texto digital. La imagen y sus códigos requieren otra copia.'}
     else:
         if number != 1:
             raise ValueError('La imagen tiene una sola página.')
@@ -94,7 +106,15 @@ def read_local_page(path: Path, number: int = 1, rotation: int = 0, force_ocr: b
     if rotation:
         image = image.rotate(-rotation, expand=True)
     method = 'pdf'
+    notice = ''
+    codes = printed_codes(image)
     if force_ocr or not text:
-        text = ocr_text(image)
-        method = 'ocr'
-    return {'page': number, 'pages': pages, 'method': method, 'text': text, 'codes': printed_codes(image)}
+        try:
+            text = ocr_text(image)
+            method = 'ocr'
+        except ValueError as exc:
+            if not codes and not text:
+                raise
+            method = 'pdf' if text else 'codes'
+            notice = str(exc)
+    return {'page': number, 'pages': pages, 'method': method, 'text': text, 'codes': codes, 'notice': notice}

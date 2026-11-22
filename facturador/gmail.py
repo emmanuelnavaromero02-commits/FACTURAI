@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 import httpx
 
 from .auth import read_json, write_private
-from .ingest import IMAGE_EXT, MAX_UPLOAD, save_inputs
+from .ingest import IMAGE_EXT, MAX_UPLOAD, save_inputs, write_original
 
 SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
 TOKEN = 'https://oauth2.googleapis.com/token'
@@ -184,6 +184,10 @@ def ticket_parts(root: Path, message_id: str) -> dict:
         raise ValueError('Gmail no pudo abrir el mensaje seleccionado.') from exc
     if msg is None:
         raise ValueError('El correo supera el límite de tamaño de importación.')
+    return receipt_mail_parts(msg, message_id)
+
+
+def receipt_mail_parts(msg, message_id: str) -> dict:
     parts = {}
     body = msg.get_body(preferencelist=('plain', 'html'))
     if body:
@@ -208,6 +212,32 @@ def ticket_parts(root: Path, message_id: str) -> dict:
     return parts
 
 
+def parse_eml(data: bytes):
+    if not data or len(data) > MAX_UPLOAD:
+        raise ValueError('El correo .eml debe pesar hasta 25 MB.')
+    msg = email.message_from_bytes(data, policy=policy.default)
+    if not any(msg.get(field) for field in ('From', 'Subject', 'Message-ID', 'Date')):
+        raise ValueError('El archivo no contiene un mensaje de correo reconocible.')
+    return msg
+
+
+def cfdi_parts(msg):
+    for part in msg.walk():
+        filename = Path((part.get_filename() or '').replace('\\', '/')).name
+        if Path(filename).suffix.lower() in {'.pdf', '.xml', '.zip'}:
+            data = part.get_payload(decode=True)
+            if data and len(data) <= MAX_UPLOAD:
+                yield filename, data
+
+
+def import_eml(store, name: str, data: bytes) -> list[dict]:
+    msg = parse_eml(data)
+    parts = receipt_mail_parts(msg, hashlib.sha256(data).hexdigest()[:12])
+    if not parts:
+        raise ValueError('El correo no contiene texto ni fotos o PDF de tickets.')
+    return save_inputs(store, list(parts.values()), 'EML: ' + Path(name).name[:80])
+
+
 def import_tickets(store, message_id: str, selected: list[str]) -> list[dict]:
     parts = ticket_parts(store.root, message_id)
     keys = list(dict.fromkeys(selected))
@@ -230,20 +260,13 @@ def recover_attachments(root: Path, key: str, query: str) -> list[Path]:
                 msg = _raw_message(client, message_id)
                 if msg is None:
                     continue
-                for index, part in enumerate(msg.walk()):
-                    filename = part.get_filename() or ''
+                for filename, data in cfdi_parts(msg):
                     suffix = Path(filename).suffix.lower()
-                    if suffix not in {'.pdf', '.xml', '.zip'}:
-                        continue
-                    data = part.get_payload(decode=True)
-                    if not data or len(data) > 25 * 1024 * 1024:
-                        continue
                     total += len(data)
                     if total > 100 * 1024 * 1024:
                         raise ValueError('La búsqueda de Gmail supera 100 MB. Acota fecha, remitente o folio.')
-                    path = target / f'{message_id}_{index}{suffix}'
-                    path.write_bytes(data)
-                    path.chmod(0o600)
+                    path = target / (hashlib.sha256(data).hexdigest() + suffix)
+                    write_original(path, data)
                     result.append(path)
             return result
     except httpx.HTTPError as exc:

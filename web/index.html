@@ -40,7 +40,7 @@
         </section>
         <aside class="side-cards">
           <section class="card source-card" id="dropzone">
-            <span class="source-icon mint" aria-hidden="true">↥</span><h2>Importar comprobantes</h2><p>Arrastra fotos, PDF o un ZIP de WhatsApp.</p>
+            <span class="source-icon mint" aria-hidden="true">↥</span><h2>Importar comprobantes</h2><p>Arrastra fotos, PDF, correos .eml o un ZIP de WhatsApp.</p>
             <button id="choose-file" class="secondary wide-button">Seleccionar archivos</button>
             <button id="gmail-inbox" class="secondary wide-button">Importar desde Gmail</button>
             <button id="add-sample" class="plain wide-button">Cargar ticket de ejemplo</button>
@@ -92,6 +92,11 @@
     <section class="screen" id="screen-ajustes" hidden aria-labelledby="settings-title">
       <header class="screen-header"><div><h1 id="settings-title">Ajustes</h1><p>Vincula tu plan y configura los datos de los CFDI.</p></div></header>
       <div class="settings-grid">
+        <section class="card settings-card"><div class="card-heading"><h2>Herramientas y recuperación</h2></div>
+          <div class="settings-body"><p>Comprueba el navegador, la lectura de tickets y el almacenamiento con una muestra local.</p>
+            <div class="buttons"><button id="check-tools" class="secondary">Comprobar herramientas</button><button id="restart-browser" class="secondary">Reiniciar Chromium</button></div>
+            <p id="tools-status" role="status"></p><dl id="tools-report" class="diagnostic-list"></dl>
+          </div></section>
         <section class="card settings-card"><div class="card-heading"><div><h2>Datos fiscales</h2><p>Captúralos como aparecen en tu constancia.</p></div></div>
           <form id="profile" class="settings-body"><div class="fields">
             <label>RFC<input name="rfc" required maxlength="13" autocomplete="off"></label>
@@ -112,11 +117,11 @@
     </section>
   </main>
 
-  <input id="file-upload" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,.zip" multiple hidden>
+  <input id="file-upload" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,.zip,.eml" multiple hidden>
   <input id="gmail-file" type="file" accept=".json,application/json" hidden>
   <input id="csf-file" type="file" accept=".pdf,.jpg,.jpeg,.png,.webp" hidden>
   <input id="history-file" type="file" accept=".json,application/json" hidden>
-  <input id="cfdi-file" type="file" accept=".xml,.pdf,.zip" multiple hidden>
+  <input id="cfdi-file" type="file" accept=".xml,.pdf,.zip,.eml" multiple hidden>
 
   <dialog id="editor"><form id="receipt-form" class="dialog-body">
     <div class="dialog-heading"><div><h2>Revisar ticket</h2><p>Compara los campos con el original.</p></div><button type="button" class="icon-button" data-close="editor" aria-label="Cerrar revisión">×</button></div>
@@ -159,6 +164,8 @@
   <dialog id="prepare-dialog"><form id="prepare-form" class="dialog-body">
     <div class="dialog-heading"><div><h2>Preparar factura</h2><p id="prepare-summary"></p></div><button type="button" class="icon-button" data-close="prepare-dialog" aria-label="Cerrar">×</button></div>
     <label class="check-row"><input type="checkbox" name="consent" required><span>Autorizo usar el ticket y mis datos fiscales en los portales indicados.</span></label>
+    <label>Cómo tramitarlo<select id="run-mode" name="mode"><option value="agent">Con mi plan de ChatGPT</option><option value="manual">Operar el portal a mano</option></select></label>
+    <p id="manual-notice" class="muted" hidden>El portal quedará bajo tu control. El expediente guardará un posible intento de emisión antes de habilitar el mouse y el teclado. Al terminar se cotejarán tus descargas.</p>
     <label class="check-row" id="auto-row"><input type="checkbox" name="auto_issue"><span>Emitir CAPUFE automáticamente si coinciden los datos. El resto requiere revisión.</span></label>
     <div class="dialog-actions"><button class="secondary" type="button" data-close="prepare-dialog">Cancelar</button><button class="primary">Iniciar facturación</button></div>
   </form></dialog>
