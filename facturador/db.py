@@ -186,10 +186,12 @@ class Store:
                 db.execute('BEGIN IMMEDIATE')
                 row = self.decode(db.execute(self._job_select + ' WHERE j.id=?', (key,)).fetchone())
                 if row['uuid'] and row['uuid'] != fields['uuid']:
-                    raise ValueError('El UUID observado difiere del que ya está registrado para este ticket.')
+                    if row['status'] == 'verified' or row['match_type']:
+                        raise ValueError('El UUID observado difiere del que ya está cotejado para este ticket.')
+                    db.execute('DELETE FROM observed_shared_invoices WHERE job_id=?', (key,))
                 owner = db.execute("SELECT id,receipt FROM jobs WHERE uuid=? AND id<>?", (fields['uuid'],key)).fetchone()
                 if owner and row['receipt']['provider'] == 'capufe' and json.loads(owner['receipt'])['provider'] == 'capufe':
-                    observed = fields.pop('uuid')
+                    observed, fields['uuid'] = fields['uuid'], None
                     db.execute('INSERT OR IGNORE INTO observed_shared_invoices VALUES(?,?)', (key, observed))
             db.execute("UPDATE jobs SET " + ",".join(f"{x}=?" for x in fields) + " WHERE id=?", (*fields.values(), key))
 
