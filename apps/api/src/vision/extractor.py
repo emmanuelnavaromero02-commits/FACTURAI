@@ -4,6 +4,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 from PIL import Image, ImageFilter, ImageOps
+from .receipt_scan import read_codes, remove_black_letterbox
 from pydantic import BaseModel, Field
 
 try:
@@ -41,39 +42,18 @@ class VisionExtractionSchema(BaseModel):
     confianza: float = Field(0.0, ge=0.0, le=1.0)
 
 
-# Si la imagen es pequeña, los QR del ticket miden pocos píxeles: se reintenta ampliada
-QR_UPSCALE_MAX_EDGE = 2000
-
-
 def extract_all_codes(image_bytes: bytes) -> List[str]:
-    """
-    Decodifica TODOS los códigos QR y de barras de la imagen, en orden de aparición.
-    Un ticket puede traer varios (facturación, publicidad, encuesta), así que no basta con el primero.
-    """
+    """Lee QR y códigos de barras del original y de una ampliación si hace falta."""
     if zxingcpp is None:
         return []
-
     try:
         try:
             import pillow_heif
             pillow_heif.register_heif_opener()
         except Exception:
             pass
-        image = Image.open(io.BytesIO(image_bytes))
-        image = ImageOps.exif_transpose(image) or image
-        gray = image.convert("L")
-
-        texts: List[str] = []
-        for r in zxingcpp.read_barcodes(gray):
-            if r.valid and r.text and r.text.strip() not in texts:
-                texts.append(r.text.strip())
-
-        if max(gray.size) <= QR_UPSCALE_MAX_EDGE:
-            big = gray.resize((gray.width * 2, gray.height * 2), Image.Resampling.LANCZOS)
-            for r in zxingcpp.read_barcodes(big):
-                if r.valid and r.text and r.text.strip() not in texts:
-                    texts.append(r.text.strip())
-        return texts
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            return read_codes(ImageOps.exif_transpose(image), zxingcpp)
     except Exception as exc:
         logger.debug("No se pudieron leer códigos de la imagen: %s", exc)
         return []
@@ -245,26 +225,6 @@ REGLAS DE EXTRACCIÓN Y RECUPERACIÓN ANTE TICKETS ARRUGADOS O BORROSOS:
 7. ESTRICTA PROHIBICIÓN DE ADIVINAR O ALUCINAR DÍGITOS:
    Si un número de folio o monto está parcialmente borroso, cubierto por una arruga o manchado de modo que no puedas distinguir con certeza cada dígito, NO intentes inventar números. Coloca null o caracteres de duda ('?') y asigna una confianza < 0.60. En facturación electrónica mexicana ante el SAT, un dígito malinterpretado invalida la emisión o puede timbrar el consumo de otra persona. Es mil veces preferible reportar la imagen como ilegible para pedir una foto nítida que inventar datos fiscales.
 """
-
-
-def remove_black_letterbox(img: Image.Image, threshold: int = 20) -> Image.Image:
-    """
-    Elimina franjas negras externas (letterbox) producidas por capturas de pantalla de celular
-    o aplicaciones de cámara, recortando automáticamente al área útil del comprobante.
-    """
-    try:
-        gray = img.convert("L")
-        mask = gray.point(lambda p: 255 if p > threshold else 0)
-        bbox = mask.getbbox()
-        if bbox:
-            w, h = img.size
-            bw = bbox[2] - bbox[0]
-            bh = bbox[3] - bbox[1]
-            if (bw * bh) >= 0.35 * (w * h) and (bw < w or bh < h):
-                return img.crop(bbox)
-    except Exception as exc:
-        logger.debug("No se pudo aplicar recorte de franjas negras: %s", exc)
-    return img
 
 
 def clean_camscanner_hd(img: Image.Image) -> Image.Image:

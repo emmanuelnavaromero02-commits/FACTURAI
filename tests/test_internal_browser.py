@@ -1,0 +1,62 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
+
+from PIL import Image
+import zxingcpp
+
+from facturador.ai import receipt_image
+from facturador.catalog import CATALOG
+from facturador.db import Store
+from facturador.runner import Runner
+
+
+class ReceiptImageTests(unittest.TestCase):
+    def test_both_codes_survive_black_margins_and_are_read_without_inference(self):
+        canvas = Image.new('L', (1100, 600), 0)
+        canvas.paste(255, (35, 60, 1065, 540))
+        for number, (text, kind) in enumerate([
+            ('FACTURAI-00001', zxingcpp.BarcodeFormat.Code128),
+            ('https://example.test/ticket', zxingcpp.BarcodeFormat.QRCode),
+        ]):
+            code = zxingcpp.write_barcode_to_image(zxingcpp.create_barcode(text, kind), scale=3)
+            image = Image.frombytes('L', (code.shape[1], code.shape[0]), bytes(code))
+            canvas.paste(image, (80, 95 + number * 220))
+        parts = receipt_image(canvas)
+        found = json.loads(parts[1]['text'].split(': ', 1)[1])
+        self.assertCountEqual(found, ['FACTURAI-00001', 'https://example.test/ticket'])
+        self.assertEqual(canvas.getpixel((0, 0)), 0)
+        self.assertEqual(canvas.size, (1100, 600))
+
+
+class PortalBrowserTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.runner = Runner(Store(Path(self.folder.name)))
+        self.addCleanup(self.runner.plan.close)
+        self.page = Mock()
+        self.page.is_closed.return_value = False
+        self.page.goto = AsyncMock()
+        self.page.set_content = AsyncMock()
+        self.runner.context = Mock(new_page=AsyncMock(return_value=self.page))
+        self.runner.start_browser = AsyncMock()
+
+    async def test_home_and_catalog_reuse_the_manual_page(self):
+        await self.runner.open_portal()
+        self.page.goto.assert_awaited_once_with('about:blank')
+        self.assertIn(CATALOG['capufe']['url'], self.page.set_content.await_args.args[0])
+        await self.runner.open_portal('capufe')
+        self.runner.context.new_page.assert_awaited_once()
+        self.assertEqual(self.page.goto.await_args.args[0], CATALOG['capufe']['url'])
+        self.assertTrue(self.runner.viewer.manual)
+
+    async def test_manual_portal_does_not_launch_for_an_arbitrary_url_or_interrupt_a_job(self):
+        with self.assertRaises(ValueError):
+            await self.runner.open_portal('https://example.test/')
+        self.runner.job_tasks['ticket'] = object()
+        with self.assertRaises(ValueError):
+            await self.runner.open_portal('capufe')
+        self.runner.start_browser.assert_not_awaited()

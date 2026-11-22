@@ -53,3 +53,19 @@ out/
 infra/postgres_data/
 infra/redis_data/
 infra/minio_data/
+
+# Instancia personal de Facturador
+.env.*
+!.env.example
+.venv/
+/data/
+*.sqlite*
+*.pem
+*.pfx
+*.key
+*.zip
+*_token.json
+google_client.json
+profile.json
+perfil_fiscal.personal.json
+historial_sesion.json

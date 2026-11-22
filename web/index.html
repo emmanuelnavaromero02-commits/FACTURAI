@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#142722">
+  <title>Facturador · Tu bandeja de CFDI</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <aside class="sidebar" aria-label="Menú principal">
+    <a class="brand" href="#bandeja"><span class="brand-icon" aria-hidden="true"></span><span>Facturador<small>PERSONAL</small></span></a>
+    <nav class="menu">
+      <a href="#bandeja" data-nav="bandeja"><span aria-hidden="true">▤</span>Bandeja</a>
+      <a href="#navegador" data-nav="navegador"><span aria-hidden="true">⊞</span>Navegador</a>
+      <a href="#comprobantes" data-nav="comprobantes"><span aria-hidden="true">▣</span>Comprobantes</a>
+      <a href="#portales" data-nav="portales"><span aria-hidden="true">↗</span>Portales</a>
+      <a href="#ajustes" data-nav="ajustes"><span aria-hidden="true">⚙</span>Ajustes</a>
+    </nav>
+    <a class="sidebar-status" href="#ajustes"><span class="status-dot" id="sidebar-dot"></span><span>ChatGPT <small id="sidebar-plan">Por conectar</small></span><b aria-hidden="true">↗</b></a>
+  </aside>
+
+  <main id="main">
+    <div class="topbar"><span>Espacio personal <span class="separator" aria-hidden="true">/</span> <strong id="breadcrumb">Bandeja</strong></span><span id="local-pill" class="pill"><i></i>Instancia privada</span></div>
+    <div id="notice" class="notice" role="status" hidden></div>
+
+    <section class="screen" id="screen-bandeja" aria-labelledby="inbox-title">
+      <header class="screen-header"><div><p class="eyebrow">OPERACIONES</p><h1 id="inbox-title">Tickets y facturas</h1><p>Revisa tus compras, sigue su facturación y conserva los comprobantes.</p></div><button id="primary-upload" class="primary"><span aria-hidden="true">＋</span> Añadir tickets</button></header>
+      <div class="metrics" aria-label="Resumen de la bandeja">
+        <div class="metric"><span class="metric-mark mint">▤</span><div><strong id="count-total">0</strong><span>Tickets registrados</span></div></div>
+        <div class="metric"><span class="metric-mark sand">◷</span><div><strong id="count-pending">0</strong><span>Por atender</span></div></div>
+        <div class="metric"><span class="metric-mark mint">✓</span><div><strong id="count-verified">0</strong><span>CFDI comprobados</span></div></div>
+      </div>
+      <div class="dashboard-grid">
+        <section class="card receipts">
+          <div class="card-heading"><div><h2>Bandeja de tickets</h2><p>De la foto al PDF y XML.</p></div><button id="batch" class="secondary" disabled>Preparar listos</button></div>
+          <div class="table-tools"><div class="filters" aria-label="Filtrar tickets"><button data-filter="all" aria-pressed="true">Todos</button><button data-filter="review" aria-pressed="false">Por revisar</button><button data-filter="working" aria-pressed="false">En trámite</button></div><label class="search"><span aria-hidden="true">⌕</span><input id="ticket-search" type="search" placeholder="Buscar ticket" aria-label="Buscar por comercio o folio"></label></div>
+          <div id="tickets"></div>
+        </section>
+        <aside class="side-cards">
+          <section class="card source-card" id="dropzone">
+            <span class="source-icon mint" aria-hidden="true">↥</span><h2>Importar comprobantes</h2><p>Arrastra fotos, PDF o un ZIP de WhatsApp.</p>
+            <button id="choose-file" class="secondary wide-button">Seleccionar archivos</button>
+            <button id="add-sample" class="plain wide-button">Cargar ticket de ejemplo</button>
+          </section>
+          <section class="card connection-card"><span class="source-icon sand" aria-hidden="true">✳</span><h2>Tu plan de ChatGPT</h2><p id="plan-card-description">Conecta tu suscripción para leer tickets y preparar los portales.</p><a class="inline-link" href="#ajustes" id="plan-card-link">Conectar ChatGPT <span aria-hidden="true">→</span></a></section>
+        </aside>
+      </div>
+    </section>
+
+    <section class="screen" id="screen-navegador" hidden aria-labelledby="browser-title">
+      <header class="screen-header"><div><h1 id="browser-title">Navegador</h1><p>Abre un portal o continúa el trámite de un ticket.</p></div><div class="buttons"><button id="browser-open" class="primary">Abrir navegador</button><button id="wa-open" class="secondary">Abrir WhatsApp Web</button></div></header>
+      <div class="browser-grid">
+        <section class="card browser-card">
+          <div class="browser-bar"><div class="browser-lights" aria-hidden="true"><i></i><i></i><i></i></div><span id="browser-address">Sin página abierta</span><span class="pill browser-pill" id="browser-state">En espera</span></div>
+          <div class="browser-stage">
+            <div id="browser-empty" class="empty small-empty"><span class="empty-symbol" aria-hidden="true">⊞</span><h3>Sin página abierta</h3><p>Abre el navegador para elegir un comercio, o prepara un ticket desde la bandeja.</p></div>
+            <img id="browser-image" alt="Página en vivo del navegador" tabindex="0" draggable="false" hidden>
+            <div id="browser-loading" class="browser-loading" hidden>Abriendo la página…</div>
+          </div>
+          <div id="native-dialog" class="inline-panel" hidden><h3>Aviso del portal</h3><p id="native-text"></p><div class="buttons"><button id="native-yes" class="primary">Aceptar</button><button id="native-no" class="secondary">Cerrar aviso</button></div></div>
+          <div class="browser-controls"><button id="take-control" class="primary" disabled>Tomar control</button><button id="wa-capture" class="secondary" disabled>Importar foto abierta</button><span id="browser-hint">El panel muestra la misma sesión que usa el facturador.</span></div>
+          <form id="paste-form" class="paste-form" hidden><label for="remote-text">Pegar texto en el campo activo</label><div class="buttons"><input id="remote-text" type="password" autocomplete="off" maxlength="2000" required><button class="secondary">Escribir</button></div></form>
+        </section>
+        <section class="card task-card"><h2>Trámite actual</h2><div id="browser-task"><p class="muted">El resumen, la forma de pago y las intervenciones aparecen aquí.</p></div></section>
+      </div>
+    </section>
+
+    <section class="screen" id="screen-comprobantes" hidden aria-labelledby="documents-title">
+      <header class="screen-header"><div><h1 id="documents-title">Comprobantes</h1><p>Consulta las emisiones, recupera archivos y descarga tus CFDI.</p></div><a class="secondary button-link" href="/api/export.csv">Exportar CSV ↓</a></header>
+      <section class="card receipts"><div class="card-heading"><div><h2>Registro de CFDI</h2><p>Incluye estados de recuperación e historial importado.</p></div></div><div id="documents"></div></section>
+    </section>
+
+    <section class="screen" id="screen-portales" hidden aria-labelledby="portals-title">
+      <header class="screen-header"><div><h1 id="portals-title">Portales</h1><p>Comercios disponibles para preparar una solicitud.</p></div><label class="search"><span aria-hidden="true">⌕</span><input id="portal-search" type="search" placeholder="Buscar comercio" aria-label="Buscar portal"></label></header>
+      <div class="portal-list" id="portal-list"></div>
+    </section>
+
+    <section class="screen" id="screen-ajustes" hidden aria-labelledby="settings-title">
+      <header class="screen-header"><div><h1 id="settings-title">Ajustes</h1><p>Vincula tu plan y configura los datos de los CFDI.</p></div></header>
+      <div class="settings-grid">
+        <section class="card settings-card"><div class="card-heading"><div><h2>Datos fiscales</h2><p>Captúralos como aparecen en tu constancia.</p></div></div>
+          <form id="profile" class="settings-body"><div class="fields">
+            <label>RFC<input name="rfc" required maxlength="13" autocomplete="off"></label>
+            <label>Código postal<input name="postal_code" required pattern="[0-9]{5}" inputmode="numeric" maxlength="5"></label>
+            <label class="full">Nombre o razón social<input name="name" required maxlength="180"></label>
+            <label>Régimen fiscal<input name="regime" required inputmode="numeric" pattern="[0-9]{3}" maxlength="3" placeholder="612"></label>
+            <label>Uso del CFDI<input name="cfdi_use" value="G03" required maxlength="5"></label>
+            <label class="full">Correo de entrega<input name="email" type="email" required maxlength="200"></label>
+          </div><div class="buttons"><button class="primary">Guardar datos fiscales</button><button id="read-csf" class="secondary" type="button">Leer constancia</button></div></form>
+        </section>
+        <section class="card settings-card"><div class="card-heading"><div><h2>Suscripción de ChatGPT</h2><p>Usa el cupo de la cuenta que autorices.</p></div><span class="pill" id="plan-status">Por conectar</span></div>
+          <div class="settings-body"><p id="plan-email" class="muted"></p><p id="plan-message" class="muted"></p><div class="buttons"><button id="pod-connect" class="primary" data-oai-siwc-button>Continuar con ChatGPT</button><button id="pod-other" class="plain" hidden>Usar otra cuenta</button><button id="pod-disconnect" class="secondary" hidden>Desconectar</button><button id="pod-retry" class="secondary" hidden>Revisar cupo</button></div>
+          <div id="model-row" class="model-row" hidden><div><strong>Modelo</strong><p id="current-model"></p></div><button class="secondary" id="model-list">Elegir modelo</button></div></div>
+        </section>
+        <section class="card settings-card"><div class="card-heading"><div><h2>Gmail</h2><p>Recupera PDF, XML y ZIP adjuntos.</p></div><span class="pill" id="gmail-status">Por conectar</span></div><div class="settings-body"><p class="muted">Importa el JSON OAuth de escritorio de Google y vincula el buzón en modo lectura.</p><div class="buttons"><button id="gmail-configure" class="secondary">Importar cliente OAuth</button><button id="gmail-connect" class="primary" disabled>Conectar Gmail</button><button id="gmail-disconnect" class="plain" hidden>Desvincular</button></div></div></section>
+        <section class="card settings-card"><div class="card-heading"><div><h2>Historial anterior</h2><p>Incorpora el registro del facturador anterior.</p></div></div><div class="settings-body"><p class="muted">Importa el JSON de historial para reconocer tickets ya registrados.</p><button class="secondary" id="import-history">Importar historial</button></div></section>
+      </div>
+    </section>
+  </main>
+
+  <input id="file-upload" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,.zip" multiple hidden>
+  <input id="gmail-file" type="file" accept=".json,application/json" hidden>
+  <input id="csf-file" type="file" accept=".pdf,.jpg,.jpeg,.png,.webp" hidden>
+  <input id="history-file" type="file" accept=".json,application/json" hidden>
+  <input id="cfdi-file" type="file" accept=".xml,.pdf,.zip" multiple hidden>
+
+  <dialog id="editor"><form id="receipt-form" class="dialog-body">
+    <div class="dialog-heading"><div><h2>Revisar ticket</h2><p>Compara los campos con el original.</p></div><button type="button" class="icon-button" data-close="editor" aria-label="Cerrar revisión">×</button></div>
+    <div class="fields">
+      <label>Portal<select name="provider" required></select></label><label>Comercio<input name="merchant" required maxlength="180"></label>
+      <label>Fecha<input name="date" type="date" required></label><label>Importe facturable<input name="amount" inputmode="decimal" required maxlength="20"></label>
+      <label>Forma de pago<select name="payment_code" required><option value="">Seleccionar</option><option value="01">01 · Efectivo</option><option value="04">04 · Crédito</option><option value="28">28 · Débito</option><option value="03">03 · Transferencia</option><option value="99">99 · Por definir</option></select></label>
+      <label>Folio<input name="ticket_number" maxlength="180"></label>
+      <label class="full">Códigos de facturación<textarea name="billing_codes" placeholder="Un código por línea" rows="2" maxlength="2500"></textarea></label>
+      <label class="full">Detalles<textarea name="details" placeholder="Tienda, carril, hora u otra referencia" rows="2" maxlength="1800"></textarea></label>
+    </div>
+    <div class="dialog-actions"><a id="view-source" class="inline-link" target="_blank" rel="noopener">Ver original ↗</a><button class="primary">Guardar revisión</button></div>
+  </form></dialog>
+
+  <dialog id="prepare-dialog"><form id="prepare-form" class="dialog-body">
+    <div class="dialog-heading"><div><h2>Preparar factura</h2><p id="prepare-summary"></p></div><button type="button" class="icon-button" data-close="prepare-dialog" aria-label="Cerrar">×</button></div>
+    <label class="check-row"><input type="checkbox" name="consent" required><span>Autorizo usar el ticket y mis datos fiscales en los portales indicados.</span></label>
+    <label class="check-row" id="auto-row"><input type="checkbox" name="auto_issue"><span>Emitir CAPUFE automáticamente si coinciden los datos. El resto requiere revisión.</span></label>
+    <div class="dialog-actions"><button class="secondary" type="button" data-close="prepare-dialog">Cancelar</button><button class="primary">Iniciar facturación</button></div>
+  </form></dialog>
+
+  <dialog id="logs-dialog"><div class="dialog-body"><div class="dialog-heading"><div><h2>Actividad del ticket</h2><p id="logs-label"></p></div><button type="button" class="icon-button" data-close="logs-dialog" aria-label="Cerrar actividad">×</button></div><div id="logs"></div></div></dialog>
+  <dialog id="model-dialog"><form id="model-form" class="dialog-body"><div class="dialog-heading"><h2>Elegir modelo</h2><button type="button" data-close="model-dialog" class="icon-button" aria-label="Cerrar">×</button></div><label>Modelos de tu plan<select name="model" required></select></label><div class="dialog-actions"><button class="primary">Usar modelo</button></div></form></dialog>
+  <dialog id="gmail-dialog"><form id="gmail-form" class="dialog-body"><div class="dialog-heading"><div><h2>Recuperar de Gmail</h2><p id="gmail-job"></p></div><button class="icon-button" type="button" data-close="gmail-dialog" aria-label="Cerrar">×</button></div><label>Búsqueda por fecha, remitente o folio<input name="query" required maxlength="400"></label><div class="dialog-actions"><button class="primary">Buscar comprobante</button></div></form></dialog>
+  <dialog id="request-dialog"><div class="dialog-body"><div class="dialog-heading"><div><h2>Solicitud al comercio</h2><p>Copia el texto para enviarlo por el canal que uses.</p></div><button class="icon-button" type="button" data-close="request-dialog" aria-label="Cerrar">×</button></div><label>Mensaje<textarea id="request-text" rows="7" readonly></textarea></label><div class="dialog-actions"><button class="primary" id="copy-request">Copiar solicitud</button></div></div></dialog>
+</body>
+</html>
