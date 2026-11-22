@@ -24,9 +24,11 @@ async def smoke():
         compressed.writestr('factura.xml', xml)
         compressed.writestr('factura.pdf', pdf)
     submissions = []
+    requests = []
 
     async def portal(route):
         path = urlsplit(route.request.url).path
+        requests.append((route.request.method, path))
         if path == '/':
             await route.fulfill(content_type='text/html; charset=utf-8', body=(
                 '<form method="post" action="/emision"><label>RFC<input name="rfc" required></label>'
@@ -35,7 +37,7 @@ async def smoke():
             submissions.append(parse_qs(route.request.post_data or ''))
             await route.fulfill(content_type='text/html; charset=utf-8', body=(
                 f'<h1>Factura emitida</h1><p>{FISCAL_UUID}</p>'
-                '<a href="/archivos" download="factura.zip">Descargar PDF y XML</a>'))
+                '<a href="/archivos">Descargar PDF y XML</a>'))
         elif path == '/archivos':
             await route.fulfill(content_type='application/zip', body=archive.getvalue(),
                                 headers={'Content-Disposition': 'attachment; filename="factura.zip"'})
@@ -68,7 +70,14 @@ async def smoke():
                 assert key in runner.pending and runner.pending[key]['kind'] == 'issue', store.get(key)['message']
                 assert not submissions
                 await runner.continue_job(key, 'approve')
-                await asyncio.wait_for(task, 30)
+                async with asyncio.timeout(30):
+                    while not task.done():
+                        pending = runner.pending.get(key, {})
+                        if pending and pending['kind'] != 'issue':
+                            raise AssertionError((pending['kind'], requests, store.events(key),
+                                                  await runner.viewer.page.locator('body').aria_snapshot()))
+                        await asyncio.sleep(0.05)
+                await task
             result = store.get(key)
             assert submissions == [{'rfc': [PROFILE.rfc]}], submissions
             assert result['status'] == 'verified', result['message']
