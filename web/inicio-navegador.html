@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Portales de facturación</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 5vh auto; padding: 24px; max-width: 970px; background: #f7f9f6; color: #213931; font: 18px system-ui, sans-serif; }
+    h1 { margin: 0 0 24px; font-size: 32px; }
+    label { display: block; margin-bottom: 8px; font-weight: 600; }
+    input { width: 100%; padding: 12px; border: 1px solid #84978c; border-radius: 6px; font: inherit; }
+    ul { padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; }
+    a { display: block; padding: 12px 14px; background: white; color: #165437; border: 1px solid #d8e1da; border-radius: 6px; }
+    a:focus-visible, input:focus-visible { outline: 2px solid #165437; }
+  </style>
+</head>
+<body>
+  <h1>Portales de facturación</h1>
+  <label for="buscar">Buscar comercio</label>
+  <input id="buscar" type="search" autocomplete="off" autofocus>
+  <ul><!--PORTALES--></ul>
+  <p id="vacio" hidden>Ningún comercio coincide con tu búsqueda.</p>
+  <script>
+    const search = document.getElementById('buscar');
+    const rows = Array.from(document.querySelectorAll('li'));
+    search.addEventListener('input', () => {
+      const text = search.value.trim().toLocaleLowerCase('es');
+      for (const row of rows) row.hidden = !row.textContent.toLocaleLowerCase('es').includes(text);
+      document.getElementById('vacio').hidden = rows.some(row => !row.hidden);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+**
+!Dockerfile
+!requirements.txt
+!PROMPT_FACTURADOR.md
+!web/
+!web/*.html
+!web/*.css
+!web/*.js
+!facturador/
+!facturador/*.py
+!apps/
+!apps/api/
+!apps/api/src/
+!apps/api/src/vision/
+!apps/api/src/vision/receipt_scan.py
