@@ -26,11 +26,12 @@ def ticket(key, merchant, status):
 
 
 class Fixture:
-    def __init__(self):
+    def __init__(self, duplicate=False):
         self.upload = ticket(TICKET_ID, 'Tienda de prueba', 'new')
+        self.duplicate = duplicate
         self.automation = {'enabled': True, 'phase': 'idle', 'message': '', 'current_id': None}
         self.state = {
-            'jobs': [ticket('otro-ticket', 'Otra tienda', 'review')], 'active_job': None,
+            'jobs': ([self.upload] if duplicate else []) + [ticket('otro-ticket', 'Otra tienda', 'review')], 'active_job': None,
             'catalog': {}, 'token': 'test-ui', 'plan': {'status': 'ready'}, 'gmail': 'disconnected',
             'profile': {}, 'automation': self.automation,
             'browser': {'open': False, 'revision': 0, 'manual': False, 'engine': 'Google Chrome'},
@@ -53,9 +54,11 @@ class Fixture:
             self.automation.update(enabled=enabled)
             return await route.fulfill(json=self.automation)
         if path == '/api/upload' and route.request.method == 'POST':
-            self.state['jobs'].insert(0, self.upload)
-            self.automation.update(current_id=TICKET_ID, phase='reading', message='Leyendo con ChatGPT')
-            return await route.fulfill(json=[{'id': TICKET_ID, 'created': True}])
+            if not self.duplicate:
+                self.state['jobs'].insert(0, self.upload)
+                self.automation.update(current_id=TICKET_ID, phase='reading', message='Leyendo con ChatGPT')
+            return await route.fulfill(json=[{'id': TICKET_ID, 'created': not self.duplicate,
+                                             'status': self.upload['status']}])
         if path == f'/api/jobs/{TICKET_ID}' and route.request.method == 'PUT':
             self.upload['receipt'].update(route.request.post_data_json)
             self.upload.update(status='ready')
@@ -77,7 +80,7 @@ class Fixture:
 
 
 async def exercise(browser, scenario):
-    app = Fixture()
+    app = Fixture(duplicate=scenario == 'duplicate')
     context = await browser.new_context(service_workers='block')
     errors = []
     try:
@@ -103,6 +106,20 @@ async def exercise(browser, scenario):
             async with page.expect_response(lambda response: response.url.endswith('/api/automation')):
                 await enabled.check()
             await expect(enabled).to_be_checked()
+
+        if scenario == 'duplicate':
+            await page.get_by_role('button', name='Por revisar', exact=True).click()
+            await page.get_by_role('searchbox', name='Buscar por comercio o folio').fill('emmanuel')
+            await expect(page.locator('#tickets')).to_contain_text('Sin tickets con estos filtros')
+            await page.locator('#file-upload').set_input_files(
+                {'name': 'prueba.jpg', 'mimeType': 'image/jpeg', 'buffer': app.picture}
+            )
+            await expect(page.locator('#notice')).to_contain_text('Este archivo ya está registrado como Tienda de prueba')
+            await expect(page.get_by_role('button', name='Todos', exact=True)).to_have_attribute('aria-pressed', 'true')
+            await expect(page.get_by_role('searchbox', name='Buscar por comercio o folio')).to_have_value('')
+            await expect(page.locator('#tickets').get_by_role('row').filter(has_text='Tienda de prueba')).to_be_visible()
+            assert not errors, errors
+            return
 
         await page.locator('#file-upload').set_input_files(
             {'name': 'prueba.jpg', 'mimeType': 'image/jpeg', 'buffer': app.picture}
@@ -214,7 +231,7 @@ async def smoke():
         browser = await playwright.chromium.launch(executable_path='/usr/bin/google-chrome-stable',
                                                     headless=False, chromium_sandbox=True)
         try:
-            for scenario in ('follow', 'dialog', 'navigation', 'payment', 'portal', 'manual'):
+            for scenario in ('follow', 'dialog', 'navigation', 'payment', 'portal', 'manual', 'duplicate'):
                 await exercise(browser, scenario)
                 print('OK', scenario, flush=True)
         finally:

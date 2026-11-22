@@ -37,16 +37,27 @@ def transient_read_delay(error):
     return None
 
 
-def review_questions(receipt: Receipt) -> list[str]:
+def review_questions(receipt: Receipt, *, confirmed_portal: bool = False) -> list[str]:
     errors = receipt.ready_errors()
     if not receipt.amount:
         errors = ['Falta importe' if m == 'Importe inválido' else m for m in errors]
-    if receipt.provider == CUSTOM_PORTAL and receipt.portal_url:
+    if receipt.provider == CUSTOM_PORTAL and receipt.portal_url and not confirmed_portal:
         errors.append('Confirma el dominio del portal antes de compartir tus datos fiscales: '
                       + (public_portal_origin(receipt.portal_url) or 'revisa la dirección impresa'))
     elif receipt.provider not in CATALOG and receipt.provider != CUSTOM_PORTAL:
         errors.append('Indica el portal de facturación que aparece en el ticket.')
     return errors
+
+
+def printed_portal_confirmed(row, receipt: Receipt) -> bool:
+    """Accept an unfamiliar portal only when the original and the model agree on one printed fiscal URL."""
+    if receipt.provider != CUSTOM_PORTAL or not public_portal_origin(receipt.portal_url):
+        return False
+    try:
+        marked, _ = portal_evidence(Path(row['source_path']))
+    except (OSError, ValueError, RuntimeError, PyPdfError):
+        return False
+    return marked == [receipt.portal_url]
 
 
 def plain_words(value: str) -> str:
@@ -113,7 +124,9 @@ def read_ticket(plan, row, automatic):
         uncertainties = [msg for msg in uncertainties if not re.fullmatch(
             r'(?:el ticket no (?:indica|especifica|muestra)|falta(?: confirmar)?|no (?:consta|se indica))\s+'
             r'(?:la )?forma de pago(?: confirmada)?[.!]?', msg.strip(), re.I)]
-    questions = [*review_questions(receipt), *uncertainties]
+    confirmed_portal = (receipt.provider == CUSTOM_PORTAL and len(marked) == 1 and
+                        marked[0] == receipt.portal_url and reported == receipt.portal_url)
+    questions = [*review_questions(receipt, confirmed_portal=confirmed_portal), *uncertainties]
 
     if automatic and known and not questions:
         # Corroborate the model's choice against the printed merchant, issuer, or official URL.
@@ -129,7 +142,7 @@ def read_ticket(plan, row, automatic):
         unique_host = any([key for key in CATALOG if allowed_url(link, key)] == [receipt.provider] for link in links)
         if not printed and not unique_host:
             questions.append('Confirma que el comercio del ticket corresponde a ' + item['name'] + '.')
-    ready = bool(automatic and known and not questions)
+    ready = bool(automatic and (known or confirmed_portal) and not questions)
     note = ' '.join(dict.fromkeys(questions)) if questions else (
         'Datos completos. Listo para preparar el portal.' if ready else 'Revisa los datos y guarda la revisión.')
     return receipt, ready, note
@@ -238,7 +251,8 @@ class TicketAutomation:
     def _prepare(self, row):
         key = row['id']
         receipt = Receipt.model_validate(row['receipt'])
-        questions = review_questions(receipt)
+        confirmed_portal = printed_portal_confirmed(row, receipt)
+        questions = review_questions(receipt, confirmed_portal=confirmed_portal)
         if questions:
             message = ' '.join(questions)
             self.store.note_review(row, message, keep_ready=receipt.provider == CUSTOM_PORTAL and not receipt.ready_errors())
@@ -258,7 +272,8 @@ class TicketAutomation:
             return False
         # No await between checking ownership and calling schedule, which atomically claims
         # the job in SQLite and registers its task before yielding control to other handlers.
-        self.runner.schedule(key, profile, auto_issue=False)
+        self.runner.schedule(key, profile, auto_issue=False,
+                             confirmed_url=receipt.portal_url if confirmed_portal else '')
         self._set('queued', key, 'En cola para preparar el portal. La emisión requiere tu aprobación.')
         return True
 
@@ -268,7 +283,8 @@ class TicketAutomation:
         # Explain already extracted tickets without another model request or a field change.
         previous = self.store.auto_candidates('review')
         if previous:
-            questions = review_questions(Receipt.model_validate(previous['receipt']))
+            receipt = Receipt.model_validate(previous['receipt'])
+            questions = review_questions(receipt, confirmed_portal=printed_portal_confirmed(previous, receipt))
             old_note = previous['message']
             if old_note and old_note not in ('Revisar datos extraídos', 'Datos extraídos; revisar antes de emitir'):
                 questions.append(old_note)

@@ -464,6 +464,8 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
             name = file.filename or 'archivo'
             importer = import_eml if Path(name).suffix.lower() == '.eml' else save_upload
             result += await asyncio.to_thread(importer, store, name, data)
+        if any(item['created'] for item in result):
+            automation.wake.set()
         return result
 
     @app.post('/api/demo')

@@ -86,7 +86,7 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
                 await self.runner.job_tasks[key]
             self.assertEqual(self.store.get(key)['status'], 'queued')
 
-    async def test_unknown_domain_is_never_scheduled_even_after_saving_review(self):
+    async def test_unfamiliar_printed_portal_opens_without_catalog_entry(self):
         link = 'https://facturas.example.org/mi-ticket'
         key = self.add(source='WhatsApp: ticket.txt', text='Factura en ' + link)
         with patch('facturador.automation.AI.extract', return_value=extracted(provider='unknown', billing_url=link)):
@@ -94,8 +94,22 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
         row = self.store.get(key)
         self.assertEqual(row['receipt']['portal_url'], link)
         self.assertEqual(row['receipt']['provider'], 'portal_ticket')
+        self.assertEqual(row['status'], 'ready')
+        with patch.object(self.runner, 'run', new_callable=AsyncMock) as run:
+            await self.worker.step()
+            await asyncio.gather(*self.runner.job_tasks.values())
+            run.assert_awaited_once_with(key, PROFILE, False, False)
+        self.assertEqual(self.store.get(key)['status'], 'queued')
+
+    async def test_unprinted_domain_still_needs_review(self):
+        link = 'https://facturas.example.org/mi-ticket'
+        key = self.add(source='WhatsApp: ticket.txt', text='Compra pagada sin dirección de facturación')
+        with patch('facturador.automation.AI.extract', return_value=extracted(provider='unknown', billing_url=None)):
+            await self.worker.step()
+        row = self.store.get(key)
         self.assertEqual(row['status'], 'review')
-        self.store.save_receipt(key, Receipt.model_validate(row['receipt']), ready=True)
+        receipt = Receipt.model_validate(row['receipt']).model_copy(update={'provider':'portal_ticket', 'portal_url':link})
+        self.store.save_receipt(key, receipt, ready=True)
         await self.worker.step()
         self.assertEqual(self.store.get(key)['status'], 'ready')
         self.assertIn('Confirma el dominio', self.store.get(key)['message'])

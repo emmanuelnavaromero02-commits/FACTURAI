@@ -35,6 +35,7 @@ let savingAutomation = false;
 let lastLiveJob = null;
 const handledLiveJobs = new Set();
 let selectedRetry = '';
+let lastUploadedId = '';
 const retryStrip = document.createElement('div');
 retryStrip.id = 'ticket-retry';
 retryStrip.className = 'buttons';
@@ -526,6 +527,8 @@ function table(container, rows, isDocs = false) {
     const actions = el('td');
     actions.append(rowActions(row));
     const tr = el('tr');
+    tr.dataset.jobId = row.id;
+    tr.tabIndex = -1;
     const amountCell = el('td', currency(receipt.amount), 'ticket-amount');
     if (row.match_type === 'agrupado') {
       amountCell.replaceChildren(el('strong', currency(row.ticket_total)),
@@ -681,15 +684,35 @@ async function refresh() {
 
 function upload(files) {
   if (!files.length) return;
+  lastUploadedId = '';
   perform(async () => {
     const data = new FormData();
     for (const file of files) data.append('files', file);
     const rows = await api('/api/upload', 'POST', data);
     const count = rows.filter(row => row.created).length;
     const duplicates = rows.length - count;
-    const readingSoon = count && state.automation?.enabled ? ' La bandeja mostrará el avance.' : '';
+    lastUploadedId = rows.find(row => row.created)?.id || rows[0]?.id || '';
+    $('ticket-search').value = '';
+    filter = 'all';
+    for (const item of document.querySelectorAll('[data-filter]')) {
+      item.setAttribute('aria-pressed', String(item.dataset.filter === 'all'));
+    }
+    route('bandeja');
+    if (!count && rows.length === 1) {
+      const existing = rows[0];
+      const name = state.jobs.find(row => row.id === existing.id)?.receipt.merchant || 'este ticket';
+      const status = jobLabels[existing.status] || existing.status;
+      return `Este archivo ya está registrado como ${name}. Estado: ${status}. Abajo puedes abrir su expediente.`;
+    }
+    const readingSoon = count && state.automation?.enabled ? ' En cola de lectura automática.' : '';
     return `${count} ${count === 1 ? 'ticket añadido' : 'tickets añadidos'}.` +
       (duplicates ? ` Ya registrados: ${duplicates}.` : '') + readingSoon;
+  }).then(() => {
+    const row = [...document.querySelectorAll('#tickets tr')].find(item => item.dataset.jobId === lastUploadedId);
+    if (row) {
+      row.scrollIntoView({block: 'center'});
+      row.focus({preventScroll: true});
+    }
   });
 }
 
