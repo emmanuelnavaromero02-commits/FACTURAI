@@ -19,7 +19,7 @@ def now() -> str:
 EDITABLE = {"new", "review", "ready", "blocked", "external"}
 # Delay after each failed automatic read. The final attempt falls back to review.
 READ_DELAYS = (30, 120, 600)
-AUTO_ELIGIBLE = """historical=0 AND source_path IS NOT NULL AND billing_profile IS NULL
+AUTO_ELIGIBLE = """historical=0 AND source_path IS NOT NULL
     AND issue_attempted=0 AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL
     AND COALESCE(json_extract(receipt,'$.source'),'') NOT LIKE 'Ejemplo:%'"""
 ARCHIVED_TOLL = 'Este código de peaje figura en un CFDI guardado. Recupera sus comprobantes para cotejar el ticket.'

@@ -102,6 +102,70 @@ def catalog_merchant_confirmed(item: dict, visible_text: str, extracted_merchant
     return False
 
 
+_PAYMENT_UNCERTAINTY_WORDS = set('''
+    a al ambas ambos aparece aparecen claramente con confirma confirmada confirmado confirmar
+    consta credito cual cuando de debito del determina determinar distingue distinguir el en
+    entre es esta estan efectivo especifica especificado fue fueron foto forma falta identificada
+    identificado identificar imagen indica indicar informacion inalambrica la las lector linea
+    lo medio metodo muestra no observada observado original pago pagado pero por puede pudo que
+    recibo se ser si sin tarjeta tarjetas terminal ticket tipo una un usado usada utiliza
+    utilizada utilizado ve ver visualmente y
+'''.split())
+
+
+def payment_only_uncertainty(message: str) -> bool:
+    """Recognize a payment-only doubt, preserving doubts about any other field."""
+    words = plain_words(message).split()
+    if not words or not set(words) <= _PAYMENT_UNCERTAINTY_WORDS:
+        return False
+    return (bool(set(words) & {'pago', 'tarjeta', 'tarjetas', 'debito', 'credito', 'efectivo'})
+            and bool(set(words) & {'no', 'falta', 'sin', 'distingue', 'confirmar', 'determinar'}))
+
+
+def catalog_portal_only_uncertainty(message: str, provider: str) -> bool:
+    """Recognize readability notes about HTTPS/QR, not mismatched destinations."""
+    if provider not in CATALOG:
+        return False
+    expected_hosts = {host.removeprefix('www.') for host in CATALOG[provider]['hosts']}
+    printed_hosts = re.findall(r'\b(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+\b', message.casefold())
+    if any(host.removeprefix('www.') not in expected_hosts for host in printed_hosts):
+        return False
+    words = plain_words(message)
+    if re.search(r'\b(?:diferente|distinto|coincide|inseguro|sospechoso|redirige|importe|folio|rfc|identidad)\b', words):
+        return False
+    return bool(any(re.fullmatch(pattern, words) for pattern in (
+        r'(?:el ticket imprime el dominio|se imprime el dominio) [a-z0-9 ]+ sin (?:el )?(?:esquema|prefijo|protocolo) https',
+        r'el portal de facturacion aparece impreso como [a-z0-9 ]+ sin (?:el )?(?:esquema|prefijo|protocolo) https',
+        r'no se pudo verificar una liga https a partir del qr',
+        r'el qr (?:inferior|de facturacion) esta identificado como el de facturacion pero no se pudo decodificar su url',
+        r'el qr superior corresponde a una encuesta',
+        r'(?:el )?(?:codigo )?qr (?:de facturacion )?no se pudo (?:leer|decodificar)',
+    )))
+
+
+def missing_portal_only_uncertainty(message: str) -> bool:
+    """A verified custom URL resolves an absent-link note, not a destination warning."""
+    return bool(re.fullmatch(
+        r'(?:no aparece|no se (?:encontro|identifico|leyo)|falta) (?:una |un |la |el )?'
+        r'(?:liga|enlace|url|portal|sitio)(?: de facturacion)?', plain_words(message)))
+
+
+def reconcile_uncertainties(messages: list[str], *, payment_confirmed: bool,
+                            catalog_provider: str, custom_portal_confirmed: bool) -> list[str]:
+    remaining = []
+    for message in messages:
+        # The model can put payment, fiscal QR, and other observations in one
+        # paragraph. Remove only individually resolved sentences.
+        sentences = re.split(r'(?<=[.!?])\s+', message.strip())
+        kept = [sentence for sentence in sentences if not (
+            (payment_confirmed and payment_only_uncertainty(sentence)) or
+            (catalog_provider and catalog_portal_only_uncertainty(sentence, catalog_provider)) or
+            (custom_portal_confirmed and missing_portal_only_uncertainty(sentence)))]
+        if kept:
+            remaining.append(' '.join(kept))
+    return remaining
+
+
 def read_ticket(plan, row, automatic, root, companions=()):
     path = Path(row['source_path'])
     result = AI(plan).extract(path, {k: v['name'] for k, v in CATALOG.items()}, list(companions))
@@ -201,28 +265,13 @@ def read_ticket(plan, row, automatic, root, companions=()):
         if old.payment_code and payment and old.payment_code != payment and not row.get('confirmed_payment'):
             receipt.payment_code = ''
         payment = receipt.payment_code
-    uncertainties = list(result.uncertainties)
-    if len(choices) > 1:
-        uncertainties.append('Se encontraron varios enlaces fiscales impresos. Revisa los destinos en Leer texto, QR y barras.')
-    elif not billing_url and not known and not searched_and_verified and (other or reported):
-        uncertainties.append('Comprueba el sitio del comercio en el original. El destino para facturar sigue sin confirmar.')
-    if payment:
-        # Drop an uncertainty solely about an absent payment when the original or owner resolved it.
-        uncertainties = [msg for msg in uncertainties if not re.fullmatch(
-            r'(?:el ticket no (?:indica|especifica|muestra)|falta(?: confirmar)?|no (?:consta|se indica))\s+'
-            r'(?:la )?forma de pago(?: confirmada)?[.!]?', msg.strip(), re.I)]
-    confirmed_portal = searched_and_verified or (receipt.provider == CUSTOM_PORTAL and
-                                                  marked == [receipt.portal_url])
-    if confirmed_portal:
-        uncertainties = [message for message in uncertainties if not re.search(
-            r'\b(?:portal|liga|enlace|direcci[oó]n|sitio de facturaci[oó]n)\b', message, re.I)]
-    questions = [*review_questions(receipt, confirmed_portal=confirmed_portal), *uncertainties]
-
-    if automatic and known and not questions:
-        # Corroborate the model's choice against the printed merchant, issuer, or official URL.
+    catalog_confirmed = False
+    if automatic and known:
+        # Corroborate the catalog choice before deciding whether model prose
+        # still warrants review. This never changes the portal destination.
         try:
             page = page or read_local_page(path)
-        except Exception:
+        except (OSError, ValueError, RuntimeError, PyPdfError):
             page = {}
         item = CATALOG[receipt.provider]
         visible_text = page.get('text', '')
@@ -243,8 +292,24 @@ def read_ticket(plan, row, automatic, root, companions=()):
                 pass
         links = portal_suggestions(page.get('codes', []), page.get('text', ''))
         unique_host = any([key for key in CATALOG if allowed_url(link, key)] == [receipt.provider] for link in links)
-        if not printed and not unique_host:
-            questions.append('Confirma que el comercio del ticket corresponde a ' + item['name'] + '.')
+        catalog_confirmed = printed or unique_host
+    uncertainties = list(result.uncertainties)
+    if len(choices) > 1:
+        uncertainties.append('Se encontraron varios enlaces fiscales impresos. Revisa los destinos en Leer texto, QR y barras.')
+    elif not billing_url and not known and not searched_and_verified and (other or reported):
+        uncertainties.append('Comprueba el sitio del comercio en el original. El destino para facturar sigue sin confirmar.')
+    confirmed_portal = searched_and_verified or (receipt.provider == CUSTOM_PORTAL and
+                                                  marked == [receipt.portal_url])
+    uncertainties = reconcile_uncertainties(
+        uncertainties,
+        payment_confirmed=bool(payment and receipt.payment_code == payment and
+                               sources.get('payment_code') in {'correccion_usuario', 'vision_modelo_linea_pago',
+                                                               'lector_local'}),
+        catalog_provider=receipt.provider if catalog_confirmed else '',
+        custom_portal_confirmed=confirmed_portal)
+    questions = [*review_questions(receipt, confirmed_portal=confirmed_portal), *uncertainties]
+    if automatic and known and not questions and not catalog_confirmed:
+        questions.append('Confirma que el comercio del ticket corresponde a ' + item['name'] + '.')
     ready = bool(automatic and (known or confirmed_portal) and not questions)
     note = ' '.join(dict.fromkeys(questions)) if questions else (
         'Portal localizado por búsqueda web y enlazado desde una fuente pública. Listo para preparar.'

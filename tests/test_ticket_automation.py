@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from facturador.app import create_app
 from facturador.ai import AI
 from facturador.auth import PlanError
-from facturador.automation import TicketAutomation
+from facturador.automation import TicketAutomation, read_ticket, reconcile_uncertainties
 from facturador.db import Store
 from facturador.models import Profile, Receipt
 from facturador.runner import Runner
@@ -28,6 +28,65 @@ def extracted(**changes):
                   date='2026-06-15', ticket_number='PRUEBA-A', billing_codes=[], payment_code='28',
                   payment_evidence='Pago con tarjeta de débito', details='', uncertainties=[], billing_url=None)
     return SimpleNamespace(**{**fields, **changes})
+
+
+class UncertaintyReconciliationTests(unittest.TestCase):
+    def test_verified_catalog_and_payment_resolve_only_their_own_sentences(self):
+        paragraph = (
+            'La línea de pago indica terminal inalámbrica, pero no distingue entre tarjeta de crédito y de débito. '
+            'El QR inferior está identificado como el de facturación, pero no se pudo decodificar su URL. '
+            'El QR superior corresponde a una encuesta. '
+            'El importe impreso no coincide con el importe leído. '
+            'El folio está incompleto.')
+        remaining = reconcile_uncertainties(
+            [paragraph], payment_confirmed=True, catalog_provider='vianney',
+            custom_portal_confirmed=False)
+        self.assertEqual(remaining, ['El importe impreso no coincide con el importe leído. El folio está incompleto.'])
+
+    def test_catalog_https_notes_require_matching_domain(self):
+        notes = [
+            'El ticket imprime el dominio buzonfacturas.com sin el esquema HTTPS. '
+            'No se pudo verificar una liga HTTPS a partir del QR.',
+            'El ticket imprime el dominio otro-dominio.example sin el esquema HTTPS.',
+            'La identidad del comercio no coincide con la del portal.',
+        ]
+        remaining = reconcile_uncertainties(
+            notes, payment_confirmed=True, catalog_provider='tesoro',
+            custom_portal_confirmed=False)
+        self.assertEqual(remaining, notes[1:])
+        self.assertEqual(reconcile_uncertainties(
+            ['El portal de facturación aparece impreso como www.facturacion.grupocentra.mx, sin prefijo HTTPS.'],
+            payment_confirmed=False, catalog_provider='bp', custom_portal_confirmed=False), [])
+
+    def test_unconfirmed_evidence_does_not_erase_payment_or_portal_doubts(self):
+        notes = ['No se puede distinguir si la tarjeta fue de crédito o débito.',
+                 'El portal de facturación aparece impreso como www.facturacion.grupocentra.mx, sin prefijo HTTPS.']
+        self.assertEqual(reconcile_uncertainties(
+            notes, payment_confirmed=False, catalog_provider='', custom_portal_confirmed=False), notes)
+
+    def test_confirmed_custom_url_keeps_destination_disagreement(self):
+        notes = ['No aparece una liga de facturación.',
+                 'El portal señalado corresponde a otro comercio.']
+        self.assertEqual(reconcile_uncertainties(
+            notes, payment_confirmed=False, catalog_provider='', custom_portal_confirmed=True), notes[1:])
+
+    def test_owner_confirmed_payment_allows_known_ticket_with_qr_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'consumo.txt'
+            path.write_text('VIANNEY\nFOLIO PRUEBA-A\nTOTAL 40.50', encoding='utf-8')
+            row = {'source_path': str(path), 'receipt': {'source': 'archivo: consumo.txt'},
+                   'confirmed_payment': '28'}
+            with patch('facturador.automation.AI.extract', return_value=extracted(
+                    provider='vianney', merchant='Vianney', payment_code=None, payment_evidence='',
+                    uncertainties=[
+                        'La línea de pago indica terminal inalámbrica, pero no distingue entre tarjeta de crédito y de débito. '
+                        'El QR inferior está identificado como el de facturación, pero no se pudo decodificar su URL. '
+                        'El QR superior corresponde a una encuesta.'])):
+                receipt, ready, note, sources = read_ticket(Mock(), row, True, root)
+            self.assertTrue(ready, note)
+            self.assertEqual(receipt.payment_code, '28')
+            self.assertEqual(sources['fields']['payment_code'], 'correccion_usuario')
 
 
 class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
@@ -134,6 +193,28 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
         key = self.add(text='BP PLAYAS\nFOLIO PRUEBA-A')
         with patch('facturador.automation.AI.extract', return_value=extracted(
                 provider='bp', merchant='BP PLAYAS')):
+            await self.worker.step()
+        self.assertEqual(self.store.get(key)['status'], 'ready')
+
+    async def test_original_payment_line_and_matching_catalog_host_clear_obsolete_doubts(self):
+        key = self.add(text='TESORO\nFOLIO PRUEBA-A\nTIPO OPER: EFECTIVO')
+        with patch('facturador.automation.AI.extract', return_value=extracted(
+                provider='tesoro', merchant='Tesoro', payment_code='01',
+                payment_evidence='TIPO OPER: EFECTIVO', uncertainties=[
+                    'El ticket no indica la forma de pago.',
+                    'El ticket imprime el dominio buzonfacturas.com sin el esquema HTTPS. '
+                    'No se pudo verificar una liga HTTPS a partir del QR.'])):
+            await self.worker.step()
+        row = self.store.get(key)
+        self.assertEqual(row['status'], 'ready', row['message'])
+        self.assertEqual(row['receipt']['payment_code'], '01')
+
+    async def test_short_catalog_brand_clears_matching_https_prefix_note(self):
+        key = self.add(text='BP PLAYAS\nFOLIO PRUEBA-A')
+        with patch('facturador.automation.AI.extract', return_value=extracted(
+                provider='bp', merchant='BP PLAYAS', uncertainties=[
+                    'El portal de facturación aparece impreso como www.facturacion.grupocentra.mx, '
+                    'sin prefijo HTTPS.'])):
             await self.worker.step()
         self.assertEqual(self.store.get(key)['status'], 'ready')
 

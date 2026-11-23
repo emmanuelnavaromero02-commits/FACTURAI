@@ -17,6 +17,7 @@ from facturador.db import Store
 from facturador.ingest import save_input
 from facturador.models import Receipt
 from facturador.runner import Runner
+from test_core import PROFILE
 
 
 def photo(color):
@@ -142,6 +143,20 @@ class BatchCompanionTests(unittest.TestCase):
         asyncio.run(exercise())
         self.assertEqual(seen, [(front_path, []), (back_path, []), (front_path, [back_path])])
         self.assertEqual(self.store.get(front)['receipt']['ticket_number'], 'TEST-101')
+
+    def test_safe_prepared_ticket_can_be_rechecked_without_losing_profile_snapshot(self):
+        key = self.add('prepared.png', 'red', 'one')
+        saved = PROFILE.model_dump_json()
+        with self.store.connect() as db:
+            db.execute("UPDATE jobs SET status='review',auto_stage='retry_read',billing_profile=? WHERE id=?",
+                       (saved, key))
+        self.assertEqual(self.store.auto_candidates('review', stage='retry_read')['id'], key)
+        row, claim = self.store.claim_read(key, automatic=True)
+        self.assertEqual(row['billing_profile'], saved)
+        self.store.finish_read(key, claim, 'review', 'Prueba terminada')
+        with self.store.connect() as db:
+            db.execute("UPDATE jobs SET auto_stage='retry_read',human_exposed=1 WHERE id=?", (key,))
+        self.assertIsNone(self.store.auto_candidates('review', stage='retry_read'))
 
 
 if __name__ == '__main__':
