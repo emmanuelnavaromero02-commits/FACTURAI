@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import traceback
 import weakref
 import unicodedata
 from pathlib import Path
@@ -19,7 +20,8 @@ from .account_flow import PortalAccountFlow, SECRET_SCREEN
 from .auth import ChatGPTPlan, PlanError
 from .brand_entry import enter_bp_franchise, BP_HOME
 from .bp_recipient import prepare_bp_rfc
-from .bp_ticket import BPProgress, at_form as bp_at_form, bp_issue_proof, evidence_from_original, prepare_bp_ticket
+from .bp_reprint import recover_bp_reprint
+from .bp_ticket import BPAlreadyBilled, BPProgress, at_form as bp_at_form, bp_issue_proof, evidence_from_original, prepare_bp_ticket
 from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, provider_for_url, public_portal_origin, resolves_publicly
 from .captcha_transport import WidgetTransport, widget_origin
 from .cfdi import UUID_RE
@@ -972,6 +974,12 @@ class Runner:
             except (Exception, asyncio.CancelledError) as exc:
                 row = self.store.get(key)
                 if row['status'] not in {'verified', 'duplicate', 'historical'}:
+                    if not isinstance(exc, (ValueError, asyncio.CancelledError)):
+                        frames = [frame for frame in traceback.extract_tb(exc.__traceback__)
+                                  if Path(frame.filename).parent.name == 'facturador']
+                        point = (Path(frames[-1].filename).name + ':' + str(frames[-1].lineno)
+                                 if frames else 'runner')
+                        self.store.event(key, 'internal_error', type(exc).__name__ + ' en ' + point)
                     attempted = bool(row['issue_attempted'] or row['human_exposed'] or row['uuid'])
                     issued = bool(row['issuance_seen'] or row['uuid'])
                     message = str(exc)[:450] if isinstance(exc, ValueError) else 'El trámite se interrumpió.'
@@ -1123,7 +1131,13 @@ class Runner:
                         self.store.event(key, 'campo_verificado', 'Consulta fiscal cotejada: ' + bp_field)
                         continue
                     if bp_at_form(page, receipt):
-                        bp_field = await prepare_bp_ticket(page, receipt, profile, bp_evidence, bp_progress)
+                        try:
+                            bp_field = await prepare_bp_ticket(page, receipt, profile, bp_evidence, bp_progress)
+                        except BPAlreadyBilled as exc:
+                            self.store.event(key, 'ticket_already_billed', 'BP confirmó que la venta ya tiene factura; se buscaron los comprobantes existentes.')
+                            if await recover_bp_reprint(self, page, key, profile, receipt, bp_evidence):
+                                return
+                            raise ValueError(str(exc)) from exc
                         if bp_field:
                             self.store.event(key, 'campo_verificado', 'Ticket BP cotejado: ' + bp_field)
                             continue

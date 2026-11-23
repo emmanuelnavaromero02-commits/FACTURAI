@@ -53,6 +53,10 @@ class BPProgress:
     add_attempted: bool = False
 
 
+class BPAlreadyBilled(ValueError):
+    """The BP portal explicitly says the loaded ticket was already invoiced."""
+
+
 def evidence_from_text(receipt: Receipt, ocr_text: str) -> BPEvidence | None:
     """Require the printed ticket, payment and time plus two station clues."""
     if receipt.provider != 'bp' or receipt.payment_code not in PAYMENT:
@@ -210,7 +214,14 @@ async def _fill(page, selector: str, label: str, expected: str):
         raise ValueError('BP no mostró el campo verificable: ' + label)
     if await field.input_value() == expected:
         return False
-    await field.fill(expected, timeout=1800)
+    if selector == '#A48':
+        # WebDev's HH:MM mask appends its template to values injected by fill().
+        # Physical key events make the portal consume each digit before blur.
+        await field.click(timeout=1800)
+        await field.press('ControlOrMeta+A', timeout=1800)
+        await field.press_sequentially(expected, delay=40, timeout=5000)
+    else:
+        await field.fill(expected, timeout=1800)
     await field.blur(timeout=1800)
     if await field.input_value() != expected:
         raise ValueError('BP no conservó el valor del campo: ' + label)
@@ -250,6 +261,18 @@ async def _decimal_field(page, selector: str) -> Decimal | None:
         return None
 
 
+async def _wait_for_consumption(page, amount_selector: str, stage: str) -> Decimal:
+    billed = page.get_by_text('El Ticket ya se encuentra Facturado', exact=True).filter(visible=True)
+    for _ in range(40):
+        if await billed.count():
+            raise BPAlreadyBilled('BP informa que el ticket ya fue facturado; recupera el CFDI en Reimpresiones.')
+        amount = await _amount_field(page, amount_selector)
+        if amount is not None:
+            return amount
+        await page.wait_for_timeout(250)
+    raise ValueError('BP no confirmó ' + stage + ' del ticket; revisa el mensaje del portal.')
+
+
 async def prepare_bp_ticket(page, receipt: Receipt, profile: Profile,
                             evidence: BPEvidence | None, progress: BPProgress) -> str | None:
     """Perform one verified pre-issue step; never click Facturar."""
@@ -274,8 +297,7 @@ async def prepare_bp_ticket(page, receipt: Receipt, profile: Profile,
     if not progress.load_attempted:
         progress.load_attempted = True
         await _click_lookup(page, '#A17', 'Cargar', LOAD_LINK)
-        await page.wait_for_function("() => Boolean(document.querySelector('input#A23')?.value)", timeout=10000)
-        if await _amount_field(page, '#A23') != evidence.amount:
+        if await _wait_for_consumption(page, '#A23', 'la carga') != evidence.amount:
             raise ValueError('El importe que BP cargó no coincide con la foto del ticket.')
         return 'Cargar ticket'
     if await _amount_field(page, '#A23') != evidence.amount:
@@ -285,8 +307,7 @@ async def prepare_bp_ticket(page, receipt: Receipt, profile: Profile,
     if not progress.add_attempted:
         progress.add_attempted = True
         await _click_lookup(page, '#A24', 'Agregar', ADD_LINK)
-        await page.wait_for_function("() => Boolean(document.querySelector('input#A28')?.value)", timeout=10000)
-        if await _amount_field(page, '#A28') != evidence.amount:
+        if await _wait_for_consumption(page, '#A28', 'la agregación') != evidence.amount:
             raise ValueError('El total de BP no coincide con el ticket.')
         return 'Agregar ticket'
     payment = await _named(page, 'select#A33', 'Forma de Pago')

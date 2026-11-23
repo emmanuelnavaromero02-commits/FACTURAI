@@ -4,7 +4,7 @@ import unittest
 
 from playwright.async_api import async_playwright
 
-from facturador.bp_ticket import (BPProgress, bp_issue_proof, evidence_from_text,
+from facturador.bp_ticket import (BPAlreadyBilled, BPProgress, bp_issue_proof, evidence_from_text,
                                   prepare_bp_ticket)
 from facturador.models import Receipt
 from test_core import PROFILE
@@ -21,10 +21,15 @@ LOAD = "javascript:if(clWDUtil.pfGetTraitement('PAGE_FACTURAR_GASOLINA_CFDI33',1
 ADD = "javascript:if(clWDUtil.pfGetTraitement('PAGE_FACTURAR_GASOLINA_CFDI33',18,undefined)()){_JAEE(_PAGE_,'A24',16,2,48);}"
 
 
-def fixture(*, total='1234.56', duplicate_station=False, same_empty=False):
+def fixture(*, total='1234.56', duplicate_station=False, same_empty=False, already_billed=False):
     duplicate = '<option value="3">PLAYAS DUPLICADA #11739</option>' if duplicate_station else ''
     empty_cities = '<option value="3">VACIA A</option><option value="4">VACIA B</option>' if same_empty else ''
     grid = '<tr><td>1234567</td><td>Premium</td><td>42.567</td><td>1234.56</td></tr>'
+    added = ("document.body.insertAdjacentHTML('beforeend',"
+             "'<div>El Ticket ya se encuentra Facturado</div>');" if already_billed else f'''
+          document.getElementById('A28').value='{total}';
+          document.getElementById('A33').disabled=false;
+          document.getElementById('grid').innerHTML='{grid}';''')
     return f'''<style>input,select,a {{display:inline-block;min-width:80px;min-height:20px}}</style>
     <script>
       const clWDUtil={{pfGetTraitement:() => () => true}}, _PAGE_='test';
@@ -45,9 +50,8 @@ def fixture(*, total='1234.56', duplicate_station=False, same_empty=False):
           document.getElementById('A18').value='Premium';
         }}
         if(id==='A24') {{
-          document.getElementById('A28').value='{total}';
-          document.getElementById('A33').disabled=false;
-          document.getElementById('grid').innerHTML='{grid}';
+          window.__addClicks=(window.__addClicks||0)+1;
+          {added}
         }}
       }}
     </script>
@@ -58,7 +62,9 @@ def fixture(*, total='1234.56', duplicate_station=False, same_empty=False):
     <input id="A117" value="{PROFILE.postal_code}"><input id="A41" value=""><input id="A13" value="">
     <table><tr><td id="lzA12">No. Ticket:</td><td><input id="A12"></td>
     <td id="lzA47">Fecha Ticket:</td><td><input id="A47"></td>
-    <td id="lzA48">Hora:</td><td><input id="A48"></td></tr></table>
+    <td id="lzA48">Hora:</td><td><input id="A48" placeholder="HH:MM"
+      onfocus="this.dataset.keyed='0'" onkeypress="this.dataset.keyed='1'"
+      onblur="if(this.value && this.dataset.keyed!=='1') this.value+='HH:MM'"></td></tr></table>
     <a id="A17" href="{LOAD}">Cargar</a><a id="A24" href="{ADD}">Agregar</a>
     <input id="A18" disabled><input id="A19" disabled><input id="A23" disabled>
     <table id="ctzA49"><tbody id="grid"><tr><th># Ticket</th><th>Descripcion</th><th>Importe</th></tr></tbody></table>
@@ -153,3 +159,26 @@ class BpTicketTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await prepare_bp_ticket(self.page, generic_receipt, PROFILE,
                                                  EVIDENCE, BPProgress()), 'Sucursal 11739')
         self.assertFalse(await bp_issue_proof(self.page, generic_receipt, PROFILE, EVIDENCE))
+
+    async def test_time_mask_is_repaired_with_keyboard_events(self):
+        progress = BPProgress()
+        for _ in range(3):
+            await prepare_bp_ticket(self.page, RECEIPT, PROFILE, EVIDENCE, progress)
+        field = self.page.locator('input#A48')
+        await field.fill(EVIDENCE.ticket_time)
+        await field.blur()
+        self.assertEqual(await field.input_value(), EVIDENCE.ticket_time + 'HH:MM')
+        self.assertEqual(await prepare_bp_ticket(self.page, RECEIPT, PROFILE,
+                                                 EVIDENCE, progress), 'Hora:')
+        self.assertEqual(await field.input_value(), EVIDENCE.ticket_time)
+
+    async def test_already_billed_modal_stops_at_one_add_attempt(self):
+        await self.reload_fixture(already_billed=True)
+        progress = BPProgress()
+        with self.assertRaises(BPAlreadyBilled):
+            await self.prepare(progress)
+        self.assertEqual(await self.page.evaluate('window.__addClicks'), 1)
+        self.assertFalse(await bp_issue_proof(self.page, RECEIPT, PROFILE, EVIDENCE))
+        with self.assertRaises(ValueError):
+            await prepare_bp_ticket(self.page, RECEIPT, PROFILE, EVIDENCE, progress)
+        self.assertEqual(await self.page.evaluate('window.__addClicks'), 1)

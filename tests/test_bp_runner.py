@@ -20,8 +20,8 @@ CROSSED_ROWS = ("<tr><td>1234567</td><td>Premium</td><td>42.567</td><td>999.00</
                 "<tr><td>7654321</td><td>Premium</td><td>1.000</td><td>1234.56</td></tr>")
 
 
-def simulated_portal(*, total='1234.56', crossed_rows=False):
-    html = fixture(total=total)
+def simulated_portal(*, total='1234.56', crossed_rows=False, already_billed=False):
+    html = fixture(total=total, already_billed=already_billed)
     if crossed_rows:
         assert GOOD_ROW in html
         html = html.replace(GOOD_ROW, CROSSED_ROWS)
@@ -101,3 +101,19 @@ class BpRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.issue_clicks(), 0)
         self.assertEqual(self.execute_states, [])
         self.assertFalse(self.store.get(self.key)['issue_attempted'])
+
+    async def test_already_billed_modal_calls_reprint_once_without_new_issue(self):
+        self.html = simulated_portal(already_billed=True)
+        with patch('facturador.runner.recover_bp_reprint', new_callable=AsyncMock,
+                   return_value=False) as reprint:
+            await self.runner.run(self.key, PROFILE, auto_issue=True)
+        reprint.assert_awaited_once()
+        self.assertEqual(await self.runner.viewer.page.evaluate('window.__addClicks'), 1)
+        self.assertEqual(await self.issue_clicks(), 0)
+        self.assertEqual(self.execute_states, [])
+        row = self.store.get(self.key)
+        self.assertFalse(row['issue_attempted'])
+        self.assertEqual(row['status'], 'blocked')
+        self.assertIn('ticket ya fue facturado', row['message'])
+        self.assertEqual(sum(event['kind'] == 'ticket_already_billed'
+                             for event in self.store.events(self.key)), 1)

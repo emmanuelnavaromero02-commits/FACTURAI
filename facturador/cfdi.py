@@ -21,6 +21,7 @@ NS = {"c": "http://www.sat.gob.mx/cfd/4", "t": "http://www.sat.gob.mx/TimbreFisc
 UUID_RE = re.compile(r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
 PDF_UUID = re.compile(r'(?<![0-9A-Z])' + UUID_RE.pattern + r'(?![0-9A-Z])', re.I)
 MAX_FILE = 25 * 1024 * 1024
+BP_STATIONS = {'11739': ('PL/20876/EXP/ES/2018-', 'ACO030325PHA')}
 
 
 class MissingPair(ValueError):
@@ -38,6 +39,25 @@ def normalize_capufe_code(value: str) -> str:
     if len(compact) != 18:
         raise ValueError('Cada código de peaje debe contener exactamente 18 letras o dígitos.')
     return compact
+
+
+def bp_ticket_concept(concepts, receipt: Receipt, issuer_rfc: str) -> None:
+    """Tie a BP CFDI to a verified station, issuer, and printed sale."""
+    ticket = receipt.ticket_number.strip()
+    if not re.fullmatch(r'\d{5,12}', ticket):
+        raise ValueError('El ticket BP no tiene un número comprobable.')
+    if len(concepts) != 1:
+        raise ValueError('El CFDI BP debe identificar una sola partida del ticket.')
+    stations = set(re.findall(r'\b(?:estaci[oó]n|e\.?\s?s\.?)\s*#?\s*(\d{4,5})\b', receipt.details, re.I))
+    station = next(iter(stations)) if len(stations) == 1 else ''
+    if station not in BP_STATIONS:
+        raise ValueError('No hay mapeo comprobado de estación y emisor BP para este ticket.')
+    prefix, expected_issuer = BP_STATIONS[station]
+    if issuer_rfc != expected_issuer:
+        raise ValueError('El RFC emisor BP no corresponde a la estación del ticket.')
+    identifier = (concepts[0].get('NoIdentificacion') or '').strip().upper()
+    if identifier != prefix + ticket:
+        raise ValueError('El CFDI BP no identifica exactamente este número de ticket y estación.')
 
 
 def xml_decimal(node, field, *, default=None):
@@ -193,6 +213,10 @@ def verify_xml(data: bytes, profile: Profile, receipt: Receipt) -> dict:
     else:
         if total != money(receipt.amount):
             raise ValueError("CFDI no coincide con el importe facturable")
+        if receipt.provider == 'bp':
+            if len(root.findall('c:Emisor', NS)) != 1:
+                raise ValueError('El CFDI BP no tiene un emisor único.')
+            bp_ticket_concept(concepts, receipt, issuer.get('Rfc', ''))
         matched = {'match_type':'total', 'ticket_total': str(total), 'concept_count': len(concepts),
                    'matched_concepts': [], 'matched_codes': [], 'invoice_codes': []}
     return {**matched, "uuid": fiscal_uuid, "total": str(total),
