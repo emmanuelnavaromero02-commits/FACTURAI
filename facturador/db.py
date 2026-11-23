@@ -508,9 +508,10 @@ class Store:
             db.execute('INSERT INTO events(job_id,at,kind,detail) VALUES(?,?,?,?)', (key, now(), 'issue_attempt', action[:250]))
 
     def enter_intervention(self, key: str, kind: str, message: str, manual: bool):
+        """Pause the job; exposure begins only when browser control is actually granted."""
         with self.connect() as db:
-            db.execute("UPDATE jobs SET status='needs_user',human_exposed=MAX(human_exposed,?),message=?,updated=? WHERE id=?",
-                       (int(manual), message, now(), key))
+            db.execute("UPDATE jobs SET status='needs_user',message=?,updated=? WHERE id=?",
+                       (message, now(), key))
             db.execute('INSERT INTO events(job_id,at,kind,detail) VALUES(?,?,?,?)', (key, now(), 'needs_user', kind))
 
     def mark_human_exposed(self, key: str):

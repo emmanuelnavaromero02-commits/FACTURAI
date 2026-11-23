@@ -56,15 +56,6 @@ async def smoke():
                 contexts.add(runner.context)
                 await runner.context.route(origin+'/**', merchant)
 
-        async def pending(key, kind):
-            async with asyncio.timeout(15):
-                while runner.pending.get(key, {}).get('kind') != kind:
-                    task = runner.job_tasks[key]
-                    if task.done():
-                        await task
-                        raise AssertionError((kind, store.get(key), store.events(key)))
-                    await asyncio.sleep(.04)
-
         def infer(_, observation, __):
             page = json.loads(observation)['estado_visible']
             if 'RFC receptor' in page:
@@ -81,19 +72,14 @@ async def smoke():
                     receipt = RECEIPT.model_copy(update={'provider': 'tesoro', 'billing_codes': [f'CODIGO{index}']})
                     store.save_receipt(key, receipt, ready=True)
                     runner.schedule(key, PROFILE)
-                    if index == 0:
-                        await pending(key, 'issue')
-                    else:
-                        await asyncio.wait_for(runner.job_tasks[key], 15)
+                    await asyncio.wait_for(runner.job_tasks[key], 15)
                     page = runner.viewer.page
                     assert page.url == (origin+'/GenerarCFDI/Index?avanzada=0' if index == 0 else origin+'/')
                     assert not store.get(key)['issue_attempted'] and not store.get(key)['human_exposed']
-                    if index == 1:
-                        assert store.get(key)['status'] == 'blocked'
+                    assert store.get(key)['status'] == 'blocked'
                     assert sum(event['kind'] == 'portal_entry' for event in store.events(key)) == (1 if index == 0 else 0)
                     if index == 0:
                         assert await page.get_by_label('RFC receptor').is_visible()
-                        await runner.stop(key)
             print('OK Chrome: Tesoro abre sólo el formulario de un ticket y bloquea el enlace de emisión.')
         finally:
             await runner.close()

@@ -320,8 +320,27 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     @app.post('/api/browser/control')
     async def browser_control(revision: int = Body(embed=True), job_id: str | None = Body(default=None, max_length=100)):
         view = runner.screen
-        if job_id is None and view is runner.viewer and runner.pending.get(runner.active_id, {}).get('kind') == 'captcha':
-            job_id = runner.active_id
+        if job_id is None and view is runner.viewer:
+            key = runner.page_job.get(view.page) if view.page is not None else None
+            pending = runner.pending.get(key)
+            if pending and key == runner.active_id:
+                if pending['kind'] == 'captcha':
+                    job_id = key
+                else:
+                    def check_job():
+                        if (view is not runner.viewer or runner.screen is not view or
+                                runner.active_id != key or runner.pending.get(key) is not pending or
+                                pending['future'].done() or pending['page'] is not view.page):
+                            raise ValueError('El visor ya no corresponde al ticket pendiente.')
+                    channel = await view.take_control(revision, check=check_job)
+                    try:
+                        store.mark_human_exposed(key)
+                    except Exception:
+                        await view.release(channel)
+                        raise
+                    return {'channel': channel}
+            elif key:
+                raise ValueError('El ticket ya no espera intervención en el navegador.')
         if job_id is None:
             return {'channel': await view.take_control(revision)}
         def check():

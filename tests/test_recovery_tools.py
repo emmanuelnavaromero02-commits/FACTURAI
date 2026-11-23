@@ -162,6 +162,8 @@ class RecoveryTests(unittest.TestCase):
                 if confirmed:
                     self.store.confirm_issued(key)
                 self.store.enter_intervention(key, kind, 'prueba', manual)
+                if manual:
+                    self.store.mark_human_exposed(key)
                 reopened = Store(self.root)
                 reopened.recover_after_restart()
                 self.assertEqual(reopened.get(key)['status'], expected)

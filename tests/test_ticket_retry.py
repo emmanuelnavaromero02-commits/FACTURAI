@@ -46,7 +46,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
             self.runner.schedule(self.key, PROFILE, auto_issue=True)
             task = self.runner.job_tasks[self.key]
             await self.pending('unknown')
-            self.assertEqual(self.store.get(self.key)['human_exposed'], 1)
+            self.assertEqual(self.store.get(self.key)['human_exposed'], 0)
             result = await asyncio.gather(self.runner.retry_job(self.key), self.runner.retry_job(self.key))
             self.assertEqual({r['action'] for r in result}, {'active', 'resumed'})
             await self.pending('issue')
@@ -56,7 +56,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
             await self.runner.continue_job(self.key, 'approve')
             await task
             self.assertEqual(page.clicks, 1)
-            self.assertEqual(self.store.get(self.key)['human_exposed'], 1)
+            self.assertEqual(self.store.get(self.key)['human_exposed'], 0)
 
     async def test_actual_control_then_retry_recovers_only_even_if_control_was_returned(self):
         page = FakePage()
@@ -67,6 +67,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
             task = self.runner.job_tasks[self.key]
             await self.pending('unknown')
             channel = await self.runner.viewer.take_control(self.runner.viewer.revision)
+            self.store.mark_human_exposed(self.key)
             await self.runner.viewer.release(channel)
             self.assertEqual(self.runner.retry_action(self.store.get(self.key)), 'recover')
             self.assertEqual((await self.runner.retry_job(self.key))['action'], 'recovering')
@@ -79,6 +80,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_legacy_exposed_after_restart_reconciles_existing_files_without_new_tab(self):
         self.store.queue(self.key, PROFILE)
         self.store.enter_intervention(self.key, 'unknown', 'Revisión', True)
+        self.store.mark_human_exposed(self.key)
         self.store.recover_after_restart()
         self.assertEqual(self.store.get(self.key)['issue_attempted'], 0)
         save_candidate(self.store, self.key, 'cfdi.xml', xml_bytes())
@@ -101,6 +103,22 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((row['status'], row['issue_attempted'], row['human_exposed']), ('ready', 0, 0))
         self.assertEqual(self.runner.retry_action(row), 'queue')
 
+    async def test_untouched_manual_pause_can_retry_after_restart(self):
+        for kind in ('unknown', 'blocked', 'operator', 'login'):
+            with self.subTest(kind=kind):
+                row, _ = self.store.add('synthetic.jpg', 'untouched-'+kind)
+                key = row['id']
+                self.store.save_receipt(key, RECEIPT.model_copy(update={'billing_codes': ['COD-'+kind]}), ready=True)
+                self.assertTrue(self.store.queue(key, PROFILE))
+                self.assertTrue(self.store.claim(key))
+                self.store.enter_intervention(key, kind, 'Pausa sin controlar Chrome', True)
+                self.assertEqual(self.store.get(key)['human_exposed'], 0)
+                self.store.recover_after_restart()
+                restored = self.store.get(key)
+                self.assertEqual((restored['status'], restored['issue_attempted'], restored['human_exposed']),
+                                 ('ready', 0, 0))
+                self.assertEqual(self.runner.retry_action(restored), 'queue')
+
     async def test_manual_inspection_does_not_claim_invoice_submission(self):
         self.assertTrue(self.store.queue(self.key, PROFILE))
         self.assertTrue(self.store.claim(self.key))
@@ -109,6 +127,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         async def inspect(key, _page, kind, message):
             self.assertFalse(self.store.get(key)['issue_attempted'])
             self.store.enter_intervention(key, kind, message, True)
+            self.store.mark_human_exposed(key)
             self.store.resume_intervention(key)
         with patch.object(self.runner, 'human', side_effect=inspect), \
              patch.object(self.runner, 'recover', new_callable=AsyncMock, return_value=False):
@@ -147,12 +166,46 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.store.recover_after_restart()
         self.assertEqual(self.store.get(self.key)['status'], 'uncertain')
 
+    async def test_generic_job_control_marks_only_current_ticket(self):
+        app = create_app(self.root)
+        runner = app.state.runner
+        self.addAsyncCleanup(runner.close)
+        self.addCleanup(app.state.plan.close)
+        other, _ = self.store.add('synthetic.jpg', 'other-control-ticket')
+        self.store.save_receipt(other['id'], RECEIPT, ready=True)
+        self.store.queue(self.key, PROFILE)
+        self.store.enter_intervention(self.key, 'unknown', 'Revisa el portal', True)
+        page = Mock()
+        page.is_closed.return_value = False
+        runner.viewer.page = page
+        runner.viewer.manual = True
+        runner.active_id = self.key
+        runner.page_job[page] = self.key
+        runner.pending[self.key] = {'kind': 'unknown', 'page': page,
+                                    'future': Mock(done=Mock(return_value=False))}
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, 'path', '') == '/api/browser/control')
+        with self.assertRaises(ValueError):
+            await endpoint(revision=runner.viewer.revision, job_id=other['id'])
+        self.assertEqual(self.store.get(self.key)['human_exposed'], 0)
+        self.assertEqual(self.store.get(other['id'])['human_exposed'], 0)
+        result = await endpoint(revision=runner.viewer.revision, job_id=None)
+        self.assertTrue(result['channel'])
+        self.assertEqual(self.store.get(self.key)['human_exposed'], 1)
+        self.assertEqual(self.store.get(other['id'])['human_exposed'], 0)
+        self.assertEqual(sum(event['kind'] == 'human_control_taken' for event in self.store.events(self.key)), 1)
+        await runner.viewer.release(result['channel'])
+        runner.active_id = other['id']
+        with self.assertRaises(ValueError):
+            await endpoint(revision=runner.viewer.revision, job_id=None)
+        self.assertEqual(self.store.get(other['id'])['human_exposed'], 0)
+
     async def test_capufe_proof_requires_same_ticket_and_unexpired_negative_without_prior_submission(self):
         receipt = RECEIPT.model_copy(update={'provider':'capufe', 'billing_codes':['ABCDEFGHIJKLMNOPQR']})
         self.store.save_receipt(self.key, receipt, ready=True)
         self.store.queue(self.key, PROFILE)
         self.store.claim(self.key)
         self.store.enter_intervention(self.key, 'unknown', 'Control', True)
+        self.store.mark_human_exposed(self.key)
         self.store.recover_after_restart()
         self.assertFalse(self.store.record_not_billed(self.key, 'capufe', receipt.model_copy(update={'amount':'9'}), PROFILE))
         self.assertTrue(self.store.record_not_billed(self.key, 'capufe', receipt, PROFILE))
@@ -176,6 +229,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.store.save_receipt(self.key, receipt, ready=True)
         self.store.queue(self.key, PROFILE)
         self.store.enter_intervention(self.key, 'unknown', 'Control', True)
+        self.store.mark_human_exposed(self.key)
         self.store.recover_after_restart()
         checked = []
         async def lookup(store, key, ticket, profile):

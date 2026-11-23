@@ -18,6 +18,28 @@ def lookup_rejected(snapshot: str) -> str | None:
     return match.group(0).rstrip('.') + '.' if match else None
 
 
+async def rejection_for_current_ticket(page, snapshot: str, receipt, *, submitted_here: bool,
+                                       prior_submission: bool) -> str | None:
+    """Ignore a stale rejection unless this ticket was submitted or still fills the lookup."""
+    rejection = lookup_rejected(snapshot)
+    if not rejection:
+        return None
+    if submitted_here:
+        return rejection
+    if not prior_submission or receipt.provider != 'vianney':
+        return None
+    parts = split_series_ticket(receipt.ticket_number)
+    address = urlsplit(page.url)
+    if (not parts or address.scheme != 'https' or address.hostname != 'poscfdi.vianney.com.mx'
+            or address.path not in {'/', '/Default.aspx'}):
+        return None
+    series = page.locator('#MainContent_serie:visible')
+    ticket = page.locator('#MainContent_tiquet:visible')
+    if await series.count() != 1 or await ticket.count() != 1:
+        return None
+    return rejection if ((await series.input_value(), await ticket.input_value()) == parts) else None
+
+
 async def _consulta_form(page, series: str, ticket: str, kind: str) -> bool:
     if (urlsplit(page.url).scheme != 'https' or urlsplit(page.url).hostname != 'poscfdi.vianney.com.mx'
             or urlsplit(page.url).path != '/Consulta.aspx'):

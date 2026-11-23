@@ -18,6 +18,7 @@ from .ai import AI
 from .account_flow import PortalAccountFlow, SECRET_SCREEN
 from .auth import ChatGPTPlan, PlanError
 from .brand_entry import enter_bp_franchise, BP_HOME
+from .bp_recipient import prepare_bp_rfc
 from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, provider_for_url, public_portal_origin, resolves_publicly
 from .captcha_transport import WidgetTransport, widget_origin
 from .cfdi import UUID_RE
@@ -31,8 +32,9 @@ from .portals import capufe_proof, capufe_recipient, normalize
 from .ticket_lookup import prefill_ticket_lookup, prepare_tesoro_lookup
 from .ticket_retry import FINAL, REOBSERVE, RecoveryRequested, may_have_issued, open_ticket_portal, recover_ticket, retry_action, ticket_in_result
 from .tesoro_recipient import tesoro_recipient
+from .tesoro_result import tesoro_verification_failure
 from .viewer import BrowserView
-from .vianney_consulta import lookup_rejected, recover_vianney_consulta
+from .vianney_consulta import lookup_rejected, rejection_for_current_ticket, recover_vianney_consulta
 
 ISSUE = re.compile(r'\b(facturar|emitir|timbrar|generar\s+(?:mi\s+)?(?:factura|cfdi)|solicitar\s+factura|enviar\s+(?:mi\s+)?(?:factura|cfdi)|s[ií] estoy seguro|confirmar (?:la )?emisi[oó]n)\b', re.I)
 EMISSION_PATH = re.compile(r'factur|invoice|invoic|cfdi|timbr|emisi|emit|creat|complet|generat|submit', re.I)
@@ -1017,6 +1019,7 @@ class Runner:
         before_action = None
         tesoro_lookup_attempted = False
         bp_entry_attempted = False
+        bp_lookup_attempted = False
         accounts = PortalAccountFlow(self.store.root, provider['url'], profile, key,
                                      progress=lambda message: self.store.running_message(key, message))
         for number in range(65):
@@ -1027,9 +1030,18 @@ class Runner:
             if page.is_closed() or not allowed_url(page.url, receipt.provider, receipt.portal_url):
                 raise ValueError('El portal se cerró o cambió a un dominio distinto del autorizado.')
             snapshot = await page.locator('body').aria_snapshot()
-            if (receipt.provider == 'vianney' and not committed and not issued
-                    and any(item.get('control', '').casefold() == 'siguiente' for item in recent)):
-                rejected = lookup_rejected(snapshot)
+            if receipt.provider == 'tesoro' and tesoro_lookup_attempted and not committed and not issued:
+                rejected = await tesoro_verification_failure(page, receipt, profile)
+                if rejected:
+                    self.store.event(key, 'ticket_lookup_rejected', rejected)
+                    raise ValueError(rejected)
+            if receipt.provider == 'vianney' and not committed and not issued and lookup_rejected(snapshot):
+                submitted_here = any(item.get('tipo') == 'click' and item.get('control', '').casefold() == 'siguiente'
+                                     for item in recent)
+                prior_submission = any(event['kind'] == 'action' and event['detail'].casefold() == 'click · siguiente'
+                                       for event in self.store.events(key)) if not submitted_here else False
+                rejected = await rejection_for_current_ticket(
+                    page, snapshot, receipt, submitted_here=submitted_here, prior_submission=prior_submission)
                 if rejected:
                     self.store.event(key, 'ticket_lookup_rejected', rejected)
                     if await recover_vianney_consulta(self, page, key, profile, receipt):
@@ -1084,6 +1096,20 @@ class Runner:
                         recent.append({'tipo': 'click', 'control': 'Franquicia BP'})
                         self.store.event(key, 'brand_entry', 'Se abrió el formulario de la franquicia BP verificada.')
                         continue
+                if receipt.provider == 'bp':
+                    try:
+                        bp_field = await prepare_bp_rfc(
+                            page, receipt, profile, lookup_attempted=bp_lookup_attempted)
+                    except BrowserError as exc:
+                        # Buscar may have reached the portal even if Chrome lost
+                        # its response. Never submit the same lookup twice.
+                        bp_lookup_attempted = True
+                        raise ValueError('BP no confirmó la consulta del RFC. Revisa el portal antes de reintentar.') from exc
+                    if bp_field:
+                        if bp_field == 'Buscar RFC':
+                            bp_lookup_attempted = True
+                        self.store.event(key, 'campo_verificado', 'Consulta fiscal cotejada: ' + bp_field)
+                        continue
                 tesoro_pending = []
                 if receipt.provider == 'tesoro':
                     try:
@@ -1121,10 +1147,14 @@ class Runner:
                     # A validation POST may have reached the portal before Chrome
                     # reported a navigation error. Never repeat it automatically.
                     tesoro_lookup_attempted = True
-                    tesoro_field = None
+                    continue
                 if tesoro_field:
                     if tesoro_field.startswith('Verificación'):
                         tesoro_lookup_attempted = True
+                        rejected = await tesoro_verification_failure(page, receipt, profile)
+                        if rejected:
+                            self.store.event(key, 'ticket_lookup_rejected', rejected)
+                            raise ValueError(rejected)
                     self.store.event(key, 'campo_verificado', 'Dato del ticket cotejado: ' + tesoro_field)
                     continue
             # Accessibility snapshots include complete hrefs on separate /url: lines.
@@ -1231,6 +1261,10 @@ class Runner:
                 if action.kind != 'click' or not action.target.exact:
                     last_error = 'Para emitir, elige el botón o enlace exacto de la confirmación.'
                     continue
+                if receipt.provider == 'tesoro':
+                    mismatch = await tesoro_verification_failure(page, receipt, profile, issue_gate=True)
+                    if mismatch:
+                        raise ValueError(mismatch)
                 _, pending_fields = await fiscal_choices(page, profile, receipt)
                 if pending_fields:
                     last_error = 'Antes de emitir, el portal debe reflejar ' + ', '.join(pending_fields) + '.'

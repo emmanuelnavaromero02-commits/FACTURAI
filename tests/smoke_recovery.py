@@ -136,6 +136,7 @@ async def smoke():
                     page = runner.viewer.page
                     await runner.continue_job(key, 'manual')
                     await pending(key, 'operator', task)
+                    store.mark_human_exposed(key)
                     assert runner.viewer.page is page and store.get(key)['human_exposed']
                     assert not store.get(key)['issue_attempted']
                     assert not store.queue(key, PROFILE)

@@ -9,7 +9,8 @@ from urllib.parse import urlsplit
 from playwright.async_api import async_playwright
 
 from facturador.models import Receipt
-from facturador.vianney_consulta import lookup_rejected, recover_vianney_consulta
+from facturador.vianney_consulta import (lookup_rejected, rejection_for_current_ticket,
+                                         recover_vianney_consulta)
 
 
 class VianneyMessageTests(unittest.TestCase):
@@ -48,6 +49,35 @@ class FakeRunner:
 
 @unittest.skipUnless(os.path.isfile('/usr/bin/google-chrome-stable'), 'Requiere Google Chrome oficial')
 class VianneyConsultaChromeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_persisted_rejection_requires_same_visible_ticket_and_prior_submission(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(executable_path='/usr/bin/google-chrome-stable')
+            try:
+                page = await browser.new_page()
+                html = ('<input id="MainContent_serie" value="E51T">'
+                        '<input id="MainContent_tiquet" value="148390">'
+                        '<p>Parametros incorrectos: El tiquet no existe o ya ha sido facturado.</p>')
+                await page.route('https://poscfdi.vianney.com.mx/**',
+                                 lambda route: route.fulfill(content_type='text/html', body=html))
+                await page.goto('https://poscfdi.vianney.com.mx/')
+                snapshot = await page.locator('body').aria_snapshot()
+                receipt = Receipt(provider='vianney', ticket_number='E51T / 148,390')
+                expected = 'Parametros incorrectos: El tiquet no existe o ya ha sido facturado.'
+                self.assertEqual(await rejection_for_current_ticket(
+                    page, snapshot, receipt, submitted_here=False, prior_submission=True), expected)
+                self.assertIsNone(await rejection_for_current_ticket(
+                    page, snapshot, receipt, submitted_here=False, prior_submission=False))
+                other = receipt.model_copy(update={'ticket_number': 'E51T / 148,391'})
+                self.assertIsNone(await rejection_for_current_ticket(
+                    page, snapshot, other, submitted_here=False, prior_submission=True))
+                await page.locator('#MainContent_serie').fill('OTRA')
+                self.assertIsNone(await rejection_for_current_ticket(
+                    page, snapshot, receipt, submitted_here=False, prior_submission=True))
+                self.assertEqual(await rejection_for_current_ticket(
+                    page, snapshot, receipt, submitted_here=True, prior_submission=False), expected)
+            finally:
+                await browser.close()
+
     async def test_pdf_and_xml_are_queried_once_without_emission(self):
         requests = []
         async with async_playwright() as playwright:

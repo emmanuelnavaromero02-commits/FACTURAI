@@ -71,9 +71,10 @@ async def smoke():
                     runner.schedule(key, PROFILE, auto_issue=True)
                     task = runner.job_tasks[key]
                     original = await wait_pending(key, 'unknown')
-                    assert store.get(key)['human_exposed'] and not store.get(key)['issue_attempted']
+                    assert not store.get(key)['human_exposed'] and not store.get(key)['issue_attempted']
                     if mode == 'controlled':
                         lease = await runner.viewer.take_control(runner.viewer.revision)
+                        store.mark_human_exposed(key)
                         await runner.viewer.release(lease)
                     if mode in ('controlled', 'retry'):
                         results = await asyncio.gather(runner.retry_job(key), runner.retry_job(key))
