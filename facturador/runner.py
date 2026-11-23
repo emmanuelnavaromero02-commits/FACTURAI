@@ -88,6 +88,33 @@ def action_risk(action: Action) -> str:
     return 'normal'
 
 
+async def dismiss_walmart_cfdi_notice(page, snapshot: str) -> bool:
+    """Close Walmart's informational CFDI 4.0 notice, never a form confirmation."""
+    parts = urlsplit(page.url)
+    if parts.scheme != 'https' or parts.netloc.lower() != 'facturacion-clientes.walmart.com':
+        return False
+    if not (re.search(r'CFDI\s+VERSION\s+4\.0', snapshot, re.I)
+            and re.search(r'datos fiscales obligatorios[\s\S]{0,130}validados por el SAT', snapshot, re.I)):
+        return False
+    heading = page.get_by_text('CFDI VERSION 4.0', exact=True)
+    try:
+        if await heading.count() != 1 or not await heading.is_visible():
+            return False
+        notice = heading.locator(
+            'xpath=ancestor::*[@role="dialog" or contains(concat(" ", normalize-space(@class), " "), " modal ")][1]')
+        if await notice.count() != 1 or not await notice.is_visible():
+            return False
+        button = notice.get_by_role('button', name='Aceptar', exact=True)
+        if (await notice.locator('input:visible, textarea:visible, select:visible').count()
+                or await button.count() != 1 or not await button.is_visible()
+                or not await button.is_enabled()):
+            return False
+        await button.click(timeout=1500)
+    except BrowserError:
+        return False
+    return True
+
+
 def private_destination(url: str) -> bool:
     hostname = urlsplit(url).hostname or ''
     if hostname and ('.' not in hostname and ':' not in hostname or hostname.endswith(('.localhost', '.local', '.internal'))):
@@ -1046,6 +1073,10 @@ class Runner:
             if page.is_closed() or not allowed_url(page.url, receipt.provider, receipt.portal_url):
                 raise ValueError('El portal se cerró o cambió a un dominio distinto del autorizado.')
             snapshot = await page.locator('body').aria_snapshot()
+            if (receipt.provider == 'walmart' and not committed and not issued
+                    and await dismiss_walmart_cfdi_notice(page, snapshot)):
+                self.store.event(key, 'notice_dismissed', 'Se cerró el aviso informativo CFDI 4.0 de Walmart.')
+                continue
             if receipt.provider == 'tesoro' and tesoro_lookup_attempted and not committed and not issued:
                 rejected = await tesoro_verification_failure(page, receipt, profile)
                 if rejected:

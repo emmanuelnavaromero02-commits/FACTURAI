@@ -109,8 +109,8 @@ def portal_suggestions(codes: list[str], text: str) -> list[str]:
 CATALOG = {
     "walmart": {
         "name": "Walmart / Bodega Aurrera",
-        "url": "https://facturacion.walmartmexico.com.mx/",
-        "hosts": ["facturacion.walmartmexico.com.mx"],
+        "url": "https://facturacion-clientes.walmart.com/",
+        "hosts": ["facturacion-clientes.walmart.com", "facturacion.walmartmexico.com.mx"],
         "guide": "Usar TC y TR completos del ticket, tienda, fecha e importe. Guardar TR y tienda en detalles si no caben en el número de ticket. No asumir crédito a partir de la marca Mastercard: verificar débito/crédito.",
     },
     "samara": {
