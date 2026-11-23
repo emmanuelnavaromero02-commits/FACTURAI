@@ -235,7 +235,7 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
         path.write_text(text, encoding='utf-8')
         return self.store.add(str(path), key, source)[0]['id']
 
-    async def test_reader_prepares_known_receipt_once_and_never_auto_issues(self):
+    async def test_reader_prepares_known_receipt_once_with_verified_auto_issue_option(self):
         key = self.add(source='Gmail: mensaje')
         self.add('demo', 'Ejemplo: demo')
         self.store.import_history([{'key': 'hist', 'receipt': self.profile.model_copy(
@@ -249,7 +249,7 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(self.runner, 'run', new_callable=AsyncMock) as run:
                 await self.worker.step()
                 await asyncio.gather(*self.runner.job_tasks.values())
-                run.assert_awaited_once_with(key, PROFILE, False, False)
+                run.assert_awaited_once_with(key, PROFILE, True, False)
             self.store.recover_after_restart()
             await self.worker.step()
             self.assertFalse(self.runner.has_active_jobs())
@@ -289,7 +289,7 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.runner, 'run', new_callable=AsyncMock) as run:
             await self.worker.step()
             await asyncio.gather(*self.runner.job_tasks.values())
-            run.assert_awaited_once_with(key, PROFILE, False, False)
+            run.assert_awaited_once_with(key, PROFILE, True, False)
         self.assertEqual(self.store.get(key)['status'], 'queued')
 
     async def test_single_printed_fiscal_url_opens_when_model_does_not_transcribe_it(self):
@@ -445,7 +445,7 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.runner, 'run', new_callable=AsyncMock) as run:
             await self.worker.step()
             await asyncio.gather(*self.runner.job_tasks.values())
-            run.assert_awaited_once_with(key, PROFILE, False, False)
+            run.assert_awaited_once_with(key, PROFILE, True, False)
         self.assertEqual(self.store.get(key)['status'], 'queued')
 
     async def test_unrelated_search_source_needs_domain_review(self):

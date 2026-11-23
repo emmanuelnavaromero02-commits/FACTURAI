@@ -175,7 +175,7 @@ CATALOG = {
     },
     "vianney": {
         "name": "Vianney", "url": "https://poscfdi.vianney.com.mx/",
-        "hosts": ["poscfdi.vianney.com.mx"], "issuer_rfcs": ["VTH981105F90"],
+        "hosts": ["poscfdi.vianney.com.mx", "facturas2.vianney.mx"], "issuer_rfcs": ["VTH981105F90"],
         "guide": "Selecciona la serie del ticket e introduce el folio sin separador de miles. Si coincide el total, abre el editor del receptor. Busca el RFC y selecciona régimen, uso y forma de pago. Si vuelve a Consulta después de emitir, recupera por el mismo ticket.",
     },
     "starbucks": {
@@ -229,6 +229,8 @@ def allowed_url(url: str, provider: str, portal_url: str = '') -> bool:
         parts = urlsplit(url)
         if parts.scheme != "https" or parts.username or parts.password:
             return False
+        if provider == 'vianney' and parts.netloc.lower() == 'facturas2.vianney.mx':
+            return parts.path == '/cgi-bin/cfds/cfdsORACLE33'
         return parts.netloc.lower() in CATALOG[provider]["hosts"]
     except (ValueError, KeyError):
         return False

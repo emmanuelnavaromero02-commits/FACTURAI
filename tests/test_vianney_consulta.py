@@ -2,18 +2,26 @@
 import asyncio
 import os
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import urlsplit
 
 from playwright.async_api import async_playwright
 
+from facturador.catalog import allowed_url
 from facturador.models import Receipt
 from facturador.vianney_consulta import (lookup_rejected, rejection_for_current_ticket,
                                          recover_vianney_consulta)
 
 
 class VianneyMessageTests(unittest.TestCase):
+    def test_only_the_official_pdf_endpoint_is_allowed(self):
+        self.assertTrue(allowed_url(
+            'https://facturas2.vianney.mx/cgi-bin/cfds/cfdsORACLE33?test=1', 'vianney'))
+        self.assertFalse(allowed_url('https://facturas2.vianney.mx/another-path', 'vianney'))
+
     def test_explicit_ambiguous_portal_rejection(self):
         page = '- text: "Parametros incorrectos: El tiquet no existe o ya ha sido facturado."'
         self.assertEqual(lookup_rejected(page),
@@ -43,7 +51,9 @@ class FakeRunner:
         self.downloads.add(task)
         task.add_done_callback(self.downloads.discard)
 
-    async def recover(self, *_):
+    async def recover(self, key, _):
+        if hasattr(self.store, 'root') and list((self.store.root / 'downloads' / key / 'recibidos').glob('*.pdf')):
+            self.formats.append('factura.pdf')
         return set(self.formats) == {'factura.pdf', 'factura.xml'}
 
 
@@ -135,3 +145,57 @@ class VianneyConsultaChromeTests(unittest.IsolatedAsyncioTestCase):
                 runner.store.event.assert_not_called()
             finally:
                 await browser.close()
+
+    async def test_chrome_inline_pdf_is_fetched_and_saved_with_same_ticket_xml(self):
+        pdf = b'%PDF-1.4\nsynthetic\n%%EOF'
+        inline = '''<form><select id="MainContent_DropDownList2">
+        <option value="pdf">PDF</option><option value="xml">XML</option></select>
+        <input id="MainContent_serie"><input id="MainContent_tiquet">
+        <input id="MainContent_Button1" type="button" value="Siguiente"
+        onclick="location.href=document.querySelector('#MainContent_DropDownList2').value==='pdf'
+        ?'https://facturas2.vianney.mx/cgi-bin/cfds/cfdsORACLE33?test=1':'/download/xml'"></form>'''
+        with TemporaryDirectory() as directory:
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(executable_path='/usr/bin/google-chrome-stable')
+                try:
+                    page = await browser.new_page(accept_downloads=True)
+                    runner = FakeRunner()
+                    runner.store.root = Path(directory)
+                    page.on('download', runner.on_download)
+
+                    async def portal(route):
+                        address = urlsplit(route.request.url)
+                        if address.path == '/Consulta.aspx':
+                            await route.fulfill(content_type='text/html', body=inline)
+                        elif address.path == '/Default.aspx':
+                            await route.fulfill(content_type='text/html', body='<p>Consulta</p>')
+                        elif address.path == '/download/xml':
+                            await route.fulfill(status=200, headers={
+                                'Content-Type': 'application/xml',
+                                'Content-Disposition': 'attachment; filename=factura.xml'}, body=b'<xml/>')
+                        elif address.path == '/cgi-bin/cfds/cfdsORACLE33':
+                            await route.fulfill(status=200, headers={
+                                'Content-Type': 'application/pdf',
+                                'Content-Disposition': 'inline',
+                                'Content-Length': str(len(pdf))}, body=pdf)
+                        else:
+                            await route.fulfill(status=404, body='Missing')
+
+                    await page.route('https://poscfdi.vianney.com.mx/**', portal)
+                    await page.route('https://facturas2.vianney.mx/**', portal)
+                    await page.goto('https://poscfdi.vianney.com.mx/Default.aspx')
+                    receipt = Receipt(provider='vianney', ticket_number='E51T / 148,390')
+                    response = SimpleNamespace(status=200, headers={'content-type': 'application/pdf',
+                                                                      'content-length': str(len(pdf))},
+                                               body=AsyncMock(return_value=pdf))
+                    with patch.object(page.context.request, 'get', new=AsyncMock(return_value=response)) as get:
+                        result = await recover_vianney_consulta(runner, page, 'synthetic', None, receipt)
+                    self.assertTrue(result)
+                    get.assert_awaited_once()
+                    self.assertEqual(urlsplit(get.await_args.args[0]).hostname, 'facturas2.vianney.mx')
+                    candidates = list((Path(directory) / 'downloads' / 'synthetic' / 'recibidos').glob('*.pdf'))
+                    self.assertEqual(len(candidates), 1)
+                    self.assertEqual(candidates[0].read_bytes(), pdf)
+                    self.assertEqual(runner.store.event.call_count, 3)
+                finally:
+                    await browser.close()

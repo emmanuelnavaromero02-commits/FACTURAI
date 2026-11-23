@@ -19,18 +19,20 @@ from .account_flow import PortalAccountFlow, SECRET_SCREEN
 from .auth import ChatGPTPlan, PlanError
 from .brand_entry import enter_bp_franchise, BP_HOME
 from .bp_recipient import prepare_bp_rfc
+from .bp_ticket import BPProgress, at_form as bp_at_form, bp_issue_proof, evidence_from_original, prepare_bp_ticket
 from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, provider_for_url, public_portal_origin, resolves_publicly
 from .captcha_transport import WidgetTransport, widget_origin
 from .cfdi import UUID_RE
 from .db import Store
 from .documents import job_candidates, reconcile
 from .fiscal_choices import NAMES as FISCAL_FIELDS, fiscal_choices
-from .models import Action, Profile, Receipt
+from .models import Action, Profile, Receipt, Target
 from .personal_browser import PersonalBrowser
 from .profile_lock import close_context, launch_chrome
 from .portals import capufe_proof, capufe_recipient, normalize
 from .ticket_lookup import prefill_ticket_lookup, prepare_tesoro_lookup
 from .ticket_retry import FINAL, REOBSERVE, RecoveryRequested, may_have_issued, open_ticket_portal, recover_ticket, retry_action, ticket_in_result
+from .tesoro_consulta import existing_invoice_folio, recover_tesoro_consulta
 from .tesoro_recipient import tesoro_recipient
 from .tesoro_result import tesoro_verification_failure
 from .viewer import BrowserView
@@ -625,7 +627,8 @@ class Runner:
             if operation == 'queue':
                 if self.plan.status()['status'] != 'ready':
                     return {**response, 'action': 'needs_user', 'message': 'Conecta ChatGPT en Ajustes para retomar el trámite.'}
-                self.schedule(key, profile, confirmed_url=row['receipt'].get('portal_url') or '')
+                self.schedule(key, profile, auto_issue=True,
+                              confirmed_url=row['receipt'].get('portal_url') or '')
                 return {**response, 'status': 'queued', 'action': 'queued', 'message': 'Ticket en cola para retomar la preparación.'}
             if self.prepare_checked_ticket(key, profile):
                 return {**response, 'status': 'queued', 'action': 'queued', 'message': self.store.get(key)['message']}
@@ -986,10 +989,14 @@ class Runner:
 
     async def _session(self, key: str, profile: Profile, auto_issue: bool, manual: bool):
         committed = issued = False
-        receipt = Receipt(**self.store.get(key)['receipt'])
+        job = self.store.get(key)
+        receipt = Receipt(**job['receipt'])
         errors = receipt.ready_errors()
         if errors or (receipt.provider not in CATALOG and receipt.provider != CUSTOM_PORTAL):
             raise ValueError(' · '.join(errors) or 'Portal sin configurar.')
+        bp_evidence = (await asyncio.to_thread(evidence_from_original, receipt, Path(job['source_path']))
+                       if receipt.provider == 'bp' and job.get('source_path') else None)
+        bp_progress = BPProgress()
         ai = AI(self.plan)
         if receipt.provider == CUSTOM_PORTAL:
             if not await resolves_publicly(receipt.portal_url):
@@ -1023,6 +1030,7 @@ class Runner:
         accounts = PortalAccountFlow(self.store.root, provider['url'], profile, key,
                                      progress=lambda message: self.store.running_message(key, message))
         for number in range(65):
+            bp_auto_ready = False
             page = self.viewer.page
             status = self.store.get(key)['status']
             if status in {'verified', 'duplicate', 'historical'}:
@@ -1034,6 +1042,10 @@ class Runner:
                 rejected = await tesoro_verification_failure(page, receipt, profile)
                 if rejected:
                     self.store.event(key, 'ticket_lookup_rejected', rejected)
+                    if existing_invoice_folio(rejected):
+                        if await recover_tesoro_consulta(self, page, key, profile, receipt, rejected):
+                            return
+                        raise ValueError(rejected + ' La consulta de Tesoro no devolvió un PDF y XML cotejables.')
                     raise ValueError(rejected)
             if receipt.provider == 'vianney' and not committed and not issued and lookup_rejected(snapshot):
                 submitted_here = any(item.get('tipo') == 'click' and item.get('control', '').casefold() == 'siguiente'
@@ -1110,6 +1122,12 @@ class Runner:
                             bp_lookup_attempted = True
                         self.store.event(key, 'campo_verificado', 'Consulta fiscal cotejada: ' + bp_field)
                         continue
+                    if bp_at_form(page, receipt):
+                        bp_field = await prepare_bp_ticket(page, receipt, profile, bp_evidence, bp_progress)
+                        if bp_field:
+                            self.store.event(key, 'campo_verificado', 'Ticket BP cotejado: ' + bp_field)
+                            continue
+                        bp_auto_ready = bool(auto_issue and await bp_issue_proof(page, receipt, profile, bp_evidence))
                 tesoro_pending = []
                 if receipt.provider == 'tesoro':
                     try:
@@ -1154,6 +1172,10 @@ class Runner:
                         rejected = await tesoro_verification_failure(page, receipt, profile)
                         if rejected:
                             self.store.event(key, 'ticket_lookup_rejected', rejected)
+                            if existing_invoice_folio(rejected):
+                                if await recover_tesoro_consulta(self, page, key, profile, receipt, rejected):
+                                    return
+                                raise ValueError(rejected + ' La consulta de Tesoro no devolvió un PDF y XML cotejables.')
                             raise ValueError(rejected)
                     self.store.event(key, 'campo_verificado', 'Dato del ticket cotejado: ' + tesoro_field)
                     continue
@@ -1164,23 +1186,31 @@ class Runner:
                                       'ultimo_error': last_error, 'campos_fiscales_pendientes': pending_fields,
                                       'estado_visible': model_snapshot[:26_000]}, ensure_ascii=False)
             try:
-                try:
-                    # Once a credential has been used, pixels could echo it outside the
-                    # accessibility tree (canvas, QR or a transient toast). Use verified text.
-                    image = None if accounts.credential_values else await page.screenshot(
-                        type='jpeg', quality=76, scale='css', timeout=6000)
-                except BrowserError:
-                    if page.is_closed() or page in self.lost_pages or self.context is None:
-                        raise
-                    image = None
-                    self.store.event(key, 'text_navigation', 'El navegador no produjo la captura. Se usó el árbol visible.')
-                # A portal may render a verification challenge while producing its frame.
-                # Discard both observations and reclassify the current page before sharing.
-                latest = await page.locator('body').aria_snapshot()
-                if (latest != snapshot or accounts.private_observation(latest) or await visible_challenge(page, latest) or
-                        self.viewer.page is not page or not allowed_url(page.url, receipt.provider, receipt.portal_url)):
-                    continue
-                action = await asyncio.to_thread(ai.next_action, instructions, observation, image)
+                if bp_auto_ready:
+                    latest = await page.locator('body').aria_snapshot()
+                    if (latest != snapshot or await visible_challenge(page, latest) or self.viewer.page is not page or
+                            not allowed_url(page.url, receipt.provider, receipt.portal_url)):
+                        continue
+                    action = Action(kind='click', target=Target(by='role', role='link', name='Facturar', exact=True),
+                                    value=None, reason='Emitir el único ticket BP cotejado con el perfil.', risk='issue')
+                else:
+                    try:
+                        # Once a credential has been used, pixels could echo it outside the
+                        # accessibility tree (canvas, QR or a transient toast). Use verified text.
+                        image = None if accounts.credential_values else await page.screenshot(
+                            type='jpeg', quality=76, scale='css', timeout=6000)
+                    except BrowserError:
+                        if page.is_closed() or page in self.lost_pages or self.context is None:
+                            raise
+                        image = None
+                        self.store.event(key, 'text_navigation', 'El navegador no produjo la captura. Se usó el árbol visible.')
+                    # A portal may render a verification challenge while producing its frame.
+                    # Discard both observations and reclassify the current page before sharing.
+                    latest = await page.locator('body').aria_snapshot()
+                    if (latest != snapshot or accounts.private_observation(latest) or await visible_challenge(page, latest) or
+                            self.viewer.page is not page or not allowed_url(page.url, receipt.provider, receipt.portal_url)):
+                        continue
+                    action = await asyncio.to_thread(ai.next_action, instructions, observation, image)
             except PlanError as exc:
                 decision = await self.human(key, page, 'plan', str(exc))
                 if decision == 'manual':
@@ -1265,6 +1295,8 @@ class Runner:
                     mismatch = await tesoro_verification_failure(page, receipt, profile, issue_gate=True)
                     if mismatch:
                         raise ValueError(mismatch)
+                if receipt.provider == 'bp' and not await bp_issue_proof(page, receipt, profile, bp_evidence):
+                    raise ValueError('BP no mostró una única compra cotejada con el ticket y el perfil fiscal.')
                 _, pending_fields = await fiscal_choices(page, profile, receipt)
                 if pending_fields:
                     last_error = 'Antes de emitir, el portal debe reflejar ' + ', '.join(pending_fields) + '.'
@@ -1279,8 +1311,13 @@ class Runner:
                         await self.human(key, page, 'blocked', detail)
                     last_error = detail
                     continue
+                capufe_auto = (receipt.provider == 'capufe' and
+                               normalize(name) in {'SI ESTOY SEGURO', 'SÍ ESTOY SEGURO'} and
+                               await capufe_proof(page, profile, receipt))
+                bp_auto = (receipt.provider == 'bp' and normalize(name) == 'FACTURAR' and
+                           await bp_issue_proof(page, receipt, profile, bp_evidence))
                 valid = (auto_issue and key not in self.explicit_approval and not self.store.get(key)['human_exposed']
-                         and normalize(name) in {'SI ESTOY SEGURO', 'SÍ ESTOY SEGURO'} and await capufe_proof(page, profile, receipt))
+                         and (capufe_auto or bp_auto))
                 if not valid:
                     approved_at = (page.url, snapshot)
                     await self.human(key, page, 'issue', 'Revisa ticket, importe, forma de pago y datos fiscales en el portal para aprobar esta emisión.')

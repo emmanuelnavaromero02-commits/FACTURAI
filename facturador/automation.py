@@ -507,9 +507,9 @@ class TicketAutomation:
             return False
         # No await between checking ownership and calling schedule, which atomically claims
         # the job in SQLite and registers its task before yielding control to other handlers.
-        self.runner.schedule(key, profile, auto_issue=False,
+        self.runner.schedule(key, profile, auto_issue=True,
                              confirmed_url=receipt.portal_url if confirmed_portal else '')
-        self._set('queued', key, 'En cola para preparar el portal. La emisión requiere tu aprobación.')
+        self._set('queued', key, 'En cola para preparar el portal y continuar donde los datos sean comprobables.')
         return True
 
     async def step(self):

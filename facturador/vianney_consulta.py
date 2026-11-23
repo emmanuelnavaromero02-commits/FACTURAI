@@ -5,10 +5,13 @@ from urllib.parse import urlsplit
 
 from playwright.async_api import Error as BrowserError, TimeoutError as BrowserTimeout
 
+from .documents import save_candidate
 from .ticket_lookup import split_series_ticket
 
 
 CONSULTA = 'https://poscfdi.vianney.com.mx/Consulta.aspx'
+INLINE_PDF_HOST = 'facturas2.vianney.mx'
+INLINE_PDF_PATH = '/cgi-bin/cfds/cfdsORACLE33'
 REJECTED = re.compile(
     r'Par[aá]metros incorrectos:\s*El (?:tiquet|ticket) no existe o ya ha sido facturado\.?', re.I)
 
@@ -67,6 +70,28 @@ async def _consulta_form(page, series: str, ticket: str, kind: str) -> bool:
             await selector.input_value() == kind)
 
 
+async def _save_inline_pdf(runner, page, key: str) -> bool:
+    """Chrome displays Vianney's PDF inline, so its download event never fires."""
+    address = urlsplit(page.url)
+    if (address.scheme != 'https' or address.hostname != INLINE_PDF_HOST or
+            address.path != INLINE_PDF_PATH or address.port is not None or
+            address.username is not None or address.password is not None):
+        return False
+    response = await page.context.request.get(page.url, timeout=15000, max_redirects=0)
+    if (response.status != 200 or
+            response.headers.get('content-type', '').split(';', 1)[0].strip().lower() != 'application/pdf'):
+        return False
+    length = response.headers.get('content-length', '')
+    if length.isdecimal() and int(length) > 25 * 1024 * 1024:
+        return False
+    data = await response.body()
+    if not data.startswith(b'%PDF-') or len(data) > 25 * 1024 * 1024:
+        return False
+    save_candidate(runner.store, key, 'vianney-consulta.pdf', data)
+    runner.store.event(key, 'vianney_pdf_inline', 'PDF recibido de la consulta del mismo ticket.')
+    return True
+
+
 async def recover_vianney_consulta(runner, page, key: str, profile, receipt) -> bool:
     """Ask the portal for each format once; only runner.recover can verify a CFDI."""
     if receipt.provider != 'vianney' or not split_series_ticket(receipt.ticket_number):
@@ -91,6 +116,8 @@ async def recover_vianney_consulta(runner, page, key: str, profile, receipt) -> 
                 pass  # The portal can show a lookup error instead of a file.
             if runner.downloads:
                 await asyncio.wait(tuple(runner.downloads), timeout=12)
+            if kind == 'pdf':
+                await _save_inline_pdf(runner, page, key)
             if await runner.recover(key, profile):
                 return True
         return False
