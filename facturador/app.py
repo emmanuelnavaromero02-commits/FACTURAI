@@ -328,7 +328,13 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
             check_captcha_ticket(job_id)
             if view is not runner.viewer or runner.screen is not view:
                 raise ValueError('Vuelve al visor de este ticket para resolver la verificación.')
-        return {'channel': await view.take_control(revision, check=check)}
+        channel = await view.take_control(revision, check=check)
+        try:
+            store.mark_human_exposed(job_id)
+        except Exception:
+            await view.release(channel)
+            raise
+        return {'channel': channel}
 
     @app.post('/api/browser/control/alive')
     async def captcha_control_alive(job_id: str = Body(max_length=100), channel: str = Body(max_length=64)):
@@ -459,11 +465,14 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         if len(files) > 100:
             raise ValueError("Límite de 100 archivos por importación")
         result = []
+        batch_id = secrets.token_hex(16)
         for file in files:
             data = await file.read(MAX_UPLOAD + 1)
             name = file.filename or 'archivo'
-            importer = import_eml if Path(name).suffix.lower() == '.eml' else save_upload
-            result += await asyncio.to_thread(importer, store, name, data)
+            if Path(name).suffix.lower() == '.eml':
+                result += await asyncio.to_thread(import_eml, store, name, data)
+            else:
+                result += await asyncio.to_thread(save_upload, store, name, data, batch_id=batch_id)
         if any(item['created'] for item in result):
             automation.wake.set()
         return result

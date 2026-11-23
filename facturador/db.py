@@ -86,6 +86,12 @@ class Store:
                 db.execute("ALTER TABLE jobs ADD COLUMN confirmed_payment TEXT NOT NULL DEFAULT ''")
                 db.execute("""UPDATE jobs SET confirmed_payment=COALESCE(json_extract(receipt, '$.payment_code'),'')
                               WHERE (status='ready' AND message='Revisado') OR status='external'""")
+            if 'batch_id' not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN batch_id TEXT NOT NULL DEFAULT ''")
+            if 'companion_of' not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN companion_of TEXT NOT NULL DEFAULT ''")
+            db.execute("CREATE INDEX IF NOT EXISTS jobs_batch ON jobs(batch_id) WHERE batch_id<>''")
+            db.execute("CREATE INDEX IF NOT EXISTS jobs_companion ON jobs(companion_of) WHERE companion_of<>''")
             db.execute("CREATE INDEX IF NOT EXISTS jobs_auto_inbox ON jobs(status,auto_stage,created,id) "
                        "WHERE historical=0 AND billing_profile IS NULL")
         self.path.chmod(0o600)
@@ -151,7 +157,7 @@ class Store:
         db.execute("UPDATE jobs SET status='issued_waiting_files',issuance_seen=1,message=?,updated=? WHERE id=?", (ARCHIVED_TOLL, now(), key))
         return True
 
-    def add(self, path: str, sha: str, source: str = "archivo"):
+    def add(self, path: str, sha: str, source: str = "archivo", batch_id: str = ''):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             existing = db.execute(self._job_select + " WHERE j.source_hash=?", (sha,)).fetchone()
@@ -159,9 +165,95 @@ class Store:
                 return self.decode(existing), False
             key = uuid.uuid4().hex
             receipt = Receipt(source=source).model_dump_json()
-            db.execute("INSERT INTO jobs(id,receipt,status,source_path,source_hash,created,updated) VALUES(?,?,?,?,?,?,?)",
-                       (key, receipt, "new", path, sha, now(), now()))
+            db.execute("INSERT INTO jobs(id,receipt,status,source_path,source_hash,batch_id,created,updated) VALUES(?,?,?,?,?,?,?,?)",
+                       (key, receipt, "new", path, sha, batch_id, now(), now()))
         return self.get(key), True
+
+    def batch_unread(self, key: str) -> bool:
+        """Keep a ready ticket in the inbox until every sibling has been classified."""
+        with self.connect() as db:
+            return bool(db.execute("""SELECT 1 FROM jobs AS sibling JOIN jobs AS current
+                ON sibling.batch_id=current.batch_id WHERE current.id=? AND current.batch_id<>''
+                AND sibling.id<>current.id AND (sibling.status='new' OR sibling.auto_stage LIKE 'reading:%')
+                LIMIT 1""", (key,)).fetchone())
+
+    def companion_paths(self, key: str) -> list[Path]:
+        with self.connect() as db:
+            paths = [row['source_path'] for row in db.execute("""SELECT source_path FROM jobs
+                WHERE companion_of=? AND status='attached' ORDER BY created,id LIMIT 3""", (key,))]
+        directory = (self.root / 'originales').resolve()
+        result = []
+        for value in paths:
+            path = Path(value).resolve()
+            if path.is_relative_to(directory) and path.is_file():
+                result.append(path)
+        return result
+
+    def pair_batch_if_unique(self, key: str) -> list[tuple[str, list[str]]]:
+        """Attach only a fiscal-only image to one complete purchase in its upload batch."""
+        from .catalog import CUSTOM_PORTAL
+
+        def complete(r: Receipt) -> bool:
+            return bool(r.merchant and r.amount and r.date and (r.ticket_number or r.billing_codes))
+
+        def merchant_key(r: Receipt) -> str:
+            return ' '.join(r.merchant.casefold().split())
+
+        def same_merchant(left: Receipt, right: Receipt) -> bool:
+            a, b = merchant_key(left), merchant_key(right)
+            if not a or not b:
+                return False
+            if a == b:
+                return True
+            shorter, longer = sorted((a, b), key=len)
+            return len(shorter) >= 5 and longer.startswith(shorter + ' ')
+
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            current = db.execute('SELECT batch_id FROM jobs WHERE id=?', (key,)).fetchone()
+            if not current or not current['batch_id']:
+                return []
+            rows = [self.decode(r) for r in db.execute('SELECT * FROM jobs WHERE batch_id=? ORDER BY created,id',
+                                                     (current['batch_id'],))]
+            if len(rows) < 2 or len(rows) > 100 or any(
+                    r['status'] == 'new' or r['auto_stage'].startswith('reading:') for r in rows):
+                return []
+            available = [r for r in rows if r['status'] in {'ready', 'review'} and not r['companion_of']
+                         and not (r['historical'] or r['issue_attempted'] or r['human_exposed']
+                                  or r['issuance_seen'] or r['uuid'])]
+            available_ids = {r['id'] for r in available}
+            complete_rows = [r for r in rows if complete(Receipt.model_validate(r['receipt']))]
+            groups: dict[str, list[dict]] = {}
+            for candidate in available:
+                extra = Receipt.model_validate(candidate['receipt'])
+                if (extra.provider == 'unknown' or not merchant_key(extra)
+                        or extra.amount or extra.date or extra.ticket_number or extra.billing_codes
+                        or not (extra.portal_url or 'factur' in extra.details.casefold())):
+                    continue
+                matches = []
+                for possible in complete_rows:
+                    purchase = Receipt.model_validate(possible['receipt'])
+                    if (purchase.provider == extra.provider and same_merchant(extra, purchase)
+                            and (purchase.provider != CUSTOM_PORTAL or purchase.portal_url == extra.portal_url)):
+                        matches.append(possible)
+                if len(matches) != 1 or matches[0]['id'] not in available_ids:
+                    continue
+                groups.setdefault(matches[0]['id'], []).append(candidate)
+            paired = []
+            for primary_id, companions in groups.items():
+                if len(companions) > 3:
+                    continue
+                for companion in companions:
+                    db.execute("""UPDATE jobs SET status='attached',auto_stage='attached',companion_of=?,
+                        message=?,updated=? WHERE id=?""",
+                        (primary_id, 'Imagen complementaria del ticket ' + primary_id, now(), companion['id']))
+                db.execute("""UPDATE jobs SET status='review',auto_stage='retry_read',read_after=0,
+                    message=?,updated=? WHERE id=?""",
+                    ('Releyendo el ticket con sus imágenes complementarias.', now(), primary_id))
+                db.execute('INSERT INTO events(job_id,at,kind,detail) VALUES(?,?,?,?)',
+                           (primary_id, now(), 'companion_attached', ','.join(c['id'] for c in companions)))
+                paired.append((primary_id, [c['id'] for c in companions]))
+            return paired
 
     def event(self, key: str, kind: str, detail: str):
         with self.connect() as db:
@@ -420,6 +512,19 @@ class Store:
             db.execute("UPDATE jobs SET status='needs_user',human_exposed=MAX(human_exposed,?),message=?,updated=? WHERE id=?",
                        (int(manual), message, now(), key))
             db.execute('INSERT INTO events(job_id,at,kind,detail) VALUES(?,?,?,?)', (key, now(), 'needs_user', kind))
+
+    def mark_human_exposed(self, key: str):
+        """Record a granted control lease before the operator can act in Chrome."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT status,human_exposed FROM jobs WHERE id=?', (key,)).fetchone()
+            if not row or row['status'] != 'needs_user':
+                raise ValueError('El ticket ya no espera intervención en el navegador.')
+            if row['human_exposed']:
+                return
+            db.execute('UPDATE jobs SET human_exposed=1,updated=? WHERE id=?', (now(), key))
+            db.execute('INSERT INTO events(job_id,at,kind,detail) VALUES(?,?,?,?)',
+                       (key, now(), 'human_control_taken', 'Se tomó control de la pestaña del ticket.'))
 
     def resume_intervention(self, key: str):
         with self.connect() as db:

@@ -92,6 +92,61 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((row['status'], row['uuid'], row['issue_attempted']), ('verified', FISCAL_UUID, 0))
         self.assertEqual((await self.runner.retry_job(self.key))['action'], 'complete')
 
+    async def test_untouched_captcha_can_retry_after_restart(self):
+        self.store.queue(self.key, PROFILE)
+        self.store.enter_intervention(self.key, 'captcha', 'Verificación pendiente', False)
+        self.assertEqual(self.store.get(self.key)['human_exposed'], 0)
+        self.store.recover_after_restart()
+        row = self.store.get(self.key)
+        self.assertEqual((row['status'], row['issue_attempted'], row['human_exposed']), ('ready', 0, 0))
+        self.assertEqual(self.runner.retry_action(row), 'queue')
+
+    async def test_manual_inspection_does_not_claim_invoice_submission(self):
+        self.assertTrue(self.store.queue(self.key, PROFILE))
+        self.assertTrue(self.store.claim(self.key))
+        page = FakePage(success=False)
+        self.runner.viewer.page = page
+        async def inspect(key, _page, kind, message):
+            self.assertFalse(self.store.get(key)['issue_attempted'])
+            self.store.enter_intervention(key, kind, message, True)
+            self.store.resume_intervention(key)
+        with patch.object(self.runner, 'human', side_effect=inspect), \
+             patch.object(self.runner, 'recover', new_callable=AsyncMock, return_value=False):
+            await self.runner.manual_job(self.key, page, PROFILE)
+        row = self.store.get(self.key)
+        self.assertEqual((row['status'], row['issue_attempted'], row['human_exposed']),
+                         ('uncertain', 0, 1))
+        self.assertFalse(self.store.queue(self.key, PROFILE))
+
+    async def test_captcha_control_lease_marks_exposure_once(self):
+        app = create_app(self.root)
+        runner = app.state.runner
+        self.addAsyncCleanup(runner.close)
+        self.addCleanup(app.state.plan.close)
+        self.store.queue(self.key, PROFILE)
+        self.store.enter_intervention(self.key, 'captcha', 'Verificación pendiente', False)
+        page = Mock()
+        page.is_closed.return_value = False
+        runner.viewer.page = page
+        runner.viewer.manual = True
+        runner.active_id = self.key
+        runner.page_job[page] = self.key
+        runner.pending[self.key] = {'kind': 'captcha', 'page': page,
+                                    'future': Mock(done=Mock(return_value=False))}
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, 'path', '') == '/api/browser/control')
+        with self.assertRaises(ValueError):
+            await endpoint(revision=runner.viewer.revision, job_id='otro-ticket')
+        self.assertEqual(self.store.get(self.key)['human_exposed'], 0)
+        result = await endpoint(revision=runner.viewer.revision, job_id=self.key)
+        self.assertTrue(result['channel'])
+        self.assertEqual(self.store.get(self.key)['human_exposed'], 1)
+        self.assertEqual(sum(event['kind'] == 'human_control_taken' for event in self.store.events(self.key)), 1)
+        await runner.viewer.release(result['channel'])
+        app.state.store.mark_human_exposed(self.key)
+        self.assertEqual(sum(event['kind'] == 'human_control_taken' for event in self.store.events(self.key)), 1)
+        self.store.recover_after_restart()
+        self.assertEqual(self.store.get(self.key)['status'], 'uncertain')
+
     async def test_capufe_proof_requires_same_ticket_and_unexpired_negative_without_prior_submission(self):
         receipt = RECEIPT.model_copy(update={'provider':'capufe', 'billing_codes':['ABCDEFGHIJKLMNOPQR']})
         self.store.save_receipt(self.key, receipt, ready=True)

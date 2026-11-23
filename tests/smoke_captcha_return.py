@@ -1,5 +1,6 @@
 """Simulate the operator returning Chrome after a challenge using offline merchant pages."""
 import asyncio
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -41,7 +42,13 @@ async def smoke():
                         value=None,risk='issue',reason='Confirmar emisión')
         try:
             with patch.object(runner, 'start_browser', open_browser), patch('facturador.runner.AI.next_action', return_value=action) as model:
-                for index, mode in enumerate(('persistent', 'error', 'redirect', 'ambiguous', 'completed', 'capufe')):
+                def next_action(_, observation, __):
+                    if 'Continuar' in json.loads(observation)['estado_visible']:
+                        return Action(kind='click', target=Target(by='role', role='link', name='Continuar', exact=True),
+                                      value=None, risk='normal', reason='Avanzar tras la verificación')
+                    return action
+                model.side_effect = next_action
+                for index, mode in enumerate(('persistent', 'error', 'redirect', 'intermediate', 'unsafe_anchor', 'ambiguous', 'completed', 'capufe')):
                     key = store.add('fixture.png', 'caso-'+mode)[0]['id']
                     receipt = RECEIPT.model_copy(update={'provider': 'capufe' if mode=='capufe' else 'sintetico',
                                                          'billing_codes':[f'PRUEBA{index}']})
@@ -54,8 +61,15 @@ async def smoke():
                     await runner.release_control('no-es-la-sesion')
                     assert runner.pending[key]['kind'] == 'captcha'
                     lease = await runner.viewer.take_control(runner.viewer.revision)
+                    store.mark_human_exposed(key)
                     if mode == 'redirect':
                         await page.goto(origin+'/otra-pagina')
+                    elif mode == 'intermediate':
+                        await page.set_content('<a href="/otra-pagina">Continuar</a>')
+                        candidate = next_action(None, json.dumps({'estado_visible':'Continuar'}), None)
+                        assert await runner.safe_continue_href(page, candidate, receipt) == origin+'/otra-pagina'
+                    elif mode == 'unsafe_anchor':
+                        await page.set_content('<a href="/facturar">Continuar</a>')
                     elif mode == 'error':
                         await page.set_content('<h1>Error 503</h1>'+FORM)
                     elif mode == 'ambiguous':
@@ -65,7 +79,9 @@ async def smoke():
                         # The offline fixture supplies the state after the human completed the challenge.
                         await page.set_content(FORM)
                     await runner.release_control(lease)
-                    if mode in ('persistent', 'error', 'redirect'):
+                    if mode == 'intermediate':
+                        assert key in runner.captcha_returned, 'El regreso del CAPTCHA no habilitó el enlace simple.'
+                    if mode in ('persistent', 'error'):
                         assert runner.pending[key]['kind'] == 'captcha'
                         try:
                             await runner.continue_job(key, 'resume')
@@ -78,13 +94,21 @@ async def smoke():
                     elif mode == 'ambiguous':
                         await asyncio.wait_for(task, 5)
                         assert store.get(key)['status'] == 'uncertain' and model.call_count == calls
+                    elif mode == 'unsafe_anchor':
+                        await pending(key, 'blocked')
+                        assert page.url == origin+'/' and model.call_count == calls+1
+                        assert not store.get(key)['issue_attempted']
+                        await runner.stop(key)
                     else:
-                        await pending(key, 'issue')
-                        assert runner.viewer.page is page and model.call_count == calls+1
+                        try:
+                            await pending(key, 'issue')
+                        except TimeoutError:
+                            raise AssertionError(f'{mode}: pausa={runner.pending.get(key, {}).get("kind")}, estado={store.get(key)["status"]}, eventos={[e["kind"] for e in store.events(key)]}, mensaje={store.get(key)["message"]}') from None
+                        assert runner.viewer.page is page and model.call_count == calls+(2 if mode == 'intermediate' else 1)
                         assert not store.get(key)['issue_attempted']
                         await runner.stop(key)
                     assert store.get(key)['human_exposed'] and not store.get(key)['issue_attempted']
-                print('OK Chrome: desafío persistente, error, redirección y acción ambigua conservan protecciones; dos comercios retoman el formulario tras devolución humana.')
+                print('OK Chrome: CAPTCHA persistente queda en pausa; POST ambiguo exige recuperar; enlace simple avanza y /facturar se bloquea.')
         finally:
             await runner.close()
 

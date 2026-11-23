@@ -6,21 +6,20 @@ from pathlib import Path
 from playwright.async_api import Error as BrowserError
 
 from .catalog import allowed_url
+from .models import SAT_PAYMENT_ALIASES, SAT_PAYMENT_CODES
 from .tax_document import REGIME_NAMES
 
 INFO = (Path(__file__).parent / 'fiscal_choice.js').read_text(encoding='utf-8')
 CONTROLS = 'select:visible, [role=combobox]:visible, .p-dropdown:visible'
 NAMES = {'payment': 'forma de pago', 'regime': 'régimen fiscal', 'use': 'uso del CFDI'}
-PAYMENTS = {'01': ('efectivo',), '03': ('transferencia', 'transferencia electrónica de fondos'),
-            '04': ('crédito', 'tarjeta de crédito'), '28': ('débito', 'tarjeta de débito'),
-            '99': ('por definir',)}
+PAYMENTS = SAT_PAYMENT_ALIASES
 USES = {'G01': ('adquisición de mercancías',), 'G03': ('gastos en general',),
         'S01': ('sin efectos fiscales',)}
 # SAT catCFDI.xsd: https://www.sat.gob.mx/sitio_internet/cfd/catalogos/catCFDI.xsd
 # Include valid alternatives a portal could post even when the app only supports
 # a subset of payment choices. Other internal IDs may be resolved by a precise label.
 SAT_CODES = {
-    'payment': set('01 02 03 04 05 06 08 12 13 14 15 17 23 24 25 26 27 28 29 30 31 99'.split()),
+    'payment': SAT_PAYMENT_CODES,
     'regime': set(REGIME_NAMES),
     'use': {'G01', 'G02', 'G03', 'P01', 'S01', 'CP01', 'CN01',
             *(f'I{i:02}' for i in range(1, 9)), *(f'D{i:02}' for i in range(1, 11))},

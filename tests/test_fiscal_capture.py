@@ -12,7 +12,7 @@ from pypdf.generic import DecodedStreamObject, NameObject
 from facturador.app import create_app
 from facturador.automation import TicketAutomation
 from facturador.db import Store
-from facturador.models import Profile, Receipt
+from facturador.models import Profile, Receipt, SAT_PAYMENT_CODES
 from facturador.local_reader import ocr_languages
 from facturador.receipt_evidence import printed_payment
 from facturador.runner import Runner
@@ -99,8 +99,23 @@ class TaxCaptureTests(unittest.TestCase):
     def test_mixed_payment_and_card_brand_are_ambiguous(self):
         self.assertEqual(printed_payment('Forma de pago: Mastercard'), '')
         self.assertEqual(printed_payment('Forma de pago: 04'), '04')
+        self.assertEqual(printed_payment('Forma de pago: 02'), '02')
+        self.assertEqual(printed_payment('Pago con cheque nominativo'), '02')
+        self.assertEqual(printed_payment('TIPO OPER: EFECTIVO'), '01')
+        self.assertEqual(printed_payment('TIPO OPER! EFECTIVO'), '01')
         self.assertEqual(printed_payment('Aceptamos efectivo o crédito'), '')
         self.assertEqual(printed_payment('Forma de pago: Efectivo\nPago con débito'), '')
+        self.assertEqual(printed_payment('Tipo oper: efectivo\nForma de pago: 28'), '')
+        self.assertEqual(printed_payment('Tipo oper: venta'), '')
+
+    def test_receipt_accepts_sat_payment_catalog_but_not_unknown_or_undefined_payment(self):
+        self.assertIn('02', SAT_PAYMENT_CODES)
+        self.assertEqual(Receipt(payment_code='02').payment_code, '02')
+        self.assertEqual({Receipt(payment_code=code).payment_code for code in SAT_PAYMENT_CODES},
+                         set(SAT_PAYMENT_CODES))
+        with self.assertRaises(ValueError):
+            Receipt(payment_code='07')
+        self.assertIn('La clave 99 no confirma cómo se pagó esta compra.', Receipt(payment_code='99').ready_errors())
 
     def test_manual_offline_api_reads_a_receipt_without_plan(self):
         with tempfile.TemporaryDirectory() as folder:

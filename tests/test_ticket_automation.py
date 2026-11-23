@@ -106,6 +106,65 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
             run.assert_awaited_once_with(key, PROFILE, False, False)
         self.assertEqual(self.store.get(key)['status'], 'queued')
 
+    async def test_single_printed_fiscal_url_opens_when_model_does_not_transcribe_it(self):
+        link = 'https://facturas.example.org/mi-ticket'
+        key = self.add(text='Factura en ' + link)
+        with patch('facturador.automation.AI.extract', return_value=extracted(
+                provider='unknown', merchant='Café Estrella', billing_url=None,
+                uncertainties=['No aparece una liga de facturación.'])):
+            await self.worker.step()
+        row = self.store.get(key)
+        self.assertEqual((row['status'], row['receipt']['portal_url']), ('ready', link))
+        self.assertNotIn('liga de facturación', row['message'])
+
+    async def test_two_printed_fiscal_urls_are_not_selected_automatically(self):
+        first = 'https://facturas.example.org/uno'
+        second = 'https://facturas.otro.org/dos'
+        key = self.add(text=f'Factura en {first}\nFactura en {second}')
+        with patch('facturador.automation.AI.extract', return_value=extracted(
+                provider='unknown', billing_url=first)):
+            await self.worker.step()
+        row = self.store.get(key)
+        self.assertEqual(row['status'], 'review')
+        self.assertEqual(row['receipt']['portal_url'], '')
+        self.assertIn('varios enlaces fiscales', row['message'])
+        self.assertFalse(self.runner.has_active_jobs())
+
+    async def test_short_catalog_brand_confirms_bp_playas(self):
+        key = self.add(text='BP PLAYAS\nFOLIO PRUEBA-A')
+        with patch('facturador.automation.AI.extract', return_value=extracted(
+                provider='bp', merchant='BP PLAYAS')):
+            await self.worker.step()
+        self.assertEqual(self.store.get(key)['status'], 'ready')
+
+    async def test_short_brand_in_folio_does_not_confirm_merchant(self):
+        other = self.add(text='OTRO COMERCIO\nFOLIO BP 567')
+        with patch('facturador.automation.AI.extract', return_value=extracted(
+                provider='bp', merchant='BP PLAYAS', ticket_number='567')):
+            await self.worker.step()
+        row = self.store.get(other)
+        self.assertEqual(row['status'], 'review')
+        self.assertIn('Confirma que el comercio', row['message'])
+
+    async def test_upside_down_receipt_retries_local_ocr_only_for_catalog_brand(self):
+        from PIL import Image
+        path = self.root / 'bp.png'
+        Image.new('RGB', (16, 16), 'white').save(path)
+        key = self.store.add(str(path), 'bp-girado')[0]['id']
+        def page(_path, *_, rotation=0, force_ocr=False):
+            if rotation:
+                self.assertEqual((rotation, force_ocr), (180, True))
+            return {'pages':1, 'method':'ocr', 'codes':[],
+                    'text':'BP PLAYAS\nFOLIO PRUEBA-A' if rotation else 'texto ilegible'}
+        with patch('facturador.automation.AI.extract', return_value=extracted(
+                provider='bp', merchant='BP PLAYAS')), \
+             patch('facturador.automation.read_local_page', side_effect=page) as local:
+            await self.worker.step()
+        self.assertEqual(self.store.get(key)['status'], 'ready')
+        self.assertEqual(local.call_count, 2)
+        source_event = next(event for event in self.store.events(key) if event['kind'] == 'fuentes_de_campos')
+        self.assertIn('ocr_giro_180', json.loads(source_event['detail'])['tools'])
+
     async def test_unprinted_domain_still_needs_review(self):
         link = 'https://facturas.example.org/mi-ticket'
         key = self.add(source='WhatsApp: ticket.txt', text='Compra pagada sin dirección de facturación')

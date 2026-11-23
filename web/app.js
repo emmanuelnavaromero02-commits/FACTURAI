@@ -7,15 +7,25 @@ const $ = id => document.getElementById(id);
 const sections = {bandeja: 'Bandeja', navegador: 'Navegador', comprobantes: 'Comprobantes', portales: 'Portales', ajustes: 'Ajustes'};
 const jobLabels = {new: 'Por leer', review: 'Por revisar', external: 'Solicitar al comercio', ready: 'Listo', queued: 'En cola', running: 'En el portal',
   issuing: 'Emisión en trámite', needs_user: 'Requiere tu intervención', issued_waiting_files: 'Emitido · recuperar',
-  verified: 'Comprobado', blocked: 'Pendiente', uncertain: 'Resultado incierto', duplicate: 'Duplicado', historical: 'Histórico',
+  verified: 'Comprobado', blocked: 'Pendiente', uncertain: 'Resultado incierto', duplicate: 'Duplicado',
+  attached: 'Imagen complementaria', historical: 'Histórico',
   whatsapp_preparing: 'Preparando WhatsApp'};
 const planLabels = {disconnected: 'Por conectar', ready: 'Plan conectado', limit: 'Cupo en pausa',
   identity_only: 'Autoriza el uso del plan', reconnect: 'Vuelve a conectar'};
-const payments = {'01': 'Efectivo', '03': 'Transferencia', '04': 'Crédito', '28': 'Débito', '99': 'Por definir'};
+const payments = {
+  '01':'Efectivo', '02':'Cheque nominativo', '03':'Transferencia electrónica de fondos',
+  '04':'Tarjeta de crédito', '05':'Monedero electrónico', '06':'Dinero electrónico',
+  '08':'Vales de despensa', '12':'Dación en pago', '13':'Pago por subrogación',
+  '14':'Pago por consignación', '15':'Condonación', '17':'Compensación',
+  '23':'Novación', '24':'Confusión', '25':'Remisión de deuda',
+  '26':'Prescripción o caducidad', '27':'A satisfacción del acreedor',
+  '28':'Tarjeta de débito', '29':'Tarjeta de servicios',
+  '30':'Aplicación de anticipos', '31':'Intermediario de pagos', '99':'Por definir'
+};
 const working = new Set(['queued', 'running', 'needs_user', 'issuing']);
 const review = new Set(['new', 'review', 'ready', 'blocked', 'external']);
 const documents = new Set(['verified', 'issued_waiting_files', 'uncertain', 'historical']);
-const terminal = new Set(['verified', 'duplicate', 'historical']);
+const terminal = new Set(['verified', 'duplicate', 'attached', 'historical']);
 const amountFormat = new Intl.NumberFormat('es-MX', {style: 'currency', currency: 'MXN'});
 const currency = value => value && Number.isFinite(Number(value)) ? amountFormat.format(Number(value)) : '—';
 let state = {token: '', jobs: [], catalog: {}, plan: {}, browser: {}, gmail: 'disconnected'};
@@ -413,6 +423,15 @@ function renderRetryStrip() {
 }
 
 function primaryAction(row, realTicket) {
+  if (row.status === 'attached' && row.companion_of) return button('Ver ticket', () => {
+    filter = 'all';
+    $('ticket-search').value = '';
+    route('bandeja');
+    renderTickets(true);
+    const main = [...document.querySelectorAll('#tickets tr[data-job-id]')].find(tr => tr.dataset.jobId === row.companion_of);
+    main?.scrollIntoView({behavior: 'smooth', block: 'center'});
+    main?.focus();
+  }, 'primary');
   if (isLive(row) || row.id === state.browser.return_job_id) return button('Ver en vivo', () => showLive(row), 'primary');
   if (reading(row)) return null;
   if (row.status === 'new' && realTicket) {
@@ -476,7 +495,7 @@ function rowActions(row) {
       panel.append(button('Usar descargas del navegador', () => perform(() => receiptTools.showDownloads(row)), 'plain'));
     }
   }
-  if (!row.historical && !working.has(row.status) && row.status !== 'duplicate') {
+  if (!row.historical && !working.has(row.status) && !terminal.has(row.status)) {
     panel.append(button('Recuperar de Gmail', () => recoverGmail(row), 'plain'),
       button('Adjuntar PDF/XML, ZIP o correo', () => {attachJob = row.id; $('cfdi-file').click();}, 'plain'),
       button('Revisar descargas', () => perform(async () => {
@@ -526,6 +545,8 @@ function table(container, rows, isDocs = false) {
     const info = el('td');
     info.append(el('strong', title, 'ticket-name'), el('span', [receipt.date, receipt.ticket_number || receipt.billing_codes[0],
       row.uuid ? `UUID ${row.uuid}` : null].filter(Boolean).join(' · ') || receipt.source, 'ticket-meta'));
+    const extras = state.jobs.filter(item => item.companion_of === row.id);
+    if (extras.length) info.append(el('span', `${extras.length} imagen${extras.length === 1 ? '' : 'es'} complementaria${extras.length === 1 ? '' : 's'}`, 'ticket-meta'));
     if (row.message) info.append(el('p', row.message, 'ticket-note'));
     const stateCell = el('td');
     const statusLabel = reading(row) ? 'Leyendo con ChatGPT' :

@@ -84,7 +84,7 @@ class ReceiptRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get(automatic)['auto_stage'], 'retry_read')
         self.assertNotEqual(self.store.get(issued)['auto_stage'], 'retry_read')
 
-    async def test_recovers_fiscal_destination_from_second_pdf_page_and_offers_alternatives(self):
+    async def test_original_second_page_overrides_invented_model_url(self):
         first = 'TIENDA DEMO\nFecha: 01/07/2026\nFolio: ABC123\nTOTAL $45.00'
         second = ('Para solicitar tu factura:\nrecibos.tienda.com.mx/portal\n'
                   'Sitio oficial: www.tienda.com.mx\nEncuesta: https://opinion.tienda.com.mx/inicio\n'
@@ -95,7 +95,7 @@ class ReceiptRetryTests(unittest.IsolatedAsyncioTestCase):
             await self.worker.step()
         row = self.store.get(key)
         self.assertEqual(row['receipt']['portal_url'], 'https://recibos.tienda.com.mx/portal')
-        self.assertEqual(row['status'], 'review')
+        self.assertEqual(row['status'], 'ready')
         self.assertFalse(self.runner.has_active_jobs())
         alternative = alternate_portal_note(row)
         self.assertIn('www.tienda.com.mx', alternative)

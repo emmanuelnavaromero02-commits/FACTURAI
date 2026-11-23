@@ -52,20 +52,23 @@ def review_questions(receipt: Receipt, *, confirmed_portal: bool = False) -> lis
     return errors
 
 
-def printed_portal_confirmed(row, receipt: Receipt) -> bool:
-    """Accept an unfamiliar portal only when the original and the model agree on one printed fiscal URL."""
+def printed_portal_confirmed(store, row, receipt: Receipt) -> bool:
+    """Accept one fiscal URL actually decoded from the original ticket."""
     if receipt.provider != CUSTOM_PORTAL or not public_portal_origin(receipt.portal_url):
         return False
-    try:
-        marked, _ = portal_evidence(Path(row['source_path']))
-    except (OSError, ValueError, RuntimeError, PyPdfError):
-        return False
-    return marked == [receipt.portal_url]
+    marked = []
+    for path in [Path(row['source_path']), *store.companion_paths(row['id'])]:
+        try:
+            links, _ = portal_evidence(path)
+            marked.extend(links)
+        except (OSError, ValueError, RuntimeError, PyPdfError):
+            continue
+    return list(dict.fromkeys(marked)) == [receipt.portal_url]
 
 
-def portal_confirmed(root, row, receipt: Receipt) -> bool:
-    return printed_portal_confirmed(row, receipt) or (
-        receipt.provider == CUSTOM_PORTAL and trusted_search_proof(root, row, receipt.portal_url))
+def portal_confirmed(store, row, receipt: Receipt) -> bool:
+    return printed_portal_confirmed(store, row, receipt) or (
+        receipt.provider == CUSTOM_PORTAL and trusted_search_proof(store.root, row, receipt.portal_url))
 
 
 def plain_words(value: str) -> str:
@@ -73,18 +76,54 @@ def plain_words(value: str) -> str:
     return ' '.join(re.findall(r'[a-z0-9]+', ''.join(c for c in plain if not unicodedata.combining(c))))
 
 
-def read_ticket(plan, row, automatic, root):
+def catalog_merchant_confirmed(item: dict, visible_text: str, extracted_merchant: str) -> bool:
+    """Corroborate a catalog brand in the original, including short station brands."""
+    visible = ' ' + plain_words(visible_text) + ' '
+    merchant = plain_words(extracted_merchant)
+    for issuer in item.get('issuer_rfcs', []):
+        if ' ' + plain_words(issuer) + ' ' in visible:
+            return True
+    for name in item['name'].split(' / '):
+        brand = plain_words(name)
+        if not brand or ' ' + brand + ' ' not in visible:
+            continue
+        if len(brand.replace(' ', '')) > 4:
+            return True
+        # A two-letter brand in a folio is not proof of the merchant. Require the
+        # model's fuller merchant name to appear on the original as well.
+        if merchant == brand and re.search(r'(?m)^\s*' + re.escape(brand) + r'\s*$',
+                                            '\n'.join(plain_words(line) for line in visible_text.splitlines())):
+            return True
+        brand_words = brand.split()
+        merchant_words = merchant.split()
+        if merchant_words[:len(brand_words)] == brand_words and len(merchant_words) > len(brand_words) and \
+                ' ' + ' '.join(merchant_words[:len(brand_words) + 1]) + ' ' in visible:
+            return True
+    return False
+
+
+def read_ticket(plan, row, automatic, root, companions=()):
     path = Path(row['source_path'])
-    result = AI(plan).extract(path, {k: v['name'] for k, v in CATALOG.items()})
+    result = AI(plan).extract(path, {k: v['name'] for k, v in CATALOG.items()}, list(companions))
+    page = {}
     if not result.is_receipt:
-        return None, False, 'El documento no se identificó como ticket de compra. ' + result.details, {}
+        # A reverse side may contain only the fiscal QR or URL. Keep it readable
+        # until the other images of this upload batch have been classified.
+        try:
+            page = read_local_page(path)
+        except (OSError, ValueError, RuntimeError, PyPdfError):
+            pass
+        fiscal_hint = ('factur' in (result.details + ' ' + page.get('text', '')).casefold()
+                       or bool(result.billing_url))
+        if (result.provider not in CATALOG or not result.merchant.strip() or not fiscal_hint
+                or result.amount or result.date or result.ticket_number or result.billing_codes):
+            return None, False, 'El documento no se identificó como ticket de compra. ' + result.details, {}
 
     try:
         date = Receipt.valid_date((result.date or '').strip())
     except ValueError:
         date = ''
     payment = row.get('confirmed_payment') or ''
-    page = {}
     if not payment:
         evidence = printed_payment(result.payment_evidence or '')
         if evidence and evidence == result.payment_code:
@@ -95,10 +134,13 @@ def read_ticket(plan, row, automatic, root):
                 payment = printed_payment(page['text'])
             except (ValueError, OSError, RuntimeError, PyPdfError):
                 pass
+    details = result.details
+    if 'factur' in page.get('text', '').casefold() and 'factur' not in details.casefold():
+        details = (details + ' El original incluye acceso a facturación.').strip()
     receipt = Receipt(provider=result.provider, merchant=result.merchant.strip(), amount=(result.amount or '').strip(),
                       date=date, ticket_number=(result.ticket_number or '').strip(),
                       billing_codes=[code.strip() for code in result.billing_codes if code.strip()],
-                      payment_code=payment, details=result.details, source=row['receipt']['source'])
+                      payment_code=payment, details=details, source=row['receipt']['source'])
     sources = {field:'vision_modelo' for field in ('provider','merchant','amount','date','ticket_number',
                'billing_codes','details') if getattr(receipt, field)}
     tools = ['vision_modelo']
@@ -108,11 +150,18 @@ def read_ticket(plan, row, automatic, root):
         sources['payment_code'] = 'vision_modelo_linea_pago'
     elif payment:
         sources['payment_code'] = 'lector_local'
-    try:
-        page = page or read_local_page(path)
-        marked, other = portal_evidence(path, page)
-    except (OSError, ValueError, RuntimeError, PyPdfError):
-        marked, other = [], []
+    marked, other = [], []
+    for original in [path, *companions]:
+        try:
+            original_page = page or read_local_page(path) if original == path else read_local_page(original)
+            if original == path:
+                page = original_page
+            links, options = portal_evidence(original, original_page)
+            marked.extend(links)
+            other.extend(options)
+        except (OSError, ValueError, RuntimeError, PyPdfError):
+            continue
+    marked, other = list(dict.fromkeys(marked)), list(dict.fromkeys(other))
     if page.get('method'):
         tools.append(page['method'])
     reported = getattr(result, 'billing_url', None)
@@ -162,8 +211,8 @@ def read_ticket(plan, row, automatic, root):
         uncertainties = [msg for msg in uncertainties if not re.fullmatch(
             r'(?:el ticket no (?:indica|especifica|muestra)|falta(?: confirmar)?|no (?:consta|se indica))\s+'
             r'(?:la )?forma de pago(?: confirmada)?[.!]?', msg.strip(), re.I)]
-    confirmed_portal = searched_and_verified or (receipt.provider == CUSTOM_PORTAL and len(marked) == 1 and
-                                                  marked[0] == receipt.portal_url and reported == receipt.portal_url)
+    confirmed_portal = searched_and_verified or (receipt.provider == CUSTOM_PORTAL and
+                                                  marked == [receipt.portal_url])
     if confirmed_portal:
         uncertainties = [message for message in uncertainties if not re.search(
             r'\b(?:portal|liga|enlace|direcci[oó]n|sitio de facturaci[oó]n)\b', message, re.I)]
@@ -175,10 +224,23 @@ def read_ticket(plan, row, automatic, root):
             page = page or read_local_page(path)
         except Exception:
             page = {}
-        content = ' ' + plain_words(page.get('text', '')) + ' '
         item = CATALOG[receipt.provider]
-        printed = any(' ' + plain_words(name) + ' ' in content
-                      for name in [*item['name'].split(' / '), *item.get('issuer_rfcs', [])])
+        visible_text = page.get('text', '')
+        for extra in companions:
+            try:
+                visible_text += '\n' + read_local_page(extra).get('text', '')
+            except (OSError, ValueError, RuntimeError, PyPdfError):
+                pass
+        printed = catalog_merchant_confirmed(item, visible_text, receipt.merchant)
+        if not printed and path.suffix.lower() != '.txt':
+            try:
+                rotated = read_local_page(path, rotation=180, force_ocr=True)
+                printed = catalog_merchant_confirmed(item, rotated.get('text', ''), receipt.merchant)
+                if printed:
+                    tools.append('ocr_giro_180')
+                    sources['provider'] = 'vision_modelo_y_ocr_giro_180'
+            except (OSError, ValueError, RuntimeError, PyPdfError):
+                pass
         links = portal_suggestions(page.get('codes', []), page.get('text', ''))
         unique_host = any([key for key in CATALOG if allowed_url(link, key)] == [receipt.provider] for link in links)
         if not printed and not unique_host:
@@ -249,7 +311,8 @@ class TicketAutomation:
             changed = {field:method for field in ('provider','merchant','amount','date','ticket_number',
                        'billing_codes','payment_code','portal_url') if getattr(receipt, field) != row['receipt'].get(field)}
             self.store.event(row['id'], 'fuentes_de_campos', json.dumps({'fields':changed,'tools':[method]}, ensure_ascii=False))
-        return saved
+        self.store.pair_batch_if_unique(row['id'])
+        return self.store.get(row['id'])
 
     async def analyze(self, key: str, automatic=False, offline=False):
         if not offline and self.plan_read_after > time.time():
@@ -262,13 +325,18 @@ class TicketAutomation:
             if offline:
                 return await self.read_offline(row, claim, reason='Lectura local',
                                                stage='offline' if automatic else 'review')
-            receipt, ready, note, provenance = await asyncio.to_thread(read_ticket, self.plan, row, automatic, self.store.root)
+            companions = self.store.companion_paths(key)
+            receipt, ready, note, provenance = await asyncio.to_thread(
+                read_ticket, self.plan, row, automatic, self.store.root, companions)
             if receipt is None:
-                return self.store.finish_read(key, claim, 'blocked', note)
+                self.store.finish_read(key, claim, 'blocked', note)
+                self.store.pair_batch_if_unique(key)
+                return self.store.get(key)
             saved = self.store.save_receipt(key, receipt, ready, claim=claim, note=note)
             if saved['receipt'] == receipt.model_dump():
                 self.store.event(key, 'fuentes_de_campos', json.dumps(provenance, ensure_ascii=False))
-            return saved
+            self.store.pair_batch_if_unique(key)
+            return self.store.get(key)
         except Exception as exc:
             note = str(exc) if isinstance(exc, PlanError) else 'No se pudo completar la lectura. Revisa el original o vuelve a leerlo.'
             stage, due = 'review', 0
@@ -301,8 +369,11 @@ class TicketAutomation:
 
     def _prepare(self, row):
         key = row['id']
+        if self.store.batch_unread(key):
+            self._set('reading', key, 'Esperando la lectura de las demás imágenes de esta carga.')
+            return False
         receipt = Receipt.model_validate(row['receipt'])
-        confirmed_portal = portal_confirmed(self.store.root, row, receipt)
+        confirmed_portal = portal_confirmed(self.store, row, receipt)
         questions = review_questions(receipt, confirmed_portal=confirmed_portal)
         if questions:
             message = ' '.join(questions)
@@ -335,7 +406,7 @@ class TicketAutomation:
         previous = self.store.auto_candidates('review')
         if previous:
             receipt = Receipt.model_validate(previous['receipt'])
-            questions = review_questions(receipt, confirmed_portal=portal_confirmed(self.store.root, previous, receipt))
+            questions = review_questions(receipt, confirmed_portal=portal_confirmed(self.store, previous, receipt))
             old_note = previous['message']
             if old_note and old_note not in ('Revisar datos extraídos', 'Datos extraídos; revisar antes de emitir'):
                 questions.append(old_note)

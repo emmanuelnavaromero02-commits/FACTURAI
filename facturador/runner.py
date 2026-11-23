@@ -10,7 +10,7 @@ import re
 import secrets
 import weakref
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 from playwright.async_api import Error as BrowserError
 
 from .ai import AI
@@ -26,10 +26,12 @@ from .models import Action, Profile, Receipt
 from .personal_browser import PersonalBrowser
 from .profile_lock import close_context, launch_chrome
 from .portals import capufe_proof, capufe_recipient, normalize
+from .ticket_lookup import prefill_ticket_lookup
 from .ticket_retry import FINAL, REOBSERVE, RecoveryRequested, may_have_issued, open_ticket_portal, recover_ticket, retry_action, ticket_in_result
 from .viewer import BrowserView
 
 ISSUE = re.compile(r'\b(facturar|emitir|timbrar|generar\s+(?:mi\s+)?(?:factura|cfdi)|solicitar\s+factura|enviar\s+(?:mi\s+)?(?:factura|cfdi)|s[ií] estoy seguro|confirmar (?:la )?emisi[oó]n)\b', re.I)
+EMISSION_PATH = re.compile(r'factur|invoice|invoic|cfdi|timbr|emisi|emit|creat|complet|generat|submit', re.I)
 FORBIDDEN = re.compile(r'\b(pagar|comprar|transferir|cancelar\s+factura|eliminar|borrar)\b', re.I)
 TERMS = re.compile(r'acepto|términos|terminos|condiciones|contrato|privacidad', re.I)
 CHALLENGE = re.compile(r'captcha|verificaci[oó]n de seguridad|no soy un robot', re.I)
@@ -130,6 +132,7 @@ class Runner:
         self.job_tasks: dict[str, asyncio.Task] = {}
         self.retries = asyncio.Lock()
         self.explicit_approval = set()
+        self.captcha_returned = set()
         self.downloads: set[asyncio.Task] = set()
         self.page_job = {}
         self.lost_pages = weakref.WeakSet()
@@ -204,6 +207,13 @@ class Runner:
                 return
             target = urlsplit(request.url)
             if target.netloc != urlsplit(pending['url']).netloc:
+                if request.method not in {'GET', 'HEAD', 'OPTIONS'} and not widget_origin(request.url):
+                    pending['uncertain_request'] = True
+                return
+            if (pending['kind'] == 'captcha' and request.method in {'GET', 'HEAD', 'OPTIONS'}
+                    and not EMISSION_PATH.search(target.path)):
+                # A solved challenge commonly redirects to another page of the
+                # same merchant. Reads alone do not prove an invoice was sent.
                 return
             # While helping with an account gate the operator may reach billing
             # themselves. Only known account endpoints are attributable to that gate.
@@ -533,19 +543,18 @@ class Runner:
         receipt = Receipt.model_validate(row['receipt'])
         if (not pending.get('challenge_seen') or page is not self.viewer.page or page.is_closed()
                 or page in self.lost_pages or self.page_job.get(page) != key or self.viewer.dialog
-                or page.url != pending['url'] or not allowed_url(page.url, receipt.provider, receipt.portal_url)):
+                or public_portal_origin(page.url) != public_portal_origin(pending['url'])
+                or not allowed_url(page.url, receipt.provider, receipt.portal_url)):
             return None
         try:
             snapshot = await page.locator('body').aria_snapshot(timeout=3000)
             if (not snapshot or ACCESS_DENIED.search(snapshot) or LOAD_FAILURE.search(snapshot)
-                    or await visible_challenge(page, snapshot) or page.url != pending['url']):
+                    or await visible_challenge(page, snapshot)):
                 return None
         except BrowserError:
             return None
         if SUCCESS.search(snapshot) or already_billed(snapshot):
             return 'recover' if ticket_in_result(snapshot, row, receipt) else None
-        if not FISCAL_INPUT.search(snapshot):
-            return None
         return 'recover' if may_have_issued(row) or pending.get('uncertain_request') else 'reobserve'
 
     async def release_control(self, channel):
@@ -563,6 +572,8 @@ class Runner:
             if pending['future'].done():
                 return
             self.explicit_approval.add(key)
+            if outcome == 'reobserve':
+                self.captcha_returned.add(key)
             self.store.event(key, 'captcha_reviewed', 'La verificación se completó en la pestaña del ticket. Se volvió a leer el estado del portal.')
             self.decide(key, 'recover' if pending.get('uncertain_request') else outcome)
 
@@ -660,7 +671,7 @@ class Runner:
         try:
             if page.is_closed() or page in self.lost_pages:
                 raise ValueError('Se cerró la página antes de iniciar la intervención.')
-            self.store.enter_intervention(key, kind, message, kind in MANUAL)
+            self.store.enter_intervention(key, kind, message, kind in MANUAL and kind != 'captcha')
             if (kind == 'captcha' and challenge_seen and self.engine == 'Google Chrome' and page in self.page_portal_origins):
                 for frame in page.frames[1:]:
                     await self.widgets.arm(frame)
@@ -705,10 +716,13 @@ class Runner:
             if kind == 'captcha' and pending.get('challenge_seen'):
                 outcome = await self.captcha_outcome(key, pending)
                 if not outcome:
-                    if pending['page'].is_closed() or pending['page'].url != pending['url'] or self.viewer.page is not pending['page']:
+                    if (pending['page'].is_closed() or self.viewer.page is not pending['page'] or
+                            public_portal_origin(pending['page'].url) != public_portal_origin(pending['url'])):
                         raise ValueError('El portal cambió de página. Detén el trámite y usa Recuperar comprobantes para comprobar el resultado.')
-                    raise ValueError('Completa la verificación en la misma página hasta que se muestre el formulario del ticket o su resultado.')
+                    raise ValueError('Completa la verificación hasta que el portal muestre el siguiente paso o su resultado.')
                 self.explicit_approval.add(key)
+                if outcome == 'reobserve':
+                    self.captcha_returned.add(key)
                 decision = outcome
             if kind in {'captcha', 'login', 'attachment'}:
                 page = self.viewer.page
@@ -757,6 +771,32 @@ class Runner:
         elif await locator.count() != 1:
             raise ValueError('La etiqueta no identifica un único control visible.')
         return locator
+
+    async def safe_continue_href(self, page, action: Action, receipt: Receipt) -> str | None:
+        """Navigate a plain same-origin link after CAPTCHA without running click handlers."""
+        target = action.target
+        if (action.kind != 'click' or not target or target.by != 'role' or target.role != 'link'
+                or not target.exact or target.name.strip().casefold() not in {'continuar', 'siguiente'}):
+            return None
+        try:
+            link = page.get_by_role('link', name=target.name, exact=True)
+            if await link.count() != 1 or not await link.is_visible():
+                return None
+            attributes = await link.evaluate("""a => ({href: a.getAttribute('href'),
+                download: a.hasAttribute('download'), target: a.hasAttribute('target'),
+                onclick: a.hasAttribute('onclick'), form: Boolean(a.closest('form'))})""")
+        except BrowserError:
+            return None
+        if (not attributes['href'] or attributes['download'] or attributes['target']
+                or attributes['onclick'] or attributes['form']):
+            return None
+        href = urljoin(page.url, attributes['href'])
+        parts = urlsplit(href)
+        if (parts.query or parts.fragment or parts.path in {'', '/'} or EMISSION_PATH.search(parts.path)
+                or public_portal_origin(href) != public_portal_origin(page.url)
+                or not allowed_url(href, receipt.provider, receipt.portal_url)):
+            return None
+        return href
 
     async def execute(self, page, action: Action, receipt: Receipt):
         if receipt.provider == CUSTOM_PORTAL and not allowed_url(page.url, receipt.provider, receipt.portal_url):
@@ -822,17 +862,16 @@ class Runner:
         row = self.store.get(key)
         if self.store.checked_preparation(key):
             raise RecoveryRequested()
-        if not (row['issue_attempted'] or row['issuance_seen'] or row['uuid']):
-            self.store.begin_emission(key, 'Operación manual en el navegador')
         await self.human(key, page, 'operator', 'El navegador es tuyo. Completa o consulta el trámite, descarga sus archivos y pulsa Terminar y cotejar.')
         if self.downloads:
             await asyncio.wait(list(self.downloads), timeout=12)
         if not await self.recover(key, profile):
             snapshot = await self.viewer.page.locator('body').aria_snapshot()
+            row = self.store.get(key)
             if SUCCESS.search(snapshot) or row['issuance_seen'] or row['uuid']:
                 self.store.confirm_issued(key)
             else:
-                self.store.update(key, status='uncertain', message='Sesión manual terminada. Recupera los comprobantes de este expediente.')
+                self.store.update(key, status='uncertain', message='Sesión manual terminada sin comprobante confirmado. Recupera el resultado antes de repetir.')
 
     async def run(self, key: str, profile: Profile, auto_issue: bool = False, manual: bool = False):
         async with self.lock:
@@ -885,6 +924,7 @@ class Runner:
             finally:
                 self.active_id = None
                 self.explicit_approval.discard(key)
+                self.captcha_returned.discard(key)
                 await self.viewer.set_manual(False)
 
     async def _session(self, key: str, profile: Profile, auto_issue: bool, manual: bool):
@@ -979,6 +1019,13 @@ class Runner:
                 if changed:
                     self.store.event(key, 'campo_verificado', 'Selección cotejada: ' + FISCAL_FIELDS[changed])
                     continue
+                try:
+                    lookup_field = await prefill_ticket_lookup(page, receipt.ticket_number)
+                except BrowserError:
+                    lookup_field = None
+                if lookup_field:
+                    self.store.event(key, 'campo_verificado', 'Dato del ticket cotejado: ' + lookup_field)
+                    continue
             # Accessibility snapshots include complete hrefs on separate /url: lines.
             model_snapshot = '\n'.join(line for line in snapshot.splitlines() if not line.lstrip().startswith('- /url:'))
             observation = json.dumps({'url': public_portal_origin(page.url), 'paso': number, 'emision_intentada': committed,
@@ -1035,6 +1082,15 @@ class Runner:
             preparing_capufe = (receipt.provider == 'capufe' and normalize(name) == 'FACTURAR CONCEPTOS' and
                                 action.kind == 'click' and not committed and not issued and
                                 urlsplit(page.url).path.rstrip('/').lower() == '/capufe/facturacionrapida')
+            if key in self.captcha_returned and risk == 'normal' and not committed and not issued:
+                href = await self.safe_continue_href(page, action, receipt)
+                if href:
+                    before_action = page.url, snapshot
+                    await page.goto(href, wait_until='domcontentloaded', timeout=18000)
+                    self.captcha_returned.discard(key)
+                    recent.append({'tipo':'goto','control':name[:120]})
+                    self.store.event(key, 'captcha_followed_link', 'Se abrió el enlace simple de continuación del mismo comercio.')
+                    continue
             if key in self.explicit_approval or self.store.checked_preparation(key):
                 if (not committed and not issued and risk != 'issue' and not preparing_capufe
                         and action.kind not in {'fill', 'select', 'wait', 'scroll'}

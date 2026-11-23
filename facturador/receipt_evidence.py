@@ -8,7 +8,7 @@ from pypdf.errors import PyPdfError
 
 from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, printed_portals, public_portal_origin
 from .local_reader import read_local_page
-from .models import Receipt, money
+from .models import Receipt, SAT_PAYMENT_ALIASES, SAT_PAYMENT_CODES, money
 
 
 def folded(text):
@@ -17,20 +17,26 @@ def folded(text):
 
 def printed_payment(text):
     codes = set()
+    label = (r'(?:FORMA\s+DE\s+PAGO|MEDIO\s+DE\s+PAGO|TIPO\s+(?:DE\s+)?OPER(?:ACION)?|'
+             r'PAGADO\s+(?:CON|EN)|PAGO(?:\s+CON|\s+EN)?)')
+    valid_codes = '|'.join(sorted(SAT_PAYMENT_CODES))
     for line in folded(text).splitlines():
         if re.search(r'\b(?:ACEPTAMOS|ACEPTADAS?|FORMAS DE PAGO DISPONIBLES|METODOS ACEPTADOS|PROMOCION|DESCUENTO)\b', line):
             continue
-        label = r'(?:FORMA\s+DE\s+PAGO|MEDIO\s+DE\s+PAGO|PAGADO\s+(?:CON|EN)|PAGO(?:\s+CON|\s+EN)?)'
-        code = re.search(r'\b' + label + r'\s*[:=-]?\s*(01|03|04|28)\b', line)
+        code = re.search(r'\b' + label + r'\s*[:=-]?\s*(' + valid_codes + r')\b', line)
         if code:
             codes.add(code[1])
         annotated = bool(re.search(r'\b' + label + r'\b', line))
-        for value, word in [('01', 'EFECTIVO'), ('04', 'CREDITO'), ('28', 'DEBITO'), ('03', 'TRANSFERENCIA')]:
-            if not re.search(r'\b' + word + r'\b', line):
-                continue
-            if annotated or re.search(r'^\s*(?:TARJETA\s+(?:DE\s+)?|VISA\s+|MASTERCARD\s+)?' +
-                                      word + r'\s*(?:$|[:$]|\d)', line):
-                codes.add(value)
+        for value, aliases in SAT_PAYMENT_ALIASES.items():
+            for alias in aliases:
+                word = folded(alias)
+                if not re.search(r'\b' + re.escape(word) + r'\b', line):
+                    continue
+                if annotated or (value in {'01','03','04','28'} and re.search(
+                        r'^\s*(?:TARJETA\s+(?:DE\s+)?|VISA\s+|MASTERCARD\s+)?' +
+                        re.escape(word) + r'\s*(?:$|[:$]|\d)', line)):
+                    codes.add(value)
+                    break
     return codes.pop() if len(codes) == 1 else ''
 
 

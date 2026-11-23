@@ -133,6 +133,13 @@ async def smoke():
                 </select></label>""")
             assert await fiscal_choices(page, PROFILE, TICKET, apply=True) == (None, ['forma de pago (04)'])
             assert not await page.evaluate('window.changed')
+            cheque = TICKET.model_copy(update={'payment_code':'02'})
+            await page.set_content("""<label>Forma de pago<select>
+                <option value=''>Seleccionar</option><option value='CASH'>Efectivo</option>
+                <option value='CHEQUE'>Cheque nominativo</option></select></label>""")
+            assert await fiscal_choices(page, PROFILE, cheque, apply=True) == ('payment', [])
+            assert await page.locator('select').input_value() == 'CHEQUE'
+            assert await fiscal_choices(page, PROFILE, cheque) == (None, [])
             await page.set_content('<label>Régimen fiscal del emisor<select><option>601</option>'
                                    '<option>612</option></select></label>')
             assert await fiscal_choices(page, PROFILE, TICKET, apply=True) == (None, [])

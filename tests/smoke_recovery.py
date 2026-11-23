@@ -136,7 +136,8 @@ async def smoke():
                     page = runner.viewer.page
                     await runner.continue_job(key, 'manual')
                     await pending(key, 'operator', task)
-                    assert runner.viewer.page is page and store.get(key)['issue_attempted']
+                    assert runner.viewer.page is page and store.get(key)['human_exposed']
+                    assert not store.get(key)['issue_attempted']
                     assert not store.queue(key, PROFILE)
                     receipt = RECEIPT.model_copy(update={'provider': 'prueba'})
                     await page.frame_locator('iframe').get_by_label('Pago').wait_for()

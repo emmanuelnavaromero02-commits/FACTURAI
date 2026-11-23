@@ -10,6 +10,27 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .catalog import CUSTOM_PORTAL, public_portal_origin
 
 
+# SAT Anexo 20, catCFDI.xsd/c_FormaPago. Keep the receipt, portal selector and
+# review form on the same set of two-character codes.
+SAT_PAYMENT_LABELS = {
+    '01': 'Efectivo', '02': 'Cheque nominativo', '03': 'Transferencia electrónica de fondos',
+    '04': 'Tarjeta de crédito', '05': 'Monedero electrónico', '06': 'Dinero electrónico',
+    '08': 'Vales de despensa', '12': 'Dación en pago', '13': 'Pago por subrogación',
+    '14': 'Pago por consignación', '15': 'Condonación', '17': 'Compensación',
+    '23': 'Novación', '24': 'Confusión', '25': 'Remisión de deuda',
+    '26': 'Prescripción o caducidad', '27': 'A satisfacción del acreedor',
+    '28': 'Tarjeta de débito', '29': 'Tarjeta de servicios',
+    '30': 'Aplicación de anticipos', '31': 'Intermediario de pagos', '99': 'Por definir',
+}
+SAT_PAYMENT_CODES = frozenset(SAT_PAYMENT_LABELS)
+SAT_PAYMENT_ALIASES = {code: (label,) for code, label in SAT_PAYMENT_LABELS.items()}
+SAT_PAYMENT_ALIASES.update({
+    '01': ('Efectivo',), '02': ('Cheque nominativo', 'Cheque'),
+    '03': ('Transferencia electrónica de fondos', 'Transferencia'),
+    '04': ('Tarjeta de crédito', 'Crédito'), '28': ('Tarjeta de débito', 'Débito'),
+})
+
+
 def money(value: str | int | Decimal) -> Decimal:
     if isinstance(value, float):
         raise ValueError("Usa texto decimal para importes; no float")
@@ -113,8 +134,8 @@ class Receipt(BaseModel):
     @field_validator("payment_code")
     @classmethod
     def valid_payment(cls, value: str) -> str:
-        if value and value not in {"01", "03", "04", "28", "99"}:
-            raise ValueError("Forma de pago no admitida en esta versión")
+        if value and value not in SAT_PAYMENT_CODES:
+            raise ValueError("Forma de pago fuera del catálogo SAT")
         return value
 
     def ready_errors(self) -> list[str]:
@@ -133,6 +154,8 @@ class Receipt(BaseModel):
             result.append("Falta número de ticket o código de facturación")
         if not self.payment_code:
             result.append("Falta forma de pago confirmada")
+        elif self.payment_code == '99':
+            result.append('La clave 99 no confirma cómo se pagó esta compra.')
         if not self.merchant:
             result.append("Falta comercio")
         return result

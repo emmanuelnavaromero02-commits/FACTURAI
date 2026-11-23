@@ -37,28 +37,28 @@ def validate_document(name: str, data: bytes) -> str:
     return mime
 
 
-def save_input(store: Store, name: str, data: bytes, source: str = "archivo") -> dict:
-    return save_inputs(store, [(name, data)], source)[0]
+def save_input(store: Store, name: str, data: bytes, source: str = "archivo", batch_id: str = '') -> dict:
+    return save_inputs(store, [(name, data)], source, batch_id=batch_id)[0]
 
 
-def save_inputs(store: Store, items: list[tuple[str, bytes]], source: str) -> list[dict]:
+def save_inputs(store: Store, items: list[tuple[str, bytes]], source: str, *, batch_id: str = '') -> list[dict]:
     for name, data in items:
         if Path(name).suffix.lower() == '.txt' and (source == 'Gmail' or source.startswith('EML: ')):
             if not data.strip() or len(data) > 256_000:
                 raise ValueError('El texto elegido está vacío o supera el límite.')
         else:
             validate_document(name, data)
-    return [_store_original(store, name, data, source) for name, data in items]
+    return [_store_original(store, name, data, source, batch_id) for name, data in items]
 
 
-def _store_original(store: Store, name: str, data: bytes, source: str) -> dict:
+def _store_original(store: Store, name: str, data: bytes, source: str, batch_id: str = '') -> dict:
     suffix = Path(name).suffix.lower()
     sha = hashlib.sha256(data).hexdigest()
     directory = store.root / "originales"
     directory.mkdir(exist_ok=True, mode=0o700)
     path = directory / (sha + suffix)
     write_original(path, data)
-    row, created = store.add(str(path), sha, source + ": " + Path(name).name[:100])
+    row, created = store.add(str(path), sha, source + ": " + Path(name).name[:100], batch_id=batch_id)
     return {"id": row["id"], "created": created, "status": row["status"]}
 
 
@@ -74,9 +74,9 @@ def write_original(path: Path, data: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def save_upload(store: Store, name: str, data: bytes, source: str = "archivo") -> list[dict]:
+def save_upload(store: Store, name: str, data: bytes, source: str = "archivo", batch_id: str = '') -> list[dict]:
     if Path(name).suffix.lower() != ".zip":
-        return [save_input(store, name, data, source)]
+        return [save_input(store, name, data, source, batch_id=batch_id)]
     if len(data) > MAX_UPLOAD:
         raise ValueError("ZIP supera 25 MB")
     result = []
@@ -87,5 +87,5 @@ def save_upload(store: Store, name: str, data: bytes, source: str = "archivo") -
         for member in members:
             if member.file_size > MAX_UPLOAD:
                 raise ValueError("Archivo del ZIP demasiado grande")
-            result.append(save_input(store, member.filename, archive.read(member), source + " / ZIP"))
+            result.append(save_input(store, member.filename, archive.read(member), source + " / ZIP", batch_id=batch_id))
     return result
