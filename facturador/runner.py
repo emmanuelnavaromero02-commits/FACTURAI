@@ -45,6 +45,8 @@ ALREADY_BILLED = re.compile(
     r'^(?:(?:el|este|su) )?(?:ticket|boleto|c[oó]digo|comprobante)(?: ingresado| [A-Z0-9]{18})? '
     r'ya (?:(?:fue|ha sido|est[áa]|se encuentra) )?facturad[oa]\b', re.I)
 RECOVERY_LINK = re.compile(r'\b(?:recuperar|consultar|reencontrar)\b.*\b(?:factura|cfdi|comprobante)\b', re.I)
+TESORO_HOME = re.compile(r'opciones de facturaci[oó]n', re.I)
+TESORO_SINGLE = re.compile(r'generar factura de estaci[oó]n y znak', re.I)
 
 
 def already_billed(snapshot: str) -> bool:
@@ -798,6 +800,50 @@ class Runner:
             return None
         return href
 
+    @staticmethod
+    def portal_entry_home(page, snapshot: str, receipt: Receipt) -> bool:
+        """The Tesoro menu is a navigation page, not the fiscal submission form."""
+        current = urlsplit(page.url)
+        return (receipt.provider == 'tesoro' and current.path in {'', '/'} and
+                not current.query and not current.fragment and
+                bool(TESORO_HOME.search(snapshot)) and bool(TESORO_SINGLE.search(snapshot)) and
+                not FISCAL_INPUT.search(snapshot) and not SUCCESS.search(snapshot) and
+                not already_billed(snapshot))
+
+    async def safe_portal_entry_href(self, page, action: Action, receipt: Receipt, snapshot: str) -> str | None:
+        """Open only the documented single-ticket Tesoro form by a plain same-origin GET."""
+        target = action.target
+        if (not self.portal_entry_home(page, snapshot, receipt) or action.kind != 'click' or
+                not target or target.by != 'role' or target.role != 'link' or not target.exact or
+                target.name.strip().casefold() not in {'continuar...', 'generar factura de estación y znak'}):
+            return None
+        try:
+            links = page.get_by_role('link', name=target.name, exact=True)
+            count = await links.count()
+            if not 1 <= count <= 16:
+                return None
+            matches = []
+            for index in range(count):
+                link = links.nth(index)
+                if not await link.is_visible():
+                    continue
+                attributes = await link.evaluate("""a => ({tag: a.tagName, href: a.getAttribute('href'),
+                    download: a.hasAttribute('download'), target: a.hasAttribute('target'),
+                    onclick: a.hasAttribute('onclick'), form: Boolean(a.closest('form'))})""")
+                if (attributes['tag'] != 'A' or not attributes['href'] or attributes['download'] or
+                        attributes['target'] or attributes['onclick'] or attributes['form']):
+                    continue
+                href = urljoin(page.url, attributes['href'])
+                parts = urlsplit(href)
+                if (parts.path != '/GenerarCFDI/Index' or parts.query != 'avanzada=0' or parts.fragment or
+                        public_portal_origin(href) != public_portal_origin(page.url) or
+                        not allowed_url(href, receipt.provider, receipt.portal_url)):
+                    continue
+                matches.append(href)
+            return matches[0] if len(matches) == 1 else None
+        except BrowserError:
+            return None
+
     async def execute(self, page, action: Action, receipt: Receipt):
         if receipt.provider == CUSTOM_PORTAL and not allowed_url(page.url, receipt.provider, receipt.portal_url):
             raise ValueError('La página cambió de dominio. Revisa el nuevo destino antes de continuar.')
@@ -1078,6 +1124,16 @@ class Runner:
                     return await self.manual_job(key, page, profile)
                 if decision == 'reobserve':
                     last_error = 'Lee otra vez los controles actuales. Sólo se permite preparar datos comprobados hasta la aprobación de emisión.'
+                continue
+            if not committed and not issued and self.portal_entry_home(page, snapshot, receipt) and action.kind == 'click' and action.target and action.target.by == 'role' and action.target.role == 'link':
+                href = await self.safe_portal_entry_href(page, action, receipt, snapshot)
+                if href:
+                    before_action = page.url, snapshot
+                    await page.goto(href, wait_until='domcontentloaded', timeout=18000)
+                    recent.append({'tipo': 'goto', 'control': name[:120]})
+                    self.store.event(key, 'portal_entry', 'Se abrió el formulario de un ticket del mismo comercio.')
+                    continue
+                await self.human(key, page, 'blocked', 'El enlace del menú no corresponde al formulario de un ticket verificado. Revisa el destino en el visor.')
                 continue
             preparing_capufe = (receipt.provider == 'capufe' and normalize(name) == 'FACTURAR CONCEPTOS' and
                                 action.kind == 'click' and not committed and not issued and

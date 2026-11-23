@@ -124,13 +124,15 @@ def payment_only_uncertainty(message: str) -> bool:
 
 
 _PORTAL_READABILITY_WORDS = set('''
-    a al aparece aparecen aparecio aqui como completa completo con codigo corresponde
+    a al alcanza aparece aparecen aparecio aqui como completa completo con codigo comprobar
+    comprobo corresponde
     carece de decodificar decodificada decodificado decodifico del direccion dominio el en enlace
     encuesta es esquema escanear escanearse esta estan extraer extraido factura facturacion
-    fiscal foto fue ha hay https http identificado identifica impresa impreso imprime imprimio
+    fiscal foto fotografia fotografias fue ha hay https http identificado identifica imagen
+    impresa impreso imprime imprimio
     indicar indicada indicado indica inferior junto la las leer leerse leyo legible liga link lo
-    logro muestra muestran no obtener obtuvo o omite omitido pagina partir pero por portal
-    posible prefijo protocolo puede pudo qr que se sin solo superior su texto ticket un una
+    logro muestra muestran no obtener obtuvo o omite omitido original pagina partir pero
+    poder por portal posible prefijo protocolo puede pudo qr que se sin solo superior su texto ticket un una
     url ve ver verificable verificada verificado verificar verifico visible visualmente www y
 '''.split())
 _PORTAL_PROTECTED_WORDS = set('''
@@ -158,8 +160,10 @@ def catalog_portal_only_uncertainty(message: str, provider: str) -> bool:
     # warning from disappearing merely because it also mentions QR or HTTPS.
     if not tokens <= _PORTAL_READABILITY_WORDS:
         return False
-    if {'qr', 'encuesta', 'corresponde'} <= tokens and 'no' not in tokens:
-        return True  # A separate survey QR is an observation, not a fiscal risk.
+    if {'qr', 'encuesta'} <= tokens and 'no' not in tokens:
+        if 'corresponde' in tokens or ({'inferior', 'superior', 'facturacion'} <= tokens
+                                         and tokens & {'identificado', 'identifica', 'es'}):
+            return True  # Separately labelled survey QR is an observation.
     absent = bool(tokens & {'no', 'sin', 'carece', 'omite', 'omitido'})
     if not absent:
         return False
@@ -170,6 +174,12 @@ def catalog_portal_only_uncertainty(message: str, provider: str) -> bool:
     if printed_hosts and tokens & {'protocolo', 'prefijo', 'esquema', 'https'}:
         return bool(tokens & {'impresa', 'impreso', 'imprime', 'imprimio', 'aparece',
                               'aparecen', 'muestra', 'muestran', 'dominio', 'direccion'})
+    if (tokens & {'url', 'liga', 'enlace', 'direccion'} and
+            tokens & {'facturacion', 'fiscal'} and
+            tokens & {'imagen', 'foto', 'fotografia', 'fotografias', 'ticket', 'original'} and
+            tokens & {'verificar', 'verifico', 'comprobar', 'comprobo', 'leer', 'leerse',
+                      'decodificar', 'obtener', 'extraer'}):
+        return True
     return (bool(tokens & {'liga', 'enlace', 'url', 'direccion'})
             and bool(tokens & {'impresa', 'impreso', 'texto', 'legible'})
             and bool(tokens & {'aparece', 'aparecen', 've', 'visible', 'leer', 'legible'}))

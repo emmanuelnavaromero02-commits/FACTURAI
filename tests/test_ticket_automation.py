@@ -31,6 +31,36 @@ def extracted(**changes):
 
 
 class UncertaintyReconciliationTests(unittest.TestCase):
+    def test_vianney_survey_qr_and_unreadable_fiscal_url_are_observations(self):
+        note = ('El QR inferior está identificado como el de facturación el superior es de la encuesta. '
+                'No se pudo verificar la URL de facturación a partir de la imagen.')
+        self.assertEqual(reconcile_uncertainties(
+            [note], payment_confirmed=False, catalog_provider='vianney',
+            custom_portal_confirmed=False), [])
+        self.assertEqual(reconcile_uncertainties(
+            [note], payment_confirmed=False, catalog_provider='',
+            custom_portal_confirmed=False), [note])
+
+    def test_survey_qr_and_fiscal_photo_wording_variations(self):
+        notes = ['El QR inferior es de facturación y el superior es de la encuesta.',
+                 'No fue posible leer la liga fiscal en la fotografía.']
+        self.assertEqual(reconcile_uncertainties(
+            notes, payment_confirmed=False, catalog_provider='vianney',
+            custom_portal_confirmed=False), [])
+
+    def test_photo_url_note_keeps_unrelated_fields_and_foreign_destination(self):
+        notes = [
+            'No se pudo verificar la URL de facturación a partir de la imagen y el importe no coincide.',
+            'No se pudo verificar la URL de facturación a partir de la imagen del otro comercio.',
+            'No se pudo verificar la URL de facturación a partir de la imagen; el folio está incompleto.',
+            'No se pudo verificar la URL de facturación a partir de la imagen y el RFC es distinto.',
+            'La URL otro-dominio.example de facturación no se pudo verificar en la imagen.',
+        ]
+        self.assertEqual(reconcile_uncertainties(
+            notes, payment_confirmed=False, catalog_provider='vianney',
+            custom_portal_confirmed=False), [notes[0], notes[1], 'el folio está incompleto.',
+                                             notes[3], notes[4]])
+
     def test_third_portal_wordings_are_readability_notes(self):
         examples = (
             ('tesoro', 'No se verificó una liga HTTPS en el código QR.'),
@@ -309,6 +339,16 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
         row = self.store.get(key)
         self.assertEqual(row['status'], 'review')
         self.assertIn('buzonfacturas.com', row['message'])
+
+    async def test_vianney_survey_qr_note_does_not_block_verified_receipt(self):
+        key = self.add(text='VIANNEY\nFOLIO PRUEBA-A\nTOTAL 40.50')
+        with patch('facturador.automation.AI.extract', return_value=extracted(
+                provider='vianney', merchant='Vianney', uncertainties=[
+                    'El QR inferior está identificado como el de facturación el superior es de la encuesta. '
+                    'No se pudo verificar la URL de facturación a partir de la imagen.'])):
+            await self.worker.step()
+        row = self.store.get(key)
+        self.assertEqual(row['status'], 'ready', row['message'])
 
     async def test_short_brand_in_folio_does_not_confirm_merchant(self):
         other = self.add(text='OTRO COMERCIO\nFOLIO BP 567')
