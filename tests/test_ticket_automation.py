@@ -48,6 +48,31 @@ class UncertaintyReconciliationTests(unittest.TestCase):
             notes, payment_confirmed=False, catalog_provider='vianney',
             custom_portal_confirmed=False), [])
 
+    def test_implicit_qr_link_fragment_after_clause_split(self):
+        note = ('No se pudo decodificar la URL del QR de facturación '
+                'y no aparece impresa en texto junto al código.')
+        self.assertEqual(reconcile_uncertainties(
+            [note], payment_confirmed=False, catalog_provider='vianney',
+            custom_portal_confirmed=False), [])
+        uncorroborated = reconcile_uncertainties(
+            [note], payment_confirmed=False, catalog_provider='',
+            custom_portal_confirmed=False)
+        self.assertEqual(len(uncorroborated), 1)
+        self.assertIn('No se pudo decodificar', uncorroborated[0])
+        self.assertIn('no aparece impresa', uncorroborated[0])
+        guarded = [
+            'no aparece impresa en texto junto al código del otro comercio.',
+            'no aparece impresa en texto junto al código; el importe no coincide.',
+            'no aparece impresa en texto junto al código; el folio no coincide.',
+            'no aparece impresa en texto junto al código; el RFC no coincide.',
+            'no aparece impresa en texto junto al código de otro-dominio.example.',
+        ]
+        self.assertEqual(reconcile_uncertainties(
+            guarded, payment_confirmed=False, catalog_provider='vianney',
+            custom_portal_confirmed=False), [guarded[0], 'el importe no coincide.',
+                                             'el folio no coincide.', 'el RFC no coincide.',
+                                             guarded[4]])
+
     def test_photo_url_note_keeps_unrelated_fields_and_foreign_destination(self):
         notes = [
             'No se pudo verificar la URL de facturación a partir de la imagen y el importe no coincide.',
@@ -346,6 +371,16 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
                 provider='vianney', merchant='Vianney', uncertainties=[
                     'El QR inferior está identificado como el de facturación el superior es de la encuesta. '
                     'No se pudo verificar la URL de facturación a partir de la imagen.'])):
+            await self.worker.step()
+        row = self.store.get(key)
+        self.assertEqual(row['status'], 'ready', row['message'])
+
+    async def test_vianney_implicit_qr_fragment_does_not_block_verified_receipt(self):
+        key = self.add(text='VIANNEY\nFOLIO PRUEBA-A\nTOTAL 40.50')
+        with patch('facturador.automation.AI.extract', return_value=extracted(
+                provider='vianney', merchant='Vianney', uncertainties=[
+                    'No se pudo decodificar la URL del QR de facturación '
+                    'y no aparece impresa en texto junto al código.'])):
             await self.worker.step()
         row = self.store.get(key)
         self.assertEqual(row['status'], 'ready', row['message'])

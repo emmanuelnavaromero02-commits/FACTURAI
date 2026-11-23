@@ -21,12 +21,12 @@ def click(role, name, risk='normal'):
 
 def home(first_href):
     return ('<h5>Opciones de facturación</h5>'
-            '<nav><a href="/GenerarCFDI/Index?avanzada=0">Generar factura de Estación y Znak</a></nav>'
+            '<nav><a href="/GenerarCFDI/Index?avanzada=0">&#xf571; Generar factura de Estación y Znak</a></nav>'
             '<div><h3>Generar factura de Estación y Znak</h3><p>Facture su nota de venta</p>'
-            f'<a href="{first_href}">Continuar...</a></div>'
+            f'<a href="{first_href}">Continuar... &#xf0a9;</a></div>'
             '<div><h3>Generar factura de Estación con múltiples tickets</h3>'
-            '<a href="/GenerarCFDI/Index?avanzada=1">Continuar...</a></div>'
-            '<div><h3>Descargar XML/PDF</h3><a href="/CFDI/Index">Continuar...</a></div>')
+            '<a href="/GenerarCFDI/Index?avanzada=1">Continuar... &#xf0a9;</a></div>'
+            '<div><h3>Descargar XML/PDF</h3><a href="/CFDI/Index">Continuar... &#xf0a9;</a></div>')
 
 
 async def smoke():
@@ -69,7 +69,7 @@ async def smoke():
             page = json.loads(observation)['estado_visible']
             if 'RFC receptor' in page:
                 return click('button', 'Facturar', 'issue')
-            return click('link', 'Continuar...')
+            return click('link', 'Continuar... \uf0a9')
 
         try:
             with patch.object(runner, 'start_browser', open_browser), patch('facturador.runner.AI.next_action', side_effect=infer):
@@ -81,15 +81,19 @@ async def smoke():
                     receipt = RECEIPT.model_copy(update={'provider': 'tesoro', 'billing_codes': [f'CODIGO{index}']})
                     store.save_receipt(key, receipt, ready=True)
                     runner.schedule(key, PROFILE)
-                    await pending(key, 'issue' if index == 0 else 'blocked')
+                    if index == 0:
+                        await pending(key, 'issue')
+                    else:
+                        await asyncio.wait_for(runner.job_tasks[key], 15)
                     page = runner.viewer.page
                     assert page.url == (origin+'/GenerarCFDI/Index?avanzada=0' if index == 0 else origin+'/')
-                    assert not store.get(key)['issue_attempted']
+                    assert not store.get(key)['issue_attempted'] and not store.get(key)['human_exposed']
+                    if index == 1:
+                        assert store.get(key)['status'] == 'blocked'
                     assert sum(event['kind'] == 'portal_entry' for event in store.events(key)) == (1 if index == 0 else 0)
                     if index == 0:
-                        assert not store.get(key)['human_exposed']
                         assert await page.get_by_label('RFC receptor').is_visible()
-                    await runner.stop(key)
+                        await runner.stop(key)
             print('OK Chrome: Tesoro abre sólo el formulario de un ticket y bloquea el enlace de emisión.')
         finally:
             await runner.close()

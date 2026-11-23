@@ -180,6 +180,12 @@ def catalog_portal_only_uncertainty(message: str, provider: str) -> bool:
             tokens & {'verificar', 'verifico', 'comprobar', 'comprobo', 'leer', 'leerse',
                       'decodificar', 'obtener', 'extraer'}):
         return True
+    # A QR note may be split at "y no" after its preceding clause established
+    # that the implied feminine noun is the fiscal URL. This fragment only says
+    # that the link is not also printed next to the code.
+    if re.fullmatch(r'no aparece impresa (?:en|como) texto junto al (?:codigo|qr)',
+                    plain_words(message)):
+        return True
     return (bool(tokens & {'liga', 'enlace', 'url', 'direccion'})
             and bool(tokens & {'impresa', 'impreso', 'texto', 'legible'})
             and bool(tokens & {'aparece', 'aparecen', 've', 'visible', 'leer', 'legible'}))

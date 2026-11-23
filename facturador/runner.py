@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import weakref
+import unicodedata
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 from playwright.async_api import Error as BrowserError
@@ -813,9 +814,14 @@ class Runner:
     async def safe_portal_entry_href(self, page, action: Action, receipt: Receipt, snapshot: str) -> str | None:
         """Open only the documented single-ticket Tesoro form by a plain same-origin GET."""
         target = action.target
+        # The live site's Font Awesome icons are part of Playwright's accessible
+        # link name (for example, "Continuar... \uf0a9"). Keep the exact locator
+        # below, but ignore those private-use glyphs when classifying its label.
+        label = ' '.join(''.join(char for char in (target.name if target else '')
+                                 if unicodedata.category(char) != 'Co').split()).casefold()
         if (not self.portal_entry_home(page, snapshot, receipt) or action.kind != 'click' or
                 not target or target.by != 'role' or target.role != 'link' or not target.exact or
-                target.name.strip().casefold() not in {'continuar...', 'generar factura de estación y znak'}):
+                label not in {'continuar...', 'generar factura de estación y znak'}):
             return None
         try:
             links = page.get_by_role('link', name=target.name, exact=True)
@@ -1133,8 +1139,7 @@ class Runner:
                     recent.append({'tipo': 'goto', 'control': name[:120]})
                     self.store.event(key, 'portal_entry', 'Se abrió el formulario de un ticket del mismo comercio.')
                     continue
-                await self.human(key, page, 'blocked', 'El enlace del menú no corresponde al formulario de un ticket verificado. Revisa el destino en el visor.')
-                continue
+                raise ValueError('El enlace del menú no corresponde al formulario de un ticket verificado. Revisa el destino en el visor.')
             preparing_capufe = (receipt.provider == 'capufe' and normalize(name) == 'FACTURAR CONCEPTOS' and
                                 action.kind == 'click' and not committed and not issued and
                                 urlsplit(page.url).path.rstrip('/').lower() == '/capufe/facturacionrapida')
