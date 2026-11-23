@@ -31,6 +31,41 @@ def extracted(**changes):
 
 
 class UncertaintyReconciliationTests(unittest.TestCase):
+    def test_new_tesoro_semicolon_resolves_only_corroborated_portal_clauses(self):
+        note = ('El ticket imprime el dominio buzonfacturas.com sin el prefijo HTTPS; '
+                'no se verificó la URL completa del código QR. '
+                'El importe no coincide con el total del ticket.')
+        self.assertEqual(reconcile_uncertainties(
+            [note], payment_confirmed=True, catalog_provider='tesoro',
+            custom_portal_confirmed=False), ['El importe no coincide con el total del ticket.'])
+
+    def test_new_bp_protocol_note_requires_catalog_host(self):
+        note = ('La dirección de facturación está impresa como '
+                'www.facturacion.grupocentra.mx, sin el prefijo de protocolo.')
+        self.assertEqual(reconcile_uncertainties(
+            [note], payment_confirmed=False, catalog_provider='bp',
+            custom_portal_confirmed=False), [])
+        changed = note.replace('www.facturacion.grupocentra.mx', 'otro-dominio.example')
+        self.assertEqual(reconcile_uncertainties(
+            [changed], payment_confirmed=False, catalog_provider='bp',
+            custom_portal_confirmed=False), [changed])
+
+    def test_new_vianney_payment_and_qr_clauses_keep_rfc_warning(self):
+        note = ('La línea de pago no indica si la tarjeta fue de crédito o de débito, '
+                'por lo que no se asigna una clave SAT. '
+                'No se pudo verificar la liga HTTPS del QR de facturación y no se ve '
+                'una liga de facturación impresa. '
+                'El RFC del emisor no coincide con el del comercio.')
+        self.assertEqual(reconcile_uncertainties(
+            [note], payment_confirmed=True, catalog_provider='vianney',
+            custom_portal_confirmed=False), ['El RFC del emisor no coincide con el del comercio.'])
+        retained = reconcile_uncertainties(
+            [note], payment_confirmed=False, catalog_provider='vianney',
+            custom_portal_confirmed=False)
+        self.assertEqual(retained, ['La línea de pago no indica si la tarjeta fue de crédito o de débito, '
+                                    'por lo que no se asigna una clave SAT. '
+                                    'El RFC del emisor no coincide con el del comercio.'])
+
     def test_verified_catalog_and_payment_resolve_only_their_own_sentences(self):
         paragraph = (
             'La línea de pago indica terminal inalámbrica, pero no distingue entre tarjeta de crédito y de débito. '

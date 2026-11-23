@@ -103,13 +103,14 @@ def catalog_merchant_confirmed(item: dict, visible_text: str, extracted_merchant
 
 
 _PAYMENT_UNCERTAINTY_WORDS = set('''
-    a al ambas ambos aparece aparecen claramente con confirma confirmada confirmado confirmar
-    consta credito cual cuando de debito del determina determinar distingue distinguir el en
+    a al ambas ambos aparece aparecen asigna asignada asignado asignar clave claramente con
+    confirma confirmada confirmado confirmar consta credito cual cuando de debito del determina
+    determinar distingue distinguir el en
     entre es esta estan efectivo especifica especificado fue fueron foto forma falta identificada
     identificado identificar imagen indica indicar informacion inalambrica la las lector linea
-    lo medio metodo muestra no observada observado original pago pagado pero por puede pudo que
+    lo medio metodo muestra no o observada observado original pago pagado pero por puede pudo que
     recibo se ser si sin tarjeta tarjetas terminal ticket tipo una un usado usada utiliza
-    utilizada utilizado ve ver visualmente y
+    utilizada utilizado ve ver visualmente y sat
 '''.split())
 
 
@@ -131,12 +132,17 @@ def catalog_portal_only_uncertainty(message: str, provider: str) -> bool:
     if any(host.removeprefix('www.') not in expected_hosts for host in printed_hosts):
         return False
     words = plain_words(message)
-    if re.search(r'\b(?:diferente|distinto|coincide|inseguro|sospechoso|redirige|importe|folio|rfc|identidad)\b', words):
+    if re.search(r'\b(?:diferente|distinto|coincide|inseguro|sospechoso|redirige|importe|monto|total|folio|rfc|identidad|fecha|cliente)\b', words):
         return False
-    return bool(any(re.fullmatch(pattern, words) for pattern in (
-        r'(?:el ticket imprime el dominio|se imprime el dominio) [a-z0-9 ]+ sin (?:el )?(?:esquema|prefijo|protocolo) https',
-        r'el portal de facturacion aparece impreso como [a-z0-9 ]+ sin (?:el )?(?:esquema|prefijo|protocolo) https',
+    prefix_note = bool(printed_hosts and re.fullmatch(
+        r'(?:el ticket imprime el dominio|se imprime el dominio|'
+        r'el portal de facturacion aparece impreso como|la direccion de facturacion esta impresa como) '
+        r'[a-z0-9 ]+ sin (?:el )?(?:esquema|prefijo|protocolo)(?: de protocolo)?(?: https)?', words))
+    return prefix_note or bool(any(re.fullmatch(pattern, words) for pattern in (
         r'no se pudo verificar una liga https a partir del qr',
+        r'no se verifico la url completa del codigo qr',
+        r'no se pudo verificar la liga https del qr de facturacion',
+        r'no se ve una liga de facturacion impresa',
         r'el qr (?:inferior|de facturacion) esta identificado como el de facturacion pero no se pudo decodificar su url',
         r'el qr superior corresponde a una encuesta',
         r'(?:el )?(?:codigo )?qr (?:de facturacion )?no se pudo (?:leer|decodificar)',
@@ -154,13 +160,13 @@ def reconcile_uncertainties(messages: list[str], *, payment_confirmed: bool,
                             catalog_provider: str, custom_portal_confirmed: bool) -> list[str]:
     remaining = []
     for message in messages:
-        # The model can put payment, fiscal QR, and other observations in one
-        # paragraph. Remove only individually resolved sentences.
-        sentences = re.split(r'(?<=[.!?])\s+', message.strip())
-        kept = [sentence for sentence in sentences if not (
-            (payment_confirmed and payment_only_uncertainty(sentence)) or
-            (catalog_provider and catalog_portal_only_uncertainty(sentence, catalog_provider)) or
-            (custom_portal_confirmed and missing_portal_only_uncertainty(sentence)))]
+        # A model paragraph can mix payment, QR, and protected-field doubts.
+        # Split semicolons and "y no ..." clauses without splitting "crédito y débito".
+        clauses = re.split(r'(?<=[.!?;])\s+|\s+y\s+(?=no\s)', message.strip(), flags=re.I)
+        kept = [clause.strip().rstrip(';') for clause in clauses if not (
+            (payment_confirmed and payment_only_uncertainty(clause)) or
+            (catalog_provider and catalog_portal_only_uncertainty(clause, catalog_provider)) or
+            (custom_portal_confirmed and missing_portal_only_uncertainty(clause)))]
         if kept:
             remaining.append(' '.join(kept))
     return remaining
