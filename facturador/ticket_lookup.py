@@ -1,10 +1,16 @@
 """Fill a clearly split series/ticket lookup when a portal's table inputs lack labels."""
 import re
+from urllib.parse import urljoin, urlsplit
+
+from .catalog import allowed_url
+from .models import Receipt
 
 
 SERIES_AND_TICKET = re.compile(r'^\s*([A-Z][A-Z0-9-]{0,9})\s*/\s*([0-9][0-9,. -]{0,14})\s*$', re.I)
 GROUPED_DIGITS = re.compile(r'^\d{1,3}(?:,\d{3})+$')
 TEXT_INPUT = 'input[type="text"]:visible, input:not([type]):visible, input[type="number"]:visible'
+TESORO_CODE = re.compile(r'[A-Z0-9]{8,24}')
+TESORO_PATH = '/GenerarCFDI/DatosTicket'
 
 
 def split_series_ticket(value: str) -> tuple[str, str] | None:
@@ -62,3 +68,57 @@ async def prefill_ticket_lookup(page, ticket_number: str) -> str | None:
             await field.fill(expected, timeout=1500)
             return kind if await field.input_value() == expected else None
     return None
+
+
+async def prepare_tesoro_lookup(page, receipt: Receipt, *, verify_attempted: bool = False) -> str | None:
+    """Fill and verify one printed code in Tesoro's lookup form, never its issue button.
+
+    The live form posts distinct `btn` values for `VerificarCodigo` and
+    `GenerarFactura`. Only the former may be submitted here, once per session.
+    """
+    if (receipt.provider != 'tesoro' or verify_attempted or
+            len(receipt.billing_codes) != 1 or
+            not allowed_url(page.url, 'tesoro') or urlsplit(page.url).path != TESORO_PATH):
+        return None
+    code = receipt.billing_codes[0].strip()
+    if not TESORO_CODE.fullmatch(code):
+        return None
+    field = page.locator('input#CodigoFacturacion')
+    if await field.count() != 1 or not await field.is_visible() or not await field.is_editable():
+        return None
+    metadata = await field.evaluate("""input => ({
+      type: input.type, name: input.name,
+      label: input.closest('.form-group')?.querySelector('label')?.textContent?.trim() || '',
+      method: input.form?.method || '', action: input.form?.getAttribute('action') || '',
+      verified: input.form?.querySelector('input#CodigoVerificado')?.value || ''
+    })""")
+    form_url = urljoin(page.url, metadata['action'])
+    if (metadata['type'] != 'text' or metadata['name'] != 'CodigoFacturacion' or
+            metadata['label'].casefold() != 'código facturación' or
+            metadata['method'].casefold() != 'post' or
+            urlsplit(form_url).path != TESORO_PATH or
+            not allowed_url(form_url, 'tesoro') or metadata['verified'].casefold() != 'false'):
+        return None
+    # The lookup action only validates the code; the separately named
+    # GenerarFactura action is intentionally untouched until emission approval.
+    verify = page.locator('button#btnVerificar')
+    issue = page.locator('button[name="btn"][value="GenerarFactura"]')
+    if (await verify.count() != 1 or await issue.count() != 1 or
+            not await verify.is_visible() or not await verify.is_enabled() or
+            await issue.is_enabled()):
+        return None
+    button = await verify.evaluate("""button => ({
+      type: button.type, name: button.name, value: button.value,
+      sameForm: button.form?.querySelector('input#CodigoFacturacion') ===
+                document.querySelector('input#CodigoFacturacion')
+    })""")
+    if button != {'type': 'submit', 'name': 'btn', 'value': 'VerificarCodigo', 'sameForm': True}:
+        return None
+    current = await field.input_value()
+    if current and current != code:
+        return None
+    if not current:
+        await field.fill(code, timeout=1500)
+        return 'Código facturación' if await field.input_value() == code else None
+    await verify.click(timeout=12000)
+    return 'Verificación del código de facturación'

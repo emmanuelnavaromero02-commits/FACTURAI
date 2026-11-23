@@ -17,6 +17,7 @@ from playwright.async_api import Error as BrowserError
 from .ai import AI
 from .account_flow import PortalAccountFlow, SECRET_SCREEN
 from .auth import ChatGPTPlan, PlanError
+from .brand_entry import enter_bp_franchise, BP_HOME
 from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, provider_for_url, public_portal_origin, resolves_publicly
 from .captcha_transport import WidgetTransport, widget_origin
 from .cfdi import UUID_RE
@@ -27,9 +28,11 @@ from .models import Action, Profile, Receipt
 from .personal_browser import PersonalBrowser
 from .profile_lock import close_context, launch_chrome
 from .portals import capufe_proof, capufe_recipient, normalize
-from .ticket_lookup import prefill_ticket_lookup
+from .ticket_lookup import prefill_ticket_lookup, prepare_tesoro_lookup
 from .ticket_retry import FINAL, REOBSERVE, RecoveryRequested, may_have_issued, open_ticket_portal, recover_ticket, retry_action, ticket_in_result
+from .tesoro_recipient import tesoro_recipient
 from .viewer import BrowserView
+from .vianney_consulta import lookup_rejected, recover_vianney_consulta
 
 ISSUE = re.compile(r'\b(facturar|emitir|timbrar|generar\s+(?:mi\s+)?(?:factura|cfdi)|solicitar\s+factura|enviar\s+(?:mi\s+)?(?:factura|cfdi)|s[ií] estoy seguro|confirmar (?:la )?emisi[oó]n)\b', re.I)
 EMISSION_PATH = re.compile(r'factur|invoice|invoic|cfdi|timbr|emisi|emit|creat|complet|generat|submit', re.I)
@@ -1012,6 +1015,8 @@ class Runner:
         reobserved = set()
         last_error = ''
         before_action = None
+        tesoro_lookup_attempted = False
+        bp_entry_attempted = False
         accounts = PortalAccountFlow(self.store.root, provider['url'], profile, key,
                                      progress=lambda message: self.store.running_message(key, message))
         for number in range(65):
@@ -1022,6 +1027,14 @@ class Runner:
             if page.is_closed() or not allowed_url(page.url, receipt.provider, receipt.portal_url):
                 raise ValueError('El portal se cerró o cambió a un dominio distinto del autorizado.')
             snapshot = await page.locator('body').aria_snapshot()
+            if (receipt.provider == 'vianney' and not committed and not issued
+                    and any(item.get('control', '').casefold() == 'siguiente' for item in recent)):
+                rejected = lookup_rejected(snapshot)
+                if rejected:
+                    self.store.event(key, 'ticket_lookup_rejected', rejected)
+                    if await recover_vianney_consulta(self, page, key, profile, receipt):
+                        return
+                    raise ValueError(rejected + ' La consulta de comprobantes no devolvió un PDF y XML cotejables.')
             if before_action is not None and recent:
                 recent[-1]['cambio_visible'] = before_action != (page.url, snapshot)
                 before_action = None
@@ -1058,6 +1071,28 @@ class Runner:
                 continue
             pending_fields = []
             if not committed and not issued:
+                if (receipt.provider == 'bp' and not bp_entry_attempted and
+                        urlsplit(page.url).path.rstrip('/') == BP_HOME):
+                    bp_entry_attempted = True
+                    prior_url = page.url
+                    try:
+                        bp_entered = await enter_bp_franchise(page, receipt, snapshot)
+                    except BrowserError as exc:
+                        raise ValueError('La portada BP no confirmó la selección de la franquicia. Reintenta el ticket.') from exc
+                    if bp_entered:
+                        before_action = prior_url, snapshot
+                        recent.append({'tipo': 'click', 'control': 'Franquicia BP'})
+                        self.store.event(key, 'brand_entry', 'Se abrió el formulario de la franquicia BP verificada.')
+                        continue
+                tesoro_pending = []
+                if receipt.provider == 'tesoro':
+                    try:
+                        tesoro_changed, tesoro_pending = await tesoro_recipient(page, profile, apply=True)
+                    except BrowserError:
+                        tesoro_changed, tesoro_pending = None, ['ficha fiscal del receptor']
+                    if tesoro_changed:
+                        self.store.event(key, 'campo_verificado', 'Campo fiscal cotejado: ' + tesoro_changed)
+                        continue
                 if (receipt.provider == 'capufe' and
                         urlsplit(page.url).path.rstrip('/').lower() == '/capufe/facturacionrapida'):
                     try:
@@ -1068,6 +1103,7 @@ class Runner:
                         self.store.event(key, 'campo_verificado', 'Campo cotejado: ' + field)
                         continue
                 changed, pending_fields = await fiscal_choices(page, profile, receipt, apply=True)
+                pending_fields = tesoro_pending + pending_fields
                 if changed:
                     self.store.event(key, 'campo_verificado', 'Selección cotejada: ' + FISCAL_FIELDS[changed])
                     continue
@@ -1077,6 +1113,19 @@ class Runner:
                     lookup_field = None
                 if lookup_field:
                     self.store.event(key, 'campo_verificado', 'Dato del ticket cotejado: ' + lookup_field)
+                    continue
+                try:
+                    tesoro_field = await prepare_tesoro_lookup(
+                        page, receipt, verify_attempted=tesoro_lookup_attempted)
+                except BrowserError:
+                    # A validation POST may have reached the portal before Chrome
+                    # reported a navigation error. Never repeat it automatically.
+                    tesoro_lookup_attempted = True
+                    tesoro_field = None
+                if tesoro_field:
+                    if tesoro_field.startswith('Verificación'):
+                        tesoro_lookup_attempted = True
+                    self.store.event(key, 'campo_verificado', 'Dato del ticket cotejado: ' + tesoro_field)
                     continue
             # Accessibility snapshots include complete hrefs on separate /url: lines.
             model_snapshot = '\n'.join(line for line in snapshot.splitlines() if not line.lstrip().startswith('- /url:'))
@@ -1131,6 +1180,17 @@ class Runner:
                 if decision == 'reobserve':
                     last_error = 'Lee otra vez los controles actuales. Sólo se permite preparar datos comprobados hasta la aprobación de emisión.'
                 continue
+            if (receipt.provider == 'tesoro' and action.kind == 'click' and
+                    normalize(''.join(char for char in name if unicodedata.category(char) != 'Co'))
+                    == 'GUARDAR Y CONTINUAR' and
+                    urlsplit(page.url).path.rstrip('/') == '/GenerarCFDI'):
+                _, unresolved = await tesoro_recipient(page, profile)
+                if unresolved:
+                    last_error = 'Antes de guardar el receptor faltan: ' + ', '.join(unresolved) + '.'
+                    if recent and recent[-1].get('bloqueo') == last_error:
+                        raise ValueError(last_error)
+                    recent.append({'bloqueo': last_error})
+                    continue
             if not committed and not issued and self.portal_entry_home(page, snapshot, receipt) and action.kind == 'click' and action.target and action.target.by == 'role' and action.target.role == 'link':
                 href = await self.safe_portal_entry_href(page, action, receipt, snapshot)
                 if href:
