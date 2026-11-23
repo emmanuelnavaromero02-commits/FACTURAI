@@ -31,6 +31,43 @@ def extracted(**changes):
 
 
 class UncertaintyReconciliationTests(unittest.TestCase):
+    def test_third_portal_wordings_are_readability_notes(self):
+        examples = (
+            ('tesoro', 'No se verificó una liga HTTPS en el código QR.'),
+            ('bp', 'La dirección de facturación está impresa como '
+                   'www.facturacion.grupocentra.mx, sin indicar el protocolo.'),
+            ('vianney', 'No se pudo decodificar la liga HTTPS del QR de facturación '
+                        'no aparece impresa como texto.'),
+        )
+        for provider, note in examples:
+            with self.subTest(provider=provider):
+                self.assertEqual(reconcile_uncertainties(
+                    [note], payment_confirmed=False, catalog_provider=provider,
+                    custom_portal_confirmed=False), [])
+                self.assertEqual(reconcile_uncertainties(
+                    [note], payment_confirmed=False, catalog_provider='',
+                    custom_portal_confirmed=False), [note])
+
+    def test_readability_family_preserves_other_commerce_and_field_disagreements(self):
+        notes = [
+            'La dirección de facturación está impresa como otro-dominio.example, sin indicar el protocolo.',
+            'No se verificó una liga HTTPS en el código QR de otro comercio.',
+            'No se verificó una liga HTTPS en el código QR y el folio no coincide.',
+            'No se pudo decodificar el QR porque el importe no coincide.',
+            'No se pudo leer el QR y el RFC del emisor es distinto.',
+        ]
+        self.assertEqual(reconcile_uncertainties(
+            notes, payment_confirmed=False, catalog_provider='bp',
+            custom_portal_confirmed=False), notes)
+
+    def test_qr_readability_variations_without_other_subjects(self):
+        notes = ['No fue posible leer el código QR de facturación.',
+                 'La URL del QR no es legible en la foto.',
+                 'El dominio buzonfacturas.com omite el protocolo HTTPS.']
+        self.assertEqual(reconcile_uncertainties(
+            notes, payment_confirmed=False, catalog_provider='tesoro',
+            custom_portal_confirmed=False), [])
+
     def test_new_tesoro_semicolon_resolves_only_corroborated_portal_clauses(self):
         note = ('El ticket imprime el dominio buzonfacturas.com sin el prefijo HTTPS; '
                 'no se verificó la URL completa del código QR. '
@@ -252,6 +289,26 @@ class TicketAutomationTests(unittest.IsolatedAsyncioTestCase):
                     'sin prefijo HTTPS.'])):
             await self.worker.step()
         self.assertEqual(self.store.get(key)['status'], 'ready')
+
+    async def test_local_catalog_host_resolves_qr_note_when_brand_ocr_is_missing(self):
+        key = self.add(text='FOLIO PRUEBA-A\nFACTURACIÓN EN https://buzonfacturas.com/')
+        with patch('facturador.automation.AI.extract', return_value=extracted(
+                provider='tesoro', merchant='Tesoro', uncertainties=[
+                    'No se verificó una liga HTTPS en el código QR.'])):
+            await self.worker.step()
+        row = self.store.get(key)
+        self.assertEqual(row['status'], 'ready', row['message'])
+        self.assertEqual(row['receipt']['provider'], 'tesoro')
+
+    async def test_model_mentioned_catalog_host_does_not_confirm_unread_original(self):
+        key = self.add(text='OTRO COMERCIO\nFOLIO PRUEBA-A')
+        with patch('facturador.automation.AI.extract', return_value=extracted(
+                provider='tesoro', merchant='Tesoro', uncertainties=[
+                    'El dominio buzonfacturas.com omite el protocolo HTTPS.'])):
+            await self.worker.step()
+        row = self.store.get(key)
+        self.assertEqual(row['status'], 'review')
+        self.assertIn('buzonfacturas.com', row['message'])
 
     async def test_short_brand_in_folio_does_not_confirm_merchant(self):
         other = self.add(text='OTRO COMERCIO\nFOLIO BP 567')

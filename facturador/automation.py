@@ -123,30 +123,56 @@ def payment_only_uncertainty(message: str) -> bool:
             and bool(set(words) & {'no', 'falta', 'sin', 'distingue', 'confirmar', 'determinar'}))
 
 
+_PORTAL_READABILITY_WORDS = set('''
+    a al aparece aparecen aparecio aqui como completa completo con codigo corresponde
+    carece de decodificar decodificada decodificado decodifico del direccion dominio el en enlace
+    encuesta es esquema escanear escanearse esta estan extraer extraido factura facturacion
+    fiscal foto fue ha hay https http identificado identifica impresa impreso imprime imprimio
+    indicar indicada indicado indica inferior junto la las leer leerse leyo legible liga link lo
+    logro muestra muestran no obtener obtuvo o omite omitido pagina partir pero por portal
+    posible prefijo protocolo puede pudo qr que se sin solo superior su texto ticket un una
+    url ve ver verificable verificada verificado verificar verifico visible visualmente www y
+'''.split())
+_PORTAL_PROTECTED_WORDS = set('''
+    apocrifo banco cliente comercio distinto distinta diferentes diferente discrepancia
+    destino emisor erroneo erronea falsificado fecha folio identidad importe incorrecto
+    incorrecta marca monto oficial otro otra precio receptor redirige rfc serie sospechoso
+    sospechosa tercero total
+'''.split())
+
+
 def catalog_portal_only_uncertainty(message: str, provider: str) -> bool:
-    """Recognize readability notes about HTTPS/QR, not mismatched destinations."""
+    """Discard only QR/scheme readability notes for a corroborated catalog merchant."""
     if provider not in CATALOG:
         return False
     expected_hosts = {host.removeprefix('www.') for host in CATALOG[provider]['hosts']}
-    printed_hosts = re.findall(r'\b(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+\b', message.casefold())
+    domain = r'\b(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+\b'
+    printed_hosts = re.findall(domain, message.casefold())
     if any(host.removeprefix('www.') not in expected_hosts for host in printed_hosts):
         return False
-    words = plain_words(message)
-    if re.search(r'\b(?:diferente|distinto|coincide|inseguro|sospechoso|redirige|importe|monto|total|folio|rfc|identidad|fecha|cliente)\b', words):
+    words = plain_words(re.sub(domain, 'dominio', message.casefold())).split()
+    tokens = set(words)
+    if not tokens or tokens & _PORTAL_PROTECTED_WORDS or 'coincide' in tokens or 'coinciden' in tokens:
         return False
-    prefix_note = bool(printed_hosts and re.fullmatch(
-        r'(?:el ticket imprime el dominio|se imprime el dominio|'
-        r'el portal de facturacion aparece impreso como|la direccion de facturacion esta impresa como) '
-        r'[a-z0-9 ]+ sin (?:el )?(?:esquema|prefijo|protocolo)(?: de protocolo)?(?: https)?', words))
-    return prefix_note or bool(any(re.fullmatch(pattern, words) for pattern in (
-        r'no se pudo verificar una liga https a partir del qr',
-        r'no se verifico la url completa del codigo qr',
-        r'no se pudo verificar la liga https del qr de facturacion',
-        r'no se ve una liga de facturacion impresa',
-        r'el qr (?:inferior|de facturacion) esta identificado como el de facturacion pero no se pudo decodificar su url',
-        r'el qr superior corresponde a una encuesta',
-        r'(?:el )?(?:codigo )?qr (?:de facturacion )?no se pudo (?:leer|decodificar)',
-    )))
+    # Keep an unfamiliar qualifier as a review item. This prevents a mixed
+    # warning from disappearing merely because it also mentions QR or HTTPS.
+    if not tokens <= _PORTAL_READABILITY_WORDS:
+        return False
+    if {'qr', 'encuesta', 'corresponde'} <= tokens and 'no' not in tokens:
+        return True  # A separate survey QR is an observation, not a fiscal risk.
+    absent = bool(tokens & {'no', 'sin', 'carece', 'omite', 'omitido'})
+    if not absent:
+        return False
+    if 'qr' in tokens:
+        return bool(tokens & {'verificar', 'verifico', 'decodificar', 'decodifico',
+                              'leer', 'leyo', 'leerse', 'legible', 'aparece', 've',
+                              'visible', 'impresa', 'impreso', 'texto', 'extraer'})
+    if printed_hosts and tokens & {'protocolo', 'prefijo', 'esquema', 'https'}:
+        return bool(tokens & {'impresa', 'impreso', 'imprime', 'imprimio', 'aparece',
+                              'aparecen', 'muestra', 'muestran', 'dominio', 'direccion'})
+    return (bool(tokens & {'liga', 'enlace', 'url', 'direccion'})
+            and bool(tokens & {'impresa', 'impreso', 'texto', 'legible'})
+            and bool(tokens & {'aparece', 'aparecen', 've', 'visible', 'leer', 'legible'}))
 
 
 def missing_portal_only_uncertainty(message: str) -> bool:
