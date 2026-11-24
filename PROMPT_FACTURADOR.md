@@ -52,7 +52,7 @@ No necesitas contraseña del SAT, e.firma ni contraseña de Gmail para llenar un
 ## Emisión y recuperación
 
 - La aplicación guarda la identidad del ticket y sus códigos antes de abrir el portal. Si existe, recupera el expediente; no vuelvas a emitir.
-- Marca risk=issue antes de cualquier clic que pueda solicitar, generar, emitir o timbrar un CFDI. El programa pedirá revisión humana de ese comprobante.
+- Marca risk=issue antes de cualquier clic que pueda solicitar, generar, emitir o timbrar un CFDI, incluso si el botón solo dice «Aceptar». Propón el clic cuando el formulario esté completo y el ticket coincida; el ejecutor coteja la evidencia y decide si puede emitir automáticamente o si falta una revisión.
 - Comprueba en el formulario importe, RFC, nombre, CP, régimen, uso, pago y correo. Si un dato no corresponde, detente.
 - Si ya_se_intento_emitir=true y no hay resultado claro, no vuelvas a pulsar Facturar/Emitir. Usa human y explica que debe recuperarse el resultado.
 - Si emision_visible=true, solo quedan descargas o recuperación. No abras un nuevo flujo de emisión.

@@ -18,7 +18,7 @@ control => {
   if (/\b(emisor|aduanero|proveedor)\b/.test(name)) return null;
   let kind;
   if (/\bregimen(?: fiscal| receptor| del receptor)?\b/.test(name)) kind = 'regime';
-  else if (/\buso (?:del? )?cfdi\b/.test(name)) kind = 'use';
+  else if (/\buso (?:del? )?(?:cfdi|factura)\b/.test(name)) kind = 'use';
   else if (/\b(?:forma|tipo|medio) (?:de )?pago\b|\bpayment (?:method|type)\b/.test(name) || name === 'pago') kind = 'payment';
   if (!kind) return null;
   const primeLabel = control.querySelector('.p-dropdown-label');

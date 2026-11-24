@@ -8,12 +8,13 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import parse_qs, urlsplit
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from facturador.ai import AI
 from facturador.auth import AUTHORIZATION, ISSUER, JWKS, PLAN_SCOPES, RESOURCE, TOKEN, ChatGPTPlan, PlanError, read_json, write_private
 from facturador.models import Extraction, PortalSearch
 
@@ -69,7 +70,8 @@ class SubscriptionTests(unittest.TestCase):
             assert request.headers['Authorization'] in {'Bearer new-access', 'Bearer old-access'}
             record = json.loads(request.content)
             assert record['stream'] is True and record['store'] is False
-            assert record['text']['format']['strict'] and record['model'] == 'gpt-6.2-sol'
+            assert record['text']['format']['strict'] and record['model'] == 'gpt-6.1-sol'
+            assert record['reasoning'] == {'effort': 'max'}
             assert 'previous_response_id' not in record
             data = {'type': 'response.completed', 'response': {'output': [{'type': 'message',
                     'content': [{'type': 'output_text', 'text': json.dumps(REPLY)}]}]}}
@@ -93,6 +95,21 @@ class SubscriptionTests(unittest.TestCase):
         self.assertEqual(login['client_id'], [self.served_client])
         self.assertEqual(login['ext_agent_host_id'], self.auth_attempt['ext_agent_host_id'])
         self.assertNotEqual(login['state'], self.auth_attempt['state'])
+
+    def test_all_ai_tasks_request_max_reasoning(self):
+        source = Path(self.tmp.name) / 'sample.txt'
+        source.write_text('Ticket de prueba', encoding='utf-8')
+        plan = Mock()
+        ai = AI(plan)
+        ai.extract(source, {})
+        ai.tax_profile(source)
+        ai.next_action('Instrucciones', '{}', None)
+        evidence = 'https://cafeteria.example.org/facturacion'
+        plan.infer.return_value = (PortalSearch(billing_url='https://facturas.example.org/emitir',
+                                               evidence_url=evidence), [evidence])
+        ai.discover_portal('Cafetería')
+        self.assertEqual([call.kwargs.get('effort', 'max') for call in plan.infer.call_args_list],
+                         ['max', 'max', 'max', 'max'])
 
     def test_callback_rejects_wrong_state_and_validation_precedes_inference(self):
         with self.assertRaises(PlanError):

@@ -39,6 +39,7 @@ from .tesoro_recipient import tesoro_recipient
 from .tesoro_result import tesoro_verification_failure
 from .viewer import BrowserView
 from .vianney_consulta import lookup_rejected, rejection_for_current_ticket, recover_vianney_consulta
+from .walmart_issue import walmart_issue_button, walmart_lookup_proof
 
 ISSUE = re.compile(r'\b(facturar|emitir|timbrar|generar\s+(?:mi\s+)?(?:factura|cfdi)|solicitar\s+factura|enviar\s+(?:mi\s+)?(?:factura|cfdi)|s[ií] estoy seguro|confirmar (?:la )?emisi[oó]n)\b', re.I)
 EMISSION_PATH = re.compile(r'factur|invoice|invoic|cfdi|timbr|emisi|emit|creat|complet|generat|submit', re.I)
@@ -88,6 +89,10 @@ def action_risk(action: Action) -> str:
     return 'normal'
 
 
+def press_without_target(action: Action) -> bool:
+    return action.kind == 'press' and (action.target is None or not action.target.name.strip())
+
+
 async def dismiss_walmart_cfdi_notice(page, snapshot: str) -> bool:
     """Close Walmart's informational CFDI 4.0 notice, never a form confirmation."""
     parts = urlsplit(page.url)
@@ -108,6 +113,36 @@ async def dismiss_walmart_cfdi_notice(page, snapshot: str) -> bool:
         if (await notice.locator('input:visible, textarea:visible, select:visible').count()
                 or await button.count() != 1 or not await button.is_visible()
                 or not await button.is_enabled()):
+            return False
+        await button.click(timeout=1500)
+    except BrowserError:
+        return False
+    return True
+
+
+async def dismiss_walmart_address_notice(page, snapshot: str) -> bool:
+    """Acknowledge Walmart's data-entry notice, scoped away from the fiscal form."""
+    parts = urlsplit(page.url)
+    if (parts.scheme != 'https' or parts.netloc.lower() != 'facturacion-clientes.walmart.com'
+            or parts.path.rstrip('/') != '/address'):
+        return False
+    message = re.compile(
+        r'Para proteger sus datos personales[\s\S]{0,230}capturar nuevamente su informaci[oó]n fiscal'
+        r'[\s\S]{0,90}cada solicitud de facturaci[oó]n', re.I)
+    if not message.search(snapshot):
+        return False
+    try:
+        notices = page.locator('[role="dialog"]:visible, .modal:visible')
+        if await notices.count() != 1:
+            return False
+        notice = notices.first
+        notice_text = await notice.inner_text()
+        if (not await notice.is_visible() or not message.search(notice_text)
+                or not re.search(r'\bImportante\s*:', notice_text, re.I)
+                or await notice.locator('input:visible, textarea:visible, select:visible').count()):
+            return False
+        button = notice.get_by_role('button', name='Aceptar', exact=True)
+        if await button.count() != 1 or not await button.is_visible() or not await button.is_enabled():
             return False
         await button.click(timeout=1500)
     except BrowserError:
@@ -638,7 +673,6 @@ class Runner:
                     return response
                 operation = self.retry_action(self.store.get(key))
                 if operation == 'resume':
-                    self.explicit_approval.add(key)
                     self.decide(key, 'reobserve')
                     return {**response, 'action': 'resumed', 'message': 'Revisando la misma pestaña del ticket.'}
                 self.decide(key, 'recover')
@@ -697,7 +731,6 @@ class Runner:
                     or not await self.viewer.finish_returned_control(page, revision, epoch) or pending['future'].done()):
                 return
             seen.add(signature)
-            self.explicit_approval.add(key)
             self.store.event(key, 'automatic_reobservation', 'Se vuelve a leer el formulario abierto para preparar el ticket.')
             self.decide(key, 'reobserve')
         except BrowserError:
@@ -1062,6 +1095,8 @@ class Runner:
         tesoro_lookup_attempted = False
         bp_entry_attempted = False
         bp_lookup_attempted = False
+        walmart_lookup = None
+        unbound_press_count = 0
         accounts = PortalAccountFlow(self.store.root, provider['url'], profile, key,
                                      progress=lambda message: self.store.running_message(key, message))
         for number in range(65):
@@ -1077,6 +1112,13 @@ class Runner:
                     and await dismiss_walmart_cfdi_notice(page, snapshot)):
                 self.store.event(key, 'notice_dismissed', 'Se cerró el aviso informativo CFDI 4.0 de Walmart.')
                 continue
+            if (receipt.provider == 'walmart' and not committed and not issued
+                    and await dismiss_walmart_address_notice(page, snapshot)):
+                self.store.event(key, 'notice_dismissed', 'Se cerró el aviso informativo de captura fiscal de Walmart.')
+                continue
+            if (receipt.provider == 'walmart' and walmart_lookup is not None
+                    and urlsplit(page.url).path.rstrip('/') != '/address'):
+                walmart_lookup = None
             if receipt.provider == 'tesoro' and tesoro_lookup_attempted and not committed and not issued:
                 rejected = await tesoro_verification_failure(page, receipt, profile)
                 if rejected:
@@ -1261,8 +1303,36 @@ class Runner:
                 if decision == 'manual':
                     return await self.manual_job(key, page, profile)
                 continue
+            if press_without_target(action):
+                unbound_press_count += 1
+                last_error = 'Indica el control visible exacto antes de pulsar una tecla; no se ejecutó la acción.'
+                if unbound_press_count >= 2:
+                    decision = await self.human(key, page, 'unknown', last_error)
+                    if decision == 'manual':
+                        return await self.manual_job(key, page, profile)
+                continue
+            unbound_press_count = 0
             risk = action_risk(action)
             name = action.target.name if action.target else ''
+            walmart_issue_control = None
+            walmart_lookup_candidate = None
+            walmart_issue_element = None
+            walmart_issue_url = None
+            walmart_auto = False
+            if (receipt.provider == 'walmart' and not committed and not issued and walmart_lookup is None
+                    and action.kind == 'click' and normalize(name) == 'CONTINUAR'):
+                walmart_lookup_candidate = await walmart_lookup_proof(page, profile, receipt)
+                if walmart_lookup_candidate is None:
+                    last_error = 'Antes de continuar, coteja RFC, código postal, TC y TR con el ticket.'
+                    continue
+            if (receipt.provider == 'walmart' and not committed and not issued
+                    and action.kind == 'click' and action.target and action.target.by == 'role'
+                    and action.target.role == 'button' and action.target.exact
+                    and normalize(name) == 'ACEPTAR'):
+                walmart_issue_control = await walmart_issue_button(page, profile, receipt, walmart_lookup)
+                if walmart_issue_control is not None:
+                    walmart_issue_url = page.url
+                    risk = 'issue'
             if risk == 'forbidden':
                 raise ValueError('La acción no corresponde a solicitar el CFDI de esta compra.')
             if action.kind == 'done':
@@ -1348,8 +1418,15 @@ class Runner:
                     await self.human(key, page, 'blocked', last_error)
                     continue
                 try:
-                    issue_button = await self.action_control(page, action, receipt)
-                    await issue_button.click(trial=True, timeout=1500)
+                    issue_button = (walmart_issue_control if walmart_issue_control is not None
+                                    else await self.action_control(page, action, receipt))
+                    if walmart_issue_control is not None:
+                        walmart_issue_element = await issue_button.element_handle()
+                        if walmart_issue_element is None:
+                            raise ValueError('El botón de Walmart cambió antes de la emisión.')
+                        await walmart_issue_element.click(trial=True, timeout=1500)
+                    else:
+                        await issue_button.click(trial=True, timeout=1500)
                 except (ValueError, BrowserError):
                     detail = 'El botón de emisión está deshabilitado, cubierto o ya cambió. Revisa los campos obligatorios y los avisos del portal.'
                     if last_error == detail:
@@ -1361,8 +1438,10 @@ class Runner:
                                await capufe_proof(page, profile, receipt))
                 bp_auto = (receipt.provider == 'bp' and normalize(name) == 'FACTURAR' and
                            await bp_issue_proof(page, receipt, profile, bp_evidence))
+                walmart_auto = (walmart_issue_element is not None and
+                                await walmart_issue_button(page, profile, receipt, walmart_lookup) is not None)
                 valid = (auto_issue and key not in self.explicit_approval and not self.store.get(key)['human_exposed']
-                         and (capufe_auto or bp_auto))
+                         and (capufe_auto or bp_auto or walmart_auto))
                 if not valid:
                     approved_at = (page.url, snapshot)
                     await self.human(key, page, 'issue', 'Revisa ticket, importe, forma de pago y datos fiscales en el portal para aprobar esta emisión.')
@@ -1373,6 +1452,10 @@ class Runner:
                     if pending_fields:
                         last_error = 'La selección fiscal cambió durante la revisión.'
                         continue
+                if (walmart_auto and (page.url != walmart_issue_url
+                        or await page.locator('body').aria_snapshot() != snapshot)):
+                    last_error = 'El formulario Walmart cambió antes de enviar. Se vuelve a cotejar.'
+                    continue
                 self.store.begin_emission(key, name)
                 committed = True
             elif committed or issued:
@@ -1388,7 +1471,10 @@ class Runner:
                     raise ValueError('Revisa o recupera la factura del intento actual.')
             try:
                 before_action = page.url, snapshot
-                await self.execute(page, action, receipt)
+                if walmart_auto and walmart_issue_element is not None:
+                    await walmart_issue_element.click(timeout=5000)
+                else:
+                    await self.execute(page, action, receipt)
                 last_error = ''
             except Exception as exc:
                 if committed:
@@ -1396,6 +1482,10 @@ class Runner:
                 last_error = str(exc) if isinstance(exc, ValueError) else 'No se completó el paso. Revisa la pantalla y el control.'
             recent.append({'tipo': action.kind, 'control': name[:120]})
             self.store.event(key, 'action', action.kind + ' · ' + name[:120])
+            if (walmart_lookup_candidate is not None and
+                    urlsplit(page.url).path.rstrip('/') == '/address'):
+                walmart_lookup = walmart_lookup_candidate
+                self.store.event(key, 'ticket_lookup_verified', 'TC, TR, RFC y código postal coincidieron al continuar.')
             if len(recent) >= 4 and all(event.get('tipo') == action.kind and event.get('control') == name[:120]
                                         and event.get('cambio_visible') is False for event in recent[-4:-1]):
                 decision = await self.human(key, page, 'blocked', 'El portal no avanzó tras varios pasos. Toma el control para revisar.')

@@ -8,10 +8,11 @@ import unittest
 
 from playwright.async_api import async_playwright
 
-from facturador.runner import dismiss_walmart_cfdi_notice
+from facturador.runner import dismiss_walmart_address_notice, dismiss_walmart_cfdi_notice
 
 
 WALMART_CLIENTS = 'https://facturacion-clientes.walmart.com/'
+WALMART_ADDRESS = WALMART_CLIENTS + 'address'
 OTHER_HOST = 'https://unrelated.example/'
 NOTICE = '''<!doctype html><html lang="es"><body>
 <main><h1>Bienvenido al sistema de Facturación Electrónica</h1>
@@ -32,6 +33,15 @@ NOTICE_WITH_FORM_BUTTON = '''<!doctype html><html lang="es"><body>
 <form><label>RFC<input name="rfc"></label>
 <button type="button" onclick="window.formAccepted = true">Aceptar</button></form>
 </body></html>'''
+ADDRESS_NOTICE = '''<!doctype html><html lang="es"><body>
+<form><label>Razón social<input name="name"></label>
+<button type="button" onclick="window.formAccepted = true">Aceptar</button></form>
+<div role="dialog" aria-label="Aviso de información fiscal">
+  <p><strong>Importante:</strong> Para proteger sus datos personales y garantizar la correcta emisión de
+  sus facturas, a partir de ahora será necesario capturar nuevamente su información fiscal en cada
+  solicitud de facturación.</p>
+  <button onclick="window.noticeAccepted = true; this.closest('[role=dialog]').remove()">Aceptar</button>
+</div></body></html>'''
 
 
 @unittest.skipUnless(os.path.isfile('/usr/bin/google-chrome-stable'), 'Requiere Google Chrome oficial')
@@ -51,7 +61,7 @@ class WalmartCfdiNoticeChromeTests(unittest.IsolatedAsyncioTestCase):
         async def route_handler(route):
             seen.append(route.request.url)
             if route.request.url == url:
-                await route.fulfill(content_type='text/html', body=html)
+                await route.fulfill(content_type='text/html; charset=utf-8', body=html)
             else:
                 await route.abort()
 
@@ -101,3 +111,40 @@ class WalmartCfdiNoticeChromeTests(unittest.IsolatedAsyncioTestCase):
             '<div role="dialog"', '<div hidden role="dialog"'))
         self.assertFalse(await dismiss_walmart_cfdi_notice(self.page, snapshot))
         self.assertFalse(await self.page.evaluate('window.noticeAccepted === true'))
+
+    async def test_dismisses_only_address_notice_not_fiscal_form(self):
+        snapshot = await self.load_synthetic(WALMART_ADDRESS, ADDRESS_NOTICE)
+        self.assertTrue(await dismiss_walmart_address_notice(self.page, snapshot))
+        self.assertTrue(await self.page.evaluate('window.noticeAccepted === true'))
+        self.assertFalse(await self.page.evaluate('window.formAccepted === true'))
+
+    async def test_dismisses_address_notice_in_modal_container(self):
+        html = ADDRESS_NOTICE.replace('role="dialog" aria-label="Aviso de información fiscal"', 'class="modal"').replace(
+            "this.closest('[role=dialog]')", "this.closest('.modal')")
+        snapshot = await self.load_synthetic(WALMART_ADDRESS, html)
+        self.assertTrue(await dismiss_walmart_address_notice(self.page, snapshot))
+        self.assertFalse(await self.page.evaluate('window.formAccepted === true'))
+
+    async def test_address_notice_requires_exact_portal_path(self):
+        snapshot = await self.load_synthetic(WALMART_CLIENTS, ADDRESS_NOTICE)
+        self.assertFalse(await dismiss_walmart_address_notice(self.page, snapshot))
+        self.assertFalse(await self.page.evaluate('window.noticeAccepted === true'))
+
+    async def test_address_notice_requires_full_message(self):
+        html = ADDRESS_NOTICE.replace('capturar nuevamente su información fiscal', 'enviar su factura')
+        snapshot = await self.load_synthetic(WALMART_ADDRESS, html)
+        self.assertFalse(await dismiss_walmart_address_notice(self.page, snapshot))
+        self.assertFalse(await self.page.evaluate('window.noticeAccepted === true'))
+
+    async def test_address_notice_cannot_confirm_a_form_within_dialog(self):
+        html = ADDRESS_NOTICE.replace('  <button onclick="window.noticeAccepted',
+                                      '  <input name="rfc"><button onclick="window.noticeAccepted')
+        snapshot = await self.load_synthetic(WALMART_ADDRESS, html)
+        self.assertFalse(await dismiss_walmart_address_notice(self.page, snapshot))
+        self.assertFalse(await self.page.evaluate('window.noticeAccepted === true'))
+
+    async def test_address_notice_cannot_click_form_button_outside_dialog(self):
+        html = ADDRESS_NOTICE.replace('  <button onclick="window.noticeAccepted = true; this.closest(\'[role=dialog]\').remove()">Aceptar</button>', '')
+        snapshot = await self.load_synthetic(WALMART_ADDRESS, html)
+        self.assertFalse(await dismiss_walmart_address_notice(self.page, snapshot))
+        self.assertFalse(await self.page.evaluate('window.formAccepted === true'))

@@ -26,7 +26,7 @@ JWKS = ISSUER + '/.well-known/jwks.json'
 PUBLIC_CLIENT = 'dynamic_agent_client'
 SCOPES = 'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct'
 PLAN_SCOPES = {'resource.invoke', 'chatgpt.tokens.use.direct'}
-DEFAULT_MODEL = 'gpt-6.2-sol'
+DEFAULT_MODEL = 'gpt-6.1-sol'
 CALLBACK = '/auth/chatgpt/callback'
 
 
@@ -326,7 +326,7 @@ class ChatGPTPlan:
             record['model'] = model
             write_private(self.session_path, record)
 
-    def infer(self, instructions, content, output_type, *, effort='medium', web_search=False):
+    def infer(self, instructions, content, output_type, *, effort='max', web_search=False):
         access, model = self._credentials()
         request = {'model': model, 'reasoning': {'effort': effort}, 'store': False, 'stream': True,
                    'instructions': instructions, 'input': [{'role': 'user', 'content': content}],
