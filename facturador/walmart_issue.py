@@ -21,6 +21,9 @@ USE = re.compile(r'uso\s+(?:de\s+)?(?:factura|(?:del\s+)?CFDI)', re.I)
 PAYMENT = re.compile(r'(?:forma|tipo|medio)\s+de\s+pago', re.I)
 TC_CODE = re.compile(r'\s*(?:TC\s*#?\s*[:=\-]?\s*)?(\d{21,22})\s*', re.I)
 TR_CODE = re.compile(r'(?<![A-Z0-9])TR\s*#?\s*[:=\-]?\s*(\d{5})(?![A-Z0-9])', re.I)
+LOOKUP_REJECTION = re.compile(
+    r'error|rechaz|inv[aá]lid|vencid|venci[oó]|caduc|plazo|facturad|expir|'
+    r'no (?:se (?:encontr[oó]|pudo)|es posible)|m[aá]s de \d+ d[ií]as', re.I)
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,70 @@ async def walmart_lookup_proof(page, profile, receipt) -> WalmartLookupProof | N
             or tc != codes[0] or tr != codes[1]):
         return None
     return WalmartLookupProof(tc, tr, profile.rfc, profile.postal_code, receipt.payment_code)
+
+
+async def walmart_lookup_continue(page, profile, receipt) -> tuple[WalmartLookupProof, Locator] | None:
+    """Bind the verified lookup fields to Walmart's unique preparatory button."""
+    if urlsplit(page.url).path.rstrip('/') != '/ticket':
+        return None
+    proof = await walmart_lookup_proof(page, profile, receipt)
+    if proof is None:
+        return None
+    try:
+        buttons = page.get_by_role('button', name='Continuar', exact=True).filter(visible=True)
+        if await buttons.count() != 1 or not await buttons.first.is_enabled():
+            return None
+        button = buttons.first
+        form = button.locator('xpath=ancestor::form[1]')
+        if await form.count() == 1:
+            containers = [form]
+        else:
+            # Legacy layouts can place the action just outside the form. Bind
+            # it through one non-root panel containing all four lookup fields.
+            containers = await button.locator(
+                'xpath=ancestor::*[not(self::body) and not(self::html)]').all()
+        matched = False
+        for container in containers:
+            if await container.locator('form:visible').count() > 1:
+                continue
+            values = [await _input_value(container, pattern) for pattern in (RFC, POSTAL, TC_FIELD, TR_FIELD)]
+            if (values[0] is not None and values[0].upper() == proof.rfc
+                    and values[1:] == [proof.postal_code, proof.ticket_number, proof.transaction]):
+                matched = True
+                break
+        if not matched:
+            return None
+    except BrowserError:
+        return None
+    return proof, button
+
+
+async def walmart_lookup_rejection(page, previous_snapshot: str) -> str:
+    """Return one visible merchant rejection after a lookup, with private values removed."""
+    if not _host(page) or urlsplit(page.url).path.rstrip('/') != '/ticket':
+        return ''
+    try:
+        alerts = page.locator('[role="alert"]:visible, .alert-danger:visible, '
+                              '.validation-summary-errors:visible, .field-validation-error:visible')
+        old_text = ' '.join(previous_snapshot.split()).casefold()
+        candidates = []
+        for item in (await alerts.all())[:5]:
+            text = await item.inner_text()
+            if ' '.join(text.split()).casefold() not in old_text:
+                candidates.append(text)
+        current = await page.locator('body').aria_snapshot(timeout=3000)
+        old_lines = set(previous_snapshot.splitlines())
+        candidates.extend(line for line in current.splitlines() if line not in old_lines)
+    except BrowserError:
+        return ''
+    for candidate in candidates:
+        message = re.sub(r'^\s*-?\s*(?:alert|status|text|paragraph|generic)\s*:?', '', candidate).strip(' "')
+        if not LOOKUP_REJECTION.search(message):
+            continue
+        message = re.sub(r'[A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3}|[\w.+-]+@[\w.-]+\.[A-Z]{2,}|\b\d{5,}\b',
+                         '[dato]', message, flags=re.I)
+        return ' '.join(message.split())[:260]
+    return ''
 
 
 async def walmart_issue_button(page, profile, receipt, lookup: WalmartLookupProof | None) -> Locator | None:

@@ -31,10 +31,14 @@ CALLBACK = '/auth/chatgpt/callback'
 
 
 class PlanError(ValueError):
-    def __init__(self, message: str, status: str = 'unavailable', retry_after: int = 0):
+    def __init__(self, message: str, status: str = 'unavailable', retry_after: int = 0,
+                 *, code: str = '', event_type: str = ''):
         super().__init__(message)
         self.status = status
         self.retry_after = retry_after
+        # Only bounded machine-readable classifications are retained for diagnostics.
+        self.code = code if re.fullmatch(r'[a-zA-Z0-9_.-]{1,80}', code) else ''
+        self.event_type = event_type if re.fullmatch(r'[a-zA-Z0-9_.-]{1,80}', event_type) else ''
 
 
 def read_json(path: Path, fallback=None):
@@ -263,11 +267,15 @@ class ChatGPTPlan:
                 record.update(hold='', message='')
                 write_private(self.session_path, record)
 
-    def _error(self, raw: dict, status: int = 0, access: str = '', retry_after: int = 0) -> PlanError:
+    def _error(self, raw: dict, status: int = 0, access: str = '', retry_after: int = 0,
+               event_type: str = '') -> PlanError:
         error = raw.get('error') or raw
         if not isinstance(error, dict):
             error = {}
         code = str(error.get('code', ''))
+        incomplete = raw.get('incomplete_details') or {}
+        reason = str(incomplete.get('reason', '')) if isinstance(incomplete, dict) else ''
+        diagnostic = {'code': code or reason, 'event_type': event_type}
         if code == 'subscription_sharing_usage_limit_exceeded' or (status == 429 and code == 'insufficient_quota'):
             message = (f'El cupo de ChatGPT está en pausa. La lectura se reanudará en {retry_after} segundos.'
                        if retry_after else 'El cupo de ChatGPT está en pausa. Consulta el uso de tu plan y retoma cuando esté disponible.')
@@ -276,15 +284,20 @@ class ChatGPTPlan:
                 if access and record.get('access_token') == access:
                     record.update(hold='limit', message=message, hold_until=time.time() + retry_after if retry_after else 0)
                     write_private(self.session_path, record)
-            return PlanError(message, 'limit', retry_after)
-        if status in {408, 425, 429, 500, 502, 503, 504} or code in {'server_error', 'rate_limit_exceeded'}:
-            return PlanError('ChatGPT está temporalmente ocupado o sin respuesta.', 'transient', retry_after)
+            return PlanError(message, 'limit', retry_after, **diagnostic)
+        if status in {408, 425, 429, 500, 502, 503, 504} or code in {
+                'server_error', 'internal_error', 'rate_limit_exceeded', 'overloaded', 'timeout'}:
+            return PlanError('El servicio está temporalmente ocupado o sin respuesta.', 'transient',
+                             retry_after, **diagnostic)
         if code == 'subscription_sharing_user_not_eligible':
-            return PlanError('El plan o espacio elegido no admite el uso en esta aplicación.', 'ineligible')
-        if code == 'subscription_sharing_unsupported_capability' or code == 'model_not_found':
+            return PlanError('El plan o espacio elegido no admite el uso en esta aplicación.', 'ineligible',
+                             **diagnostic)
+        if code in {'subscription_sharing_unsupported_capability', 'model_not_found',
+                    'invalid_request_error', 'invalid_prompt', 'context_length_exceeded'}:
             field = str(error.get('param', ''))
             suffix = f' ({field})' if re.fullmatch(r'[a-zA-Z0-9_.\[\]-]{1,80}', field) else ''
-            return PlanError('El modelo elegido no admite esta solicitud con el plan' + suffix + '.', 'model')
+            return PlanError('El modelo elegido no admite esta solicitud con el plan' + suffix + '.',
+                             'model', **diagnostic)
         if status == 401 or code in {'subscription_sharing_invalid_user', 'chatpass_v2_invalid_authorization_context'}:
             message = 'OpenAI no aceptó la sesión. Vuelve a conectar ChatGPT.'
             with self.lock:
@@ -292,11 +305,19 @@ class ChatGPTPlan:
                 if access and record.get('access_token') == access:
                     record.update(hold='reconnect', message=message)
                     write_private(self.session_path, record)
-            return PlanError(message, 'reconnect')
+            return PlanError(message, 'reconnect', **diagnostic)
         if status == 403:
-            return PlanError('OpenAI no autorizó usar el plan para esta solicitud.', 'ineligible')
+            return PlanError('OpenAI no autorizó usar el plan para esta solicitud.', 'ineligible',
+                             **diagnostic)
+        if reason == 'content_filter' or code in {'content_filter', 'safety_violation'}:
+            return PlanError('El servicio pidió revisar este paso antes de continuar.',
+                             'unavailable', **diagnostic)
+        if event_type in {'error', 'response.failed', 'response.incomplete'} and not status:
+            return PlanError('El análisis del portal se interrumpió. Puedes reintentar el ticket.',
+                             'transient', retry_after, **diagnostic)
         suffix = f' (HTTP {status})' if status else ''
-        return PlanError('ChatGPT no pudo completar la solicitud' + suffix + '.')
+        return PlanError('El servicio no pudo completar la solicitud' + suffix + '.',
+                         **diagnostic)
 
     @staticmethod
     def _body(response: httpx.Response) -> dict:
@@ -335,6 +356,18 @@ class ChatGPTPlan:
         if web_search:
             request.update(tools=[{'type':'web_search', 'search_context_size':'low'}],
                            include=['web_search_call.action.sources'])
+        # Repeating an inference cannot submit a merchant form. A brief, bounded
+        # retry absorbs a failed stream without leaving the live browser frozen.
+        for attempt in range(2):
+            try:
+                return self._infer_once(access, request, output_type, web_search)
+            except PlanError as exc:
+                if attempt or exc.status != 'transient' or exc.retry_after > 2:
+                    raise
+                time.sleep(0.5)
+        raise AssertionError('Unreachable inference retry state')
+
+    def _infer_once(self, access, request, output_type, web_search):
         try:
             with self.client.stream('POST', RESOURCE + '/responses', json=request,
                                     headers={'Authorization': 'Bearer ' + access}) as response:
@@ -346,7 +379,8 @@ class ChatGPTPlan:
                 for event in decode_event_stream(response.iter_lines()):
                     kind = event.get('type')
                     if kind in {'error', 'response.failed', 'response.incomplete'}:
-                        raise self._error(event.get('response') or event, access=access)
+                        raise self._error(event.get('response') or event, access=access,
+                                          event_type=kind)
                     if web_search and kind == 'response.output_item.done':
                         streamed_items.append(event['item'])
                     if kind == 'response.completed':

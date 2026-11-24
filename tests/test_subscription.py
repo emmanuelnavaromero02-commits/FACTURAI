@@ -161,6 +161,50 @@ class SubscriptionTests(unittest.TestCase):
                 self.assertEqual((result.exception.status, result.exception.retry_after), ('transient', 80))
                 self.assertEqual(plan.status()['status'], 'ready')
 
+    def test_failed_stream_retries_inference_once_without_exposing_response_text(self):
+        self.finish()
+        attempts = []
+        failed = {'type': 'response.failed', 'response': {
+            'error': {'code': 'model_backend_failure', 'message': 'private portal content'}}}
+        complete = {'type': 'response.completed', 'response': {'output': [{'type': 'message',
+            'content': [{'type': 'output_text', 'text': json.dumps(REPLY)}]}]}}
+
+        def handler(request):
+            attempts.append(request)
+            event = failed if len(attempts) == 1 else complete
+            return httpx.Response(200, text='data: ' + json.dumps(event) + '\n\n',
+                                  headers={'Content-Type': 'text/event-stream'})
+
+        plan = self.new_plan(handler)
+        with patch('facturador.auth.time.sleep') as pause:
+            result = plan.infer('Lee este ticket', [{'type': 'input_text', 'text': 'datos'}], Extraction)
+        self.assertEqual(result.ticket_number, REPLY['ticket_number'])
+        self.assertEqual(len(attempts), 2)
+        pause.assert_called_once_with(0.5)
+        self.assertEqual(attempts[0].content, attempts[1].content)
+
+    def test_repeated_incomplete_stream_has_bounded_safe_diagnostic(self):
+        self.finish()
+        attempts = []
+        incomplete = {'type': 'response.incomplete', 'response': {
+            'incomplete_details': {'reason': 'max_output_tokens'},
+            'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'secret'}]}]}}
+
+        def handler(request):
+            attempts.append(request)
+            return httpx.Response(200, text='data: ' + json.dumps(incomplete) + '\n\n',
+                                  headers={'Content-Type': 'text/event-stream'})
+
+        plan = self.new_plan(handler)
+        with patch('facturador.auth.time.sleep'):
+            with self.assertRaises(PlanError) as raised:
+                plan.infer('Lee este ticket', [], Extraction)
+        self.assertEqual(len(attempts), 2)
+        error = raised.exception
+        self.assertEqual((error.status, error.code, error.event_type),
+                         ('transient', 'max_output_tokens', 'response.incomplete'))
+        self.assertNotIn('secret', str(error))
+
     def test_quota_with_server_deadline_recovers_after_restart(self):
         self.finish()
         def limited(request):

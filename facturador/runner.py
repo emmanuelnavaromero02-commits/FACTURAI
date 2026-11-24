@@ -39,7 +39,8 @@ from .tesoro_recipient import tesoro_recipient
 from .tesoro_result import tesoro_verification_failure
 from .viewer import BrowserView
 from .vianney_consulta import lookup_rejected, rejection_for_current_ticket, recover_vianney_consulta
-from .walmart_issue import walmart_issue_button, walmart_lookup_proof
+from .walmart_issue import (walmart_issue_button, walmart_lookup_continue,
+                           walmart_lookup_proof, walmart_lookup_rejection)
 
 ISSUE = re.compile(r'\b(facturar|emitir|timbrar|generar\s+(?:mi\s+)?(?:factura|cfdi)|solicitar\s+factura|enviar\s+(?:mi\s+)?(?:factura|cfdi)|s[ií] estoy seguro|confirmar (?:la )?emisi[oó]n)\b', re.I)
 EMISSION_PATH = re.compile(r'factur|invoice|invoic|cfdi|timbr|emisi|emit|creat|complet|generat|submit', re.I)
@@ -1312,6 +1313,47 @@ class Runner:
                             raise ValueError(rejected)
                     self.store.event(key, 'campo_verificado', 'Dato del ticket cotejado: ' + tesoro_field)
                     continue
+                if receipt.provider == 'walmart' and walmart_lookup is None:
+                    lookup_step = await walmart_lookup_continue(page, profile, receipt)
+                    if lookup_step is not None:
+                        proof, control = lookup_step
+                        bound = await control.element_handle()
+                        if bound is None:
+                            raise ValueError('El botón Continuar de Walmart cambió antes de consultar el ticket.')
+                        try:
+                            await bound.click(trial=True, timeout=1500)
+                        except BrowserError as exc:
+                            raise ValueError('El botón Continuar de Walmart no está disponible para consultar el ticket.') from exc
+                        checked = await walmart_lookup_continue(page, profile, receipt)
+                        if (checked is None or checked[0] != proof or
+                                await page.locator('body').aria_snapshot() != snapshot):
+                            continue
+                        before_action = page.url, snapshot
+                        try:
+                            await bound.click(timeout=5000)
+                        except BrowserError as exc:
+                            # Chrome may lose the response after the portal receives the lookup.
+                            # Never repeat a possibly submitted lookup in the same attempt.
+                            rejected = await walmart_lookup_rejection(page, snapshot)
+                            if rejected:
+                                self.store.event(key, 'ticket_lookup_rejected', rejected)
+                                raise ValueError('Walmart respondió: ' + rejected) from exc
+                            raise ValueError('Walmart no confirmó el clic de consulta. Revisa el resultado antes de reintentar.') from exc
+                        recent.append({'tipo': 'click', 'control': 'Continuar'})
+                        self.store.event(key, 'action', 'click · Continuar')
+                        try:
+                            await page.wait_for_url(re.compile(
+                                r'^https://facturacion-clientes\.walmart\.com/address(?:[/?#].*)?$'), timeout=8000)
+                        except BrowserError as exc:
+                            rejected = await walmart_lookup_rejection(page, snapshot)
+                            if rejected:
+                                self.store.event(key, 'ticket_lookup_rejected', rejected)
+                                raise ValueError('Walmart respondió: ' + rejected) from exc
+                            raise ValueError('Walmart no confirmó la consulta del ticket. Revisa el mensaje del portal antes de reintentar.') from exc
+                        walmart_lookup = proof
+                        self.store.event(key, 'ticket_lookup_verified',
+                                         'TC, TR, RFC y código postal coincidieron al continuar.')
+                        continue
             # Accessibility snapshots include complete hrefs on separate /url: lines.
             model_snapshot = '\n'.join(line for line in snapshot.splitlines() if not line.lstrip().startswith('- /url:'))
             observation = json.dumps({'url': public_portal_origin(page.url), 'paso': number, 'emision_intentada': committed,
@@ -1345,6 +1387,16 @@ class Runner:
                         continue
                     action = await asyncio.to_thread(ai.next_action, instructions, observation, image)
             except PlanError as exc:
+                diagnostic = {'status': exc.status}
+                for field in ('code', 'event_type'):
+                    value = str(getattr(exc, field, ''))
+                    if re.fullmatch(r'[a-zA-Z0-9_.-]{1,80}', value):
+                        diagnostic[field] = value
+                self.store.event(key, 'plan_failure', json.dumps(diagnostic))
+                if not committed and not issued:
+                    if exc.status in {'reconnect', 'identity_only', 'ineligible', 'model', 'limit'}:
+                        raise ValueError('La conexión del asistente requiere atención. Revisa Ajustes y reintenta el ticket; no se envió la factura.') from exc
+                    raise ValueError('El asistente no completó el siguiente paso. Puedes reintentar el ticket; no se envió la factura.') from exc
                 decision = await self.human(key, page, 'plan', str(exc))
                 if decision == 'manual':
                     return await self.manual_job(key, page, profile)
