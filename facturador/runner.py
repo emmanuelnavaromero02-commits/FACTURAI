@@ -58,18 +58,46 @@ FISCAL_INPUT = re.compile(r'\b(?:textbox|combobox|spinbutton|radio)\s+"[^"\n]*\b
 RETRYABLE = re.compile(r'se cerr[oó]|cambi[oó] (?:a un|de) dominio|'
                        r'requiere revisar el resultado del portal|no hay comprobante ni confirmaci[oó]n visible|'
                        r'no avanz[oó]|no est[aá] disponible|no confirm[oó] el clic|destino fuera', re.I)
-# Visible text plus what is typed or chosen in each field (innerText omits input values).
-PAGE_TEXT = """() => {
-  const fields = [...document.querySelectorAll('input, textarea, select')].filter(e =>
-      e.type !== 'password' && e.type !== 'hidden' && e.offsetParent !== null).map(e => {
-    const label = (e.labels && e.labels[0] && e.labels[0].innerText) || e.getAttribute('aria-label') ||
-                  e.placeholder || e.name || '';
-    const value = e.tagName === 'SELECT' ? (e.selectedOptions[0] ? e.selectedOptions[0].text : '') :
-                  (e.type === 'checkbox' || e.type === 'radio') ? (e.checked ? 'marcado' : 'sin marcar') : e.value;
-    return label.trim() + ': ' + value;
+# Visible text plus a numbered list of every visible field: its label (or the text
+# right before it when the page has no label), what is typed or chosen, and its errors.
+# Each field gets data-facturai-campo=n so the agent can target it as by="field".
+PAGE_TEXT = r"""(start) => {
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+  const shown = e => e.type !== 'password' && e.type !== 'hidden' &&
+    !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const near = e => {
+    let node = e;
+    for (let depth = 0; node && depth < 4; depth++, node = node.parentElement) {
+      let prev = node.previousElementSibling;
+      while (prev) {
+        const t = clean(prev.innerText || prev.textContent);
+        if (t) return t.slice(-80);
+        prev = prev.previousElementSibling;
+      }
+    }
+    return '';
+  };
+  const items = [...document.querySelectorAll('input, textarea, select')].filter(shown);
+  const fields = items.map((e, i) => {
+    const n = start + i;
+    e.setAttribute('data-facturai-campo', String(n));
+    const ref = e.getAttribute('aria-labelledby');
+    const named = ref && document.getElementById(ref);
+    const label = clean((e.labels && e.labels[0] && e.labels[0].innerText) || e.getAttribute('aria-label') ||
+      (named && named.innerText) || e.placeholder || near(e) || e.name || e.id);
+    const kind = e.tagName === 'SELECT' ? 'lista' : e.tagName === 'TEXTAREA' ? 'texto' : (e.type || 'text');
+    const value = e.tagName === 'SELECT' ? (e.selectedOptions[0] ? clean(e.selectedOptions[0].text) : '') :
+      (e.type === 'checkbox' || e.type === 'radio') ? (e.checked ? 'marcado' : 'sin marcar') : e.value;
+    const notes = [e.required ? 'obligatorio' : '', e.disabled ? 'deshabilitado' : '',
+                   e.validationMessage ? 'error: ' + clean(e.validationMessage) : ''].filter(Boolean);
+    return '#' + n + ' ' + kind + ' «' + label.slice(0, 80) + '»: ' + String(value).slice(0, 120) +
+      (notes.length ? ' (' + notes.join(', ') + ')' : '');
   });
-  return (document.body ? document.body.innerText : '') + '\\n[Campos]\\n' + fields.join('\\n');
+  return {text: document.body ? document.body.innerText : '', fields: fields, count: items.length};
 }"""
+ASK_TIMEOUT = 300
+MAX_QUESTIONS = 3
+IDLE_BEFORE_ASK = 10
 TOOLS = {'read_text', 'search_web', 'view_ticket', 'back', 'reload', 'upload'}
 SUCCESS = re.compile(r'factura\s+(?:emitida|generada)\b|cfdi\s+(?:emitido|generado)\b|timbrad[ao]\s+correctamente|resultado facturaci[oó]n[^\n]*\n[\s\S]{0,130}facturas generadas|se gener[oó]\s+exitosamente', re.I)
 DOWNLOAD = re.compile(r'descargar|download|\bpdf\b|\bxml\b|imprimir', re.I)
@@ -250,6 +278,8 @@ class Runner:
         self.session_hints: dict[str, str] = {}
         # Tickets where a generic «Aceptar»/«Enviar» may have submitted something.
         self.soft_submitted: set[str] = set()
+        # Questions the agent asked in the chat, answered by the person's next message.
+        self.questions: dict[str, asyncio.Future] = {}
         self.manual_download_error = ''
 
     async def start_browser(self):
@@ -908,6 +938,11 @@ class Runner:
     def locator(page, target):
         if target is None or not target.name.strip():
             raise ValueError('Falta la etiqueta visible de la acción.')
+        if target.by == 'field':
+            number = target.name.strip().lstrip('#')
+            if not number.isdigit():
+                raise ValueError('Con by="field" escribe en name el número del campo, por ejemplo «7».')
+            return page.locator(f'[data-facturai-campo="{int(number)}"]')
         if target.by == 'role':
             if not target.role:
                 raise ValueError('Falta el rol del elemento.')
@@ -1015,15 +1050,56 @@ class Runner:
 
     async def visible_text(self, page, receipt: Receipt) -> str:
         """Rendered text of the portal page and its same-portal frames."""
-        parts = []
+        text, fields = await self.page_fields(page, receipt)
+        return text + '\n[Campos]\n' + '\n'.join(fields)
+
+    async def page_fields(self, page, receipt: Receipt) -> tuple[str, list[str]]:
+        """Visible text and the numbered fields of the portal page and its same-portal frames."""
+        parts, fields, start = [], [], 1
         for frame in getattr(page, 'frames', []):
             if frame.parent_frame and not allowed_url(frame.url, receipt.provider, receipt.portal_url, self._extra()):
                 continue
             try:
-                parts.append(await frame.evaluate(PAGE_TEXT))
+                result = await frame.evaluate(PAGE_TEXT, start)
             except BrowserError:
                 continue
-        return '\n'.join(parts)
+            if isinstance(result, str):
+                parts.append(result)
+                continue
+            parts.append(result.get('text', ''))
+            fields.extend(result.get('fields', []))
+            start += int(result.get('count', 0))
+        return '\n'.join(parts), fields
+
+    def open_question(self) -> str | None:
+        """The ticket whose agent is waiting for an answer in the chat."""
+        return next((key for key, future in self.questions.items() if not future.done()), None)
+
+    def answer_question(self, key: str, text: str) -> None:
+        future = self.questions.get(key)
+        if future and not future.done():
+            future.set_result(text[:1000])
+
+    async def ask_chat(self, key: str, question: str) -> str:
+        """Ask the person in the live chat and wait a few minutes; an empty answer means «assume»."""
+        future = asyncio.get_running_loop().create_future()
+        self.questions[key] = future
+        question = ' '.join(question.split())[:600]
+        self.store.add_assistant_message('Sobre tu ticket en proceso: ' + question +
+                                         ' Respóndeme aquí; si no me contestas en unos minutos, sigo con lo más probable.',
+                                         [key])
+        self.store.running_message(key, 'Te pregunté en el chat: ' + question[:200])
+        self.store.event(key, 'question', question[:200])
+        try:
+            answer = await asyncio.wait_for(asyncio.shield(future), ASK_TIMEOUT)
+        except asyncio.TimeoutError:
+            answer = ''
+        finally:
+            self.questions.pop(key, None)
+            if not future.done():
+                future.cancel()
+        self.store.event(key, 'answer', 'Respuesta recibida en el chat.' if answer else 'Sin respuesta; el agente asume y sigue.')
+        return answer
 
     async def generic_issue_proof(self, page, profile: Profile, receipt: Receipt) -> bool:
         """The page shows this recipient RFC, this ticket's folio or code and its amount."""
@@ -1126,7 +1202,14 @@ class Runner:
             await locator.fill(value)
             actual = await locator.evaluate("e => e.isContentEditable ? e.innerText : e.value")
             if actual != value:
-                raise ValueError('El portal modificó o rechazó el valor escrito. Revisa la máscara y el mensaje del campo.')
+                # Masked fields often reject a pasted value but accept it typed key by key.
+                await locator.click()
+                await locator.press('Control+A')
+                await locator.press('Delete')
+                await locator.press_sequentially(value, delay=35)
+                actual = await locator.evaluate("e => e.isContentEditable ? e.innerText : e.value")
+                if re.sub(r'[\s\-/.]', '', actual or '').upper() != re.sub(r'[\s\-/.]', '', value).upper():
+                    raise ValueError('El portal modificó o rechazó el valor escrito. Revisa la máscara y el mensaje del campo.')
         elif action.kind == 'select':
             value = action.value or ''
             choices = await locator.locator('option').evaluate_all('(options) => options.map(o => [o.value, o.label])')
@@ -1303,6 +1386,10 @@ class Runner:
         done_refusals = 0
         attachment_tries = 0
         stalled_hints = 0
+        failures: dict[str, int] = {}
+        idle_steps = 0
+        questions = 0
+        answer_note = ''
         before_action = None
         tesoro_lookup_attempted = False
         bp_entry_attempted = False
@@ -1524,6 +1611,20 @@ class Runner:
                         self.store.event(key, 'ticket_lookup_verified',
                                          'TC, TR, RFC y código postal coincidieron al continuar.')
                         continue
+            try:
+                _, fields = await self.page_fields(page, receipt)
+            except BrowserError:
+                fields = []
+            # Long without progress: ask in the chat once, then keep going with an assumption.
+            if (idle_steps >= IDLE_BEFORE_ASK and questions < MAX_QUESTIONS and not committed and not issued
+                    and not accounts.credential_values):
+                questions += 1
+                idle_steps = 0
+                answer = await self.ask_chat(key, 'No he podido avanzar en el portal de ' + receipt.merchant[:80] +
+                                             '. Lo que me frena: ' + (last_error or 'el formulario no acepta lo que capturo')[:250] +
+                                             ' ¿Me dices qué hago o qué dato falta?')
+                answer_note = answer or 'Sin respuesta: asume lo más razonable y toma otra ruta.'
+                continue
             # Accessibility snapshots include complete hrefs on separate /url: lines.
             model_snapshot = '\n'.join(line for line in snapshot.splitlines() if not line.lstrip().startswith('- /url:'))
             observation = json.dumps({'url': public_portal_origin(page.url), 'paso': number, 'pasos_maximos': MAX_STEPS,
@@ -1531,6 +1632,7 @@ class Runner:
                                       'tus_notas': agent_notes, 'acciones_recientes': recent[-15:],
                                       'ultimo_error': last_error, 'resultado_herramienta': tool_result,
                                       'campos_fiscales_pendientes': pending_fields,
+                                      'campos': fields[:120], 'respuesta_del_titular': answer_note,
                                       'operadores_autorizados': sorted(self._extra()),
                                       'estado_visible': model_snapshot[:26_000]}, ensure_ascii=False)
             tool_result = ''
@@ -1594,7 +1696,18 @@ class Runner:
             unbound_press_count = 0
             if action.notes:
                 agent_notes = action.notes.strip()[:2000]
+            if action.kind == 'ask':
+                if questions >= MAX_QUESTIONS or committed or issued:
+                    last_error = 'Ya no puedes preguntar más: asume el dato más razonable y sigue.'
+                    continue
+                questions += 1
+                idle_steps = 0
+                answer = await self.ask_chat(key, action.value or action.reason)
+                answer_note = answer or 'Sin respuesta: asume lo más razonable y sigue.'
+                recent.append({'tipo': 'ask', 'control': (action.value or '')[:120]})
+                continue
             if action.kind in TOOLS:
+                idle_steps += 1
                 tool_result, ticket_view, failure = await self.use_tool(key, page, action, receipt, ai, committed or issued)
                 last_error = failure
                 if not failure and action.kind in {'back', 'reload', 'upload'}:
@@ -1658,6 +1771,13 @@ class Runner:
                               'revisa la foto del ticket (view_ticket), investiga el portal (search_web) o prueba otra '
                               'ruta (back, reload, otro control). Motivo que diste: ' + (action.reason or '')[:200])
                 recent.append({'tipo': 'autoayuda', 'control': (action.reason or '')[:120]})
+                continue
+            if ((action.kind == 'human' or risk in {'unknown', 'terms', 'blocked'}) and risk not in {'captcha', 'login'}
+                    and questions < MAX_QUESTIONS and not committed and not issued and not accounts.credential_values):
+                questions += 1
+                idle_steps = 0
+                answer = await self.ask_chat(key, action.reason or 'Necesito un dato para continuar con el portal.')
+                answer_note = answer or 'Sin respuesta: asume lo más razonable y sigue.'
                 continue
             if risk in MANUAL or action.kind == 'human':
                 detail = ('El portal aún no refleja ' + ', '.join(pending_fields) + '. Revisa el formulario.' if pending_fields
@@ -1802,10 +1922,17 @@ class Runner:
                     except BrowserError:
                         pass
                 last_error = ''
+                idle_steps = 0
             except Exception as exc:
                 if committed:
                     raise ValueError('El portal no confirmó el resultado del intento de emisión. Busca el CFDI antes de repetir.')
                 last_error = str(exc) if isinstance(exc, ValueError) else 'No se completó el paso. Revisa la pantalla y el control.'
+                idle_steps += 1
+                control = action.kind + ':' + (action.target.by + '=' + name if action.target else '')
+                failures[control] = failures.get(control, 0) + 1
+                if failures[control] >= 2:
+                    last_error += (' Ese control ya falló ' + str(failures[control]) + ' veces. Si no tiene etiqueta usable, '
+                                   'apúntalo por número: target.by="field" y name con su número de la lista campos.')
             recent.append({'tipo': action.kind, 'control': name[:120]})
             self.store.event(key, 'action', action.kind + ' · ' + name[:120])
             if (walmart_lookup_candidate is not None and

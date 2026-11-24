@@ -213,7 +213,8 @@ class TaxProfileExtraction(BaseModel):
 
 class Target(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    by: Literal["role", "label", "text", "placeholder"]
+    # field: name is the number «#n» from the «campos» list, for controls without a usable label.
+    by: Literal["role", "label", "text", "placeholder", "field"]
     name: str
     role: str | None
     exact: bool
@@ -224,7 +225,7 @@ class Action(BaseModel):
     # read_text, search_web, view_ticket, back, reload and upload are tools the agent
     # uses to resolve a blocked step by itself before asking the person.
     kind: Literal["click", "fill", "select", "press", "goto", "scroll", "wait", "human", "done",
-                  "read_text", "search_web", "view_ticket", "back", "reload", "upload"]
+                  "read_text", "search_web", "view_ticket", "back", "reload", "upload", "ask"]
     target: Target | None
     value: str | None
     reason: str

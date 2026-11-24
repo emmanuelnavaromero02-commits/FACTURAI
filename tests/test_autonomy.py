@@ -24,7 +24,7 @@ class FakeFrame:
     def __init__(self, text, url='https://estacionamientos.fibrauno.mx/facturar'):
         self.text, self.url = text, url
 
-    async def evaluate(self, _script):
+    async def evaluate(self, _script, *_args):
         return self.text
 
 

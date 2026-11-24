@@ -246,6 +246,13 @@ class Store:
                     db.execute('INSERT OR IGNORE INTO chat_queue(job_id,at) VALUES(?,?)', (job_ids[0], timestamp))
         return self.chat_turn(request_id)
 
+    def add_assistant_message(self, text: str, job_ids: list[str], intent: str = 'question') -> None:
+        """A message the assistant starts on its own, such as a question about a ticket."""
+        with self.connect() as db:
+            db.execute('''INSERT INTO chat_messages(id,role,text,at,files,job_ids,intent)
+                VALUES(?,?,?,?,?,?,?)''', (uuid.uuid4().hex, 'assistant', text[:2000], now(), '[]',
+                                             json.dumps(job_ids), intent))
+
     def queue_chat_job(self, key: str) -> None:
         with self.connect() as db:
             db.execute('INSERT OR IGNORE INTO chat_queue(job_id,at) VALUES(?,?)', (key, now()))
@@ -679,8 +686,13 @@ class Store:
                        "message='El resultado del portal sigue pendiente. Puedes buscar los comprobantes del ticket.',updated=? "
                        "WHERE status IN ('queued','running','issuing','needs_user') AND "
                        "(issue_attempted=1 OR uuid IS NOT NULL OR status='issuing' OR human_exposed=1)", (now(),))
-            db.execute("UPDATE jobs SET status='ready',message='Trámite interrumpido antes de enviar. Puedes prepararlo de nuevo.',updated=? "
+            # A restart never relaunches a ticket by itself: it waits for the person to
+            # press Preparar or ask to retry in the chat.
+            interrupted = [row['id'] for row in db.execute(
+                "SELECT id FROM jobs WHERE status IN ('queued','running','needs_user') AND issue_attempted=0 AND uuid IS NULL")]
+            db.execute("UPDATE jobs SET status='ready',auto_stage='review',message='Trámite interrumpido antes de enviar. Puedes prepararlo de nuevo.',updated=? "
                        "WHERE status IN ('queued','running','needs_user') AND issue_attempted=0 AND uuid IS NULL", (now(),))
+            db.executemany('DELETE FROM chat_queue WHERE job_id=?', [(key,) for key in interrupted])
 
     def import_history(self, rows: list[dict]):
         with self.connect() as db:

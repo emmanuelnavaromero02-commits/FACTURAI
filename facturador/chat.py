@@ -135,7 +135,7 @@ async def _retry_answer(store, runner, get_profile) -> tuple[str, list[str]]:
     if not row:
         return 'Aún no hay un ticket para retomar. Envíame una foto del comprobante.', []
     key = row['id']
-    if row['status'] == 'blocked' and not any(row[field] for field in
+    if row['status'] in {'blocked', 'ready'} and not any(row[field] for field in
                                              ('issue_attempted', 'human_exposed', 'issuance_seen', 'uuid')):
         result = await runner.retry_job(key, get_profile)
         if result.get('action') in {'queued', 'recovering'}:
@@ -203,6 +203,13 @@ def chat_router(store, plan, automation, runner, get_profile) -> APIRouter:
                 asset_id = store.save_chat_asset(name, str(path))
                 asset_files.append({'name': name, 'url': '/api/chat/files/' + asset_id})
                 asset_paths.append(path)
+            waiting = runner.open_question() if not prepared and text.strip() else None
+            if waiting:
+                # The agent asked something about the ticket in progress: this is the answer.
+                runner.answer_question(waiting, text.strip())
+                messages = store.save_chat_turn(request_id, text.strip(), asset_files, [waiting], 'answer',
+                                                'Gracias. Sigo con el trámite con lo que me dijiste.')
+                return {'messages': messages, 'job_ids': [waiting], 'intent': 'answer'}
             earlier = next((m for m in reversed(store.chat_messages(8)) if m['role'] == 'user'), None)
             reference = clearly_example(text) or (bool(prepared) and not text.strip() and earlier is not None
                                                   and not earlier['files'] and clearly_example(earlier['text']))
