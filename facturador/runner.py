@@ -444,9 +444,51 @@ class Runner:
         if self.screen is self.personal.view:
             return {**self.personal.state(), 'engine': self.engine, 'return_job_id': self.active_id}
         state = self.viewer.state()
-        job = self.page_job.get(self.viewer.page)
+        job = self.page_job.get(self.viewer.page) if state['open'] else None
         mode = 'idle' if not state['open'] else 'job' if job else 'whatsapp' if self.viewer.page is self.whatsapp else 'portal'
         return {**state, 'mode': mode, 'engine': self.engine, 'job_id': job, 'return_job_id': None, 'tabs': []}
+
+    async def finish_job_browser(self, key: str):
+        """Dismiss a finished ticket; retain only pages needed for result recovery."""
+        pages = [page for page, owner in list(self.page_job.items()) if owner == key]
+        if not pages:
+            return
+        showing = self.viewer.page in pages
+        if showing:
+            personal_revision = self.personal_at_revision == self.viewer.revision
+            await self.viewer.hide(self.viewer.page)
+            if personal_revision:
+                self.personal_at_revision = self.viewer.revision
+        row = self.store.get(key)
+        if row['status'] not in FINAL and (row['status'] != 'blocked' or may_have_issued(row)):
+            return
+        if self.downloads:
+            await asyncio.wait(tuple(self.downloads), timeout=12)
+        for page in pages:
+            try:
+                if not page.is_closed():
+                    await page.close()
+            except BrowserError:
+                pass
+            self.page_job.pop(page, None)
+        self.store.event(key, 'browser_closed', 'Se cerró la pestaña del trámite; la sesión del navegador permanece guardada.')
+
+    async def close_parked_job_pages(self, active_key: str):
+        """Close parked tabs before opening a fresh ticket session."""
+        parked = [(page, owner) for page, owner in list(self.page_job.items())
+                  if owner == active_key or not (owner in self.job_tasks and not self.job_tasks[owner].done())]
+        if parked and self.downloads:
+            await asyncio.wait(tuple(self.downloads), timeout=12)
+        for page, owner in parked:
+            if self.viewer.page is page and self.viewer.visible:
+                await self.viewer.hide(page)
+            try:
+                if not page.is_closed():
+                    await page.close()
+            except BrowserError:
+                pass
+            self.page_job.pop(page, None)
+            self.store.event(owner, 'browser_closed', 'Se cerró la pestaña anterior; el expediente conserva el resultado.')
 
     async def open_personal(self, url=None, channel='', *, action=None, tab_id=None):
         async with self.personal.lock:
@@ -598,6 +640,7 @@ class Runner:
                 await self.recover_only(key, profile)
             finally:
                 self.active_id = None
+                await self.finish_job_browser(key)
 
     def retry_action(self, row):
         pending = self.pending.get(row['id'])
@@ -689,7 +732,7 @@ class Runner:
                 raise ValueError('Guarda tu perfil fiscal para cotejar este ticket.')
             if operation == 'queue':
                 if self.plan.status()['status'] != 'ready':
-                    return {**response, 'action': 'needs_user', 'message': 'Conecta ChatGPT en Ajustes para retomar el trámite.'}
+                    return {**response, 'action': 'needs_user', 'message': 'Conecta tu cuenta en Ajustes para retomar el trámite.'}
                 self.schedule(key, profile, auto_issue=True,
                               confirmed_url=row['receipt'].get('portal_url') or '')
                 return {**response, 'status': 'queued', 'action': 'queued', 'message': 'Ticket en cola para retomar la preparación.'}
@@ -803,7 +846,7 @@ class Runner:
                     message = 'Todavía falta el archivo que pide el portal.' if kind == 'attachment' else 'El portal todavía muestra la verificación.'
                     raise ValueError(message + ' Completa el paso y pulsa Continuar.')
             if kind == 'plan' and decision != 'manual' and self.plan.status()['status'] != 'ready':
-                raise ValueError('Conecta ChatGPT o revisa el cupo antes de continuar.')
+                raise ValueError('Conecta tu cuenta o revisa el cupo antes de continuar.')
         await self.viewer.set_manual(False)
         if decision in {'resume', 'manual'} and (pending.get('uncertain_request')
                 or (kind in MANUAL and self.viewer.page is not pending['page']) or (
@@ -1054,9 +1097,11 @@ class Runner:
                 self.explicit_approval.discard(key)
                 self.captcha_returned.discard(key)
                 await self.viewer.set_manual(False)
+                await self.finish_job_browser(key)
 
     async def _session(self, key: str, profile: Profile, auto_issue: bool, manual: bool):
         committed = issued = False
+        await self.close_parked_job_pages(key)
         job = self.store.get(key)
         receipt = Receipt(**job['receipt'])
         errors = receipt.ready_errors()
@@ -1079,6 +1124,7 @@ class Runner:
         if receipt.provider == CUSTOM_PORTAL:
             self.page_portal_origins[page] = public_portal_origin(receipt.portal_url)
         await self.viewer.show(page, provider['name'])
+        self.store.event(key, 'browser_opened', 'Se abrió el portal del comercio en el navegador del trámite.')
         await open_ticket_portal(page, provider['url'], receipt, visible_challenge, self.store, key)
         if receipt.provider == CUSTOM_PORTAL and not allowed_url(page.url, receipt.provider, receipt.portal_url):
             raise ValueError('El portal redirigió a otro dominio. Confirma la dirección final en la revisión del ticket.')

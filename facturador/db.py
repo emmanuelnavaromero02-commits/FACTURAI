@@ -60,6 +60,14 @@ class Store:
               job_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, next_check INTEGER NOT NULL, paused INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS negative_billing_checks(
               job_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, checked_at INTEGER NOT NULL, preparing INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS chat_messages(
+              id TEXT PRIMARY KEY, role TEXT NOT NULL, text TEXT NOT NULL, at TEXT NOT NULL,
+              files TEXT NOT NULL DEFAULT '[]', job_ids TEXT NOT NULL DEFAULT '[]',
+              intent TEXT NOT NULL DEFAULT '', request_id TEXT UNIQUE, reply_to TEXT);
+            CREATE TABLE IF NOT EXISTS chat_assets(
+              id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS chat_queue(job_id TEXT PRIMARY KEY, at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS chat_requests(request_id TEXT PRIMARY KEY, job_id TEXT NOT NULL);
             """)
             columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
             if 'billing_profile' not in columns:
@@ -168,6 +176,128 @@ class Store:
             db.execute("INSERT INTO jobs(id,receipt,status,source_path,source_hash,batch_id,created,updated) VALUES(?,?,?,?,?,?,?,?)",
                        (key, receipt, "new", path, sha, batch_id, now(), now()))
         return self.get(key), True
+
+    def add_chat_bundle(self, items: list[tuple[str, str, str]], request_id: str = '') -> tuple[str, bool]:
+        """Create one purchase from consecutive photos in a single chat turn."""
+        if not 1 <= len(items) <= 4 or len({sha for _, sha, _ in items}) != len(items):
+            raise ValueError('Envía de una a cuatro fotos distintas del mismo ticket.')
+        batch, primary = 'chat-' + uuid.uuid4().hex, uuid.uuid4().hex
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if request_id:
+                previous = db.execute('SELECT job_id FROM chat_requests WHERE request_id=?',
+                                      (request_id,)).fetchone()
+                if previous:
+                    # The chat turn was not committed yet (the caller checks it first).
+                    # Its retry must enqueue this original job, never create another.
+                    return previous['job_id'], True
+            existing = [db.execute('SELECT id FROM jobs WHERE source_hash=?', (sha,)).fetchone()
+                        for _, sha, _ in items]
+            if any(existing):
+                if len(items) == 1 and existing[0]:
+                    return existing[0]['id'], False
+                raise ValueError('Una de estas fotos ya está en otro expediente. Abre ese ticket antes de añadirle más imágenes.')
+            for index, (path, sha, name) in enumerate(items):
+                key = primary if index == 0 else uuid.uuid4().hex
+                receipt = Receipt(source='archivo: ' + Path(name).name[:100]).model_dump_json()
+                db.execute('''INSERT INTO jobs(id,receipt,status,source_path,source_hash,batch_id,
+                    companion_of,auto_stage,message,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+                    (key, receipt, 'new' if index == 0 else 'attached', path, sha, batch,
+                     '' if index == 0 else primary, '' if index == 0 else 'attached',
+                     '' if index == 0 else 'Parte del mismo ticket.', now(), now()))
+            if len(items) > 1:
+                db.execute('INSERT INTO events(job_id,at,kind,detail) VALUES(?,?,?,?)',
+                           (primary, now(), 'chat_parts', f'{len(items)} imágenes del mismo ticket recibidas.'))
+            if request_id:
+                db.execute('INSERT INTO chat_requests(request_id,job_id) VALUES(?,?)', (request_id, primary))
+        return primary, True
+
+    def chat_messages(self, limit: int = 100) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute('SELECT * FROM chat_messages ORDER BY rowid DESC LIMIT ?', (limit,)).fetchall()
+        return [{**dict(row), 'files': json.loads(row['files']), 'job_ids': json.loads(row['job_ids'])}
+                for row in reversed(rows)]
+
+    def chat_turn(self, request_id: str) -> list[dict]:
+        with self.connect() as db:
+            user = db.execute('SELECT id FROM chat_messages WHERE request_id=?', (request_id,)).fetchone()
+            if not user:
+                return []
+            rows = db.execute('SELECT * FROM chat_messages WHERE id=? OR reply_to=? ORDER BY rowid',
+                              (user['id'], user['id'])).fetchall()
+        return [{**dict(row), 'files': json.loads(row['files']), 'job_ids': json.loads(row['job_ids'])}
+                for row in rows]
+
+    def save_chat_turn(self, request_id: str, text: str, files: list[dict], job_ids: list[str],
+                       intent: str, answer: str, *, queue_job: bool = False) -> list[dict]:
+        user_id, answer_id = uuid.uuid4().hex, uuid.uuid4().hex
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            existing = db.execute('SELECT id FROM chat_messages WHERE request_id=?', (request_id,)).fetchone()
+            if not existing:
+                timestamp = now()
+                db.execute('''INSERT INTO chat_messages(id,role,text,at,files,job_ids,intent,request_id)
+                    VALUES(?,?,?,?,?,?,?,?)''', (user_id, 'user', text, timestamp, json.dumps(files, ensure_ascii=False),
+                                                  json.dumps(job_ids), intent, request_id))
+                db.execute('''INSERT INTO chat_messages(id,role,text,at,files,job_ids,intent,reply_to)
+                    VALUES(?,?,?,?,?,?,?,?)''', (answer_id, 'assistant', answer, timestamp, '[]',
+                                                  json.dumps(job_ids), intent, user_id))
+                if queue_job and job_ids:
+                    db.execute('INSERT OR IGNORE INTO chat_queue(job_id,at) VALUES(?,?)', (job_ids[0], timestamp))
+        return self.chat_turn(request_id)
+
+    def queue_chat_job(self, key: str) -> None:
+        with self.connect() as db:
+            db.execute('INSERT OR IGNORE INTO chat_queue(job_id,at) VALUES(?,?)', (key, now()))
+
+    def chat_jobs(self) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute('''SELECT j.* FROM chat_queue q JOIN jobs j ON j.id=q.job_id
+                ORDER BY q.at,q.job_id''').fetchall()
+        return [self.decode(row) for row in rows]
+
+    def has_chat_jobs(self) -> bool:
+        with self.connect() as db:
+            return db.execute('SELECT 1 FROM chat_queue LIMIT 1').fetchone() is not None
+
+    def finish_chat_job(self, key: str) -> None:
+        with self.connect() as db:
+            db.execute('DELETE FROM chat_queue WHERE job_id=?', (key,))
+
+    def confirm_chat_payment(self, key: str, code: str) -> None:
+        """Record an explicit payment correction before any portal submission."""
+        from .models import SAT_PAYMENT_CODES
+        if code not in SAT_PAYMENT_CODES or code == '99':
+            raise ValueError('Forma de pago inválida.')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = self.decode(db.execute('SELECT * FROM jobs WHERE id=?', (key,)).fetchone())
+            if (row['status'] not in {'new', 'review', 'ready', 'blocked'} or row['historical']
+                    or row['issue_attempted'] or row['human_exposed'] or row['issuance_seen'] or row['uuid']):
+                raise ValueError('El ticket ya avanzó; no se puede cambiar la forma de pago aquí.')
+            receipt = Receipt.model_validate(row['receipt'])
+            if receipt.payment_code and receipt.payment_code != code:
+                raise ValueError('La forma de pago difiere de la que ya aparece en el ticket. Revisa el original.')
+            receipt.payment_code = code
+            db.execute('''UPDATE jobs SET receipt=?,confirmed_payment=?,status='review',auto_stage='retry_read',
+                read_after=0,message=?,updated=? WHERE id=?''',
+                (receipt.model_dump_json(), code, 'Forma de pago recibida. Releyendo el ticket completo.', now(), key))
+            db.execute('INSERT INTO events(job_id,at,kind,detail) VALUES(?,?,?,?)',
+                       (key, now(), 'payment_confirmed', 'Forma de pago SAT ' + code + ' confirmada por el usuario.'))
+            db.execute('INSERT OR IGNORE INTO chat_queue(job_id,at) VALUES(?,?)', (key, now()))
+
+    def chat_asset(self, asset_id: str) -> dict:
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM chat_assets WHERE id=?', (asset_id,)).fetchone()
+        if not row:
+            raise KeyError(asset_id)
+        return dict(row)
+
+    def save_chat_asset(self, name: str, path: str) -> str:
+        key = uuid.uuid4().hex
+        with self.connect() as db:
+            db.execute('INSERT INTO chat_assets(id,name,path) VALUES(?,?,?)', (key, Path(name).name[:100], path))
+        return key
 
     def batch_unread(self, key: str) -> bool:
         """Keep a ready ticket in the inbox until every sibling has been classified."""

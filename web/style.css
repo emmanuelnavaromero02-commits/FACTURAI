@@ -239,3 +239,71 @@ textarea { resize: vertical; }
   .followup-fields .fields { grid-template-columns: minmax(0, 1fr); }
   .followup-actions button { white-space: normal; }
 }
+
+/* The conversation is the application's primary surface. Existing tools remain
+   available through Settings, while the same live viewer is mounted in the chat. */
+.sidebar, .topbar { display: none; }
+main { margin-left: 0; }
+.chat-screen { width: min(920px, 100%); min-height: 100vh; padding: 0 24px; display: flex; flex-direction: column; }
+.chat-header { min-height: 70px; display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 1px solid var(--line); }
+.chat-header h1 { font-size: 18px; letter-spacing: -.03em; }
+.chat-settings { font-size: 12px; color: var(--muted); padding: 8px 10px; border-radius: 8px; }
+.chat-settings:hover { color: var(--green); background: #eaf2ec; }
+.chat-content { flex: 1; min-height: 0; padding: 20px 0 28px; }
+.chat-thread { display: grid; gap: 18px; }
+.chat-welcome { padding: min(18vh, 120px) 12px 50px; text-align: center; }
+.chat-welcome h2 { font-size: clamp(24px, 4vw, 32px); letter-spacing: -.05em; }
+.chat-welcome p { max-width: 450px; margin: 9px auto 0; color: var(--muted); font-size: 14px; }
+.chat-message { max-width: min(680px, 90%); padding: 13px 16px; border-radius: 17px; font-size: 14px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-message[data-role="user"] { justify-self: end; background: #e6eee8; border-bottom-right-radius: 5px; }
+.chat-message[data-role="assistant"] { justify-self: start; background: #fff; border: 1px solid var(--line); border-bottom-left-radius: 5px; }
+.chat-message p { white-space: pre-wrap; }
+.chat-message small { display: block; margin-top: 7px; color: var(--muted); font-size: 10px; }
+.chat-message-files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.chat-message-files a { max-width: 100%; display: grid; gap: 4px; padding: 5px 8px; border: 1px solid #cbd9d1; border-radius: 7px; color: var(--green); background: #fff; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-message-files a img { display: block; max-width: 160px; max-height: 150px; object-fit: contain; border-radius: 5px; }
+.chat-message-files a span { overflow: hidden; text-overflow: ellipsis; }
+.chat-progress { margin-top: 22px; padding: 15px 17px; background: #fff; border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 2px 12px #1e312508; }
+.chat-progress-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; align-items: center; font-size: 14px; }
+.chat-progress-heading span { font-size: 11px; color: var(--green); font-weight: 700; }
+.chat-progress > p { color: var(--muted); font-size: 12px; margin-top: 7px; }
+.chat-progress .buttons { margin-top: 10px; }
+.chat-events { display: grid; gap: 8px; max-height: 280px; overflow-y: auto; margin-top: 14px; border-top: 1px solid #edf1ed; padding-top: 12px; }
+.chat-event { display: grid; grid-template-columns: 9px minmax(0, 1fr); gap: 9px; align-items: start; font-size: 11px; color: var(--muted); }
+.chat-event::before { content: ''; width: 7px; height: 7px; margin-top: 5px; border-radius: 50%; background: #7bad91; }
+.chat-event strong { display: block; color: var(--ink); font-size: 11px; }
+.chat-event p { margin-top: 2px; overflow-wrap: anywhere; }
+.chat-browser-slot { margin-top: 15px; }
+.chat-browser-slot #screen-navegador { width: 100%; padding: 0; }
+.chat-browser-slot #screen-navegador > .screen-header { display: none; }
+.chat-browser-slot .browser-grid { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.chat-browser-slot .browser-card { border-radius: 14px; }
+.chat-browser-slot .browser-bar, .chat-browser-slot .browser-tabs, .chat-browser-slot .browser-tools { display: none; }
+.chat-browser-slot .browser-stage { aspect-ratio: 1280 / 720; }
+.chat-browser-slot .task-card { display: none; }
+.chat-compose { position: sticky; bottom: 0; z-index: 2; padding: 12px 0 max(18px, env(safe-area-inset-bottom)); background: linear-gradient(0deg, var(--paper) 86%, #f5f7f300); }
+.chat-compose-row { display: flex; align-items: end; gap: 8px; padding: 8px; background: #fff; border: 1px solid #cbdad1; border-radius: 17px; box-shadow: 0 4px 22px #10251e12; }
+.chat-compose-row:focus-within { border-color: #6da68b; box-shadow: 0 0 0 3px #a6d0b530; }
+.chat-compose textarea { min-height: 40px; max-height: 160px; flex: 1; padding: 10px 4px; border: 0; resize: none; background: transparent; font-size: 14px; line-height: 1.45; }
+.chat-compose textarea:focus { outline: none; }
+.chat-icon, .chat-send { width: 40px; height: 40px; flex: 0 0 40px; display: grid; place-items: center; border: 0; border-radius: 11px; font-size: 23px; }
+.chat-icon { background: #edf4ef; color: var(--green); }
+.chat-send { background: var(--green); color: #fff; font-size: 18px; }
+.chat-icon:hover { background: #dcebe0; }
+.chat-send:hover { background: var(--green-hover); }
+.chat-attachments { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 7px; }
+.chat-attachments:empty { display: none; }
+.chat-attachment { display: inline-flex; align-items: center; gap: 8px; padding: 6px 8px 6px 10px; background: #fff; border: 1px solid var(--line); border-radius: 8px; font-size: 11px; max-width: 100%; }
+.chat-attachment span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-attachment-thumb { width: 30px; height: 30px; flex: none; object-fit: cover; border-radius: 5px; }
+.chat-attachment button { border: 0; background: transparent; color: var(--muted); font-size: 16px; }
+.chat-screen.chat-dragging .chat-compose-row { border-color: var(--green); background: #eff8f1; }
+#chat-status { min-height: 18px; margin: 4px 6px 0; color: var(--muted); font-size: 11px; }
+#chat-status.error { color: var(--danger); }
+@media (max-width: 710px) {
+  .chat-screen { padding: 0 12px; }
+  .chat-header { min-height: 58px; }
+  .chat-content { padding-top: 16px; }
+  .chat-message { max-width: 95%; }
+  .chat-browser-slot .browser-stage { aspect-ratio: 390 / 470; }
+}

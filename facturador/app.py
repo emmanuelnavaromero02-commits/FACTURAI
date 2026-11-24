@@ -25,6 +25,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .auth import CALLBACK, ChatGPTPlan, PlanError, read_json, write_private
 from .automation import TicketAutomation
 from .catalog import CATALOG, CUSTOM_PORTAL, portal_suggestions
+from .chat import chat_router
 from .db import Store
 from .diagnostics import check_tools
 from .invoice_mail import InvoiceMailRecovery
@@ -124,6 +125,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     mail_recovery = InvoiceMailRecovery(store, lambda: automation.enabled and gmail_connection.status() == 'connected',
                                         lambda: runner.active_id)
     app.state.automation = automation
+    app.include_router(chat_router(store, plan, automation, runner, profile))
     wa_routes = whatsapp_router(store, runner, profile)
     app.include_router(wa_routes)
     app.include_router(portal_accounts_router(root, runner.viewer, profile))
@@ -157,6 +159,10 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     @app.get("/app.js")
     def javascript():
         return FileResponse(BASE / "web" / "app.js", media_type="application/javascript")
+
+    @app.get('/chat.js')
+    def chat_script():
+        return FileResponse(BASE / 'web' / 'chat.js', media_type='application/javascript')
 
     @app.get("/style.css")
     def stylesheet():

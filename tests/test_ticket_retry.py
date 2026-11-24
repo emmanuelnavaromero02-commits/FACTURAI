@@ -146,8 +146,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.store.enter_intervention(self.key, 'captcha', 'Verificación pendiente', False)
         page = Mock()
         page.is_closed.return_value = False
-        runner.viewer.page = page
-        runner.viewer.manual = True
+        await runner.viewer.show(page, 'Portal de prueba', manual=True)
         runner.active_id = self.key
         runner.page_job[page] = self.key
         runner.pending[self.key] = {'kind': 'captcha', 'page': page,
@@ -177,8 +176,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.store.enter_intervention(self.key, 'unknown', 'Revisa el portal', True)
         page = Mock()
         page.is_closed.return_value = False
-        runner.viewer.page = page
-        runner.viewer.manual = True
+        await runner.viewer.show(page, 'Portal de prueba', manual=True)
         runner.active_id = self.key
         runner.page_job[page] = self.key
         runner.pending[self.key] = {'kind': 'unknown', 'page': page,

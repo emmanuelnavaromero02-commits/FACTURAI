@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#142722">
-  <title>Facturador · Tu bandeja de CFDI</title>
+  <title>FACTURAI</title>
   <link rel="stylesheet" href="/style.css">
   <script type="module" src="/app.js"></script>
 </head>
@@ -18,7 +18,7 @@
       <a href="#portales" data-nav="portales"><span aria-hidden="true">↗</span>Portales</a>
       <a href="#ajustes" data-nav="ajustes"><span aria-hidden="true">⚙</span>Ajustes</a>
     </nav>
-    <a class="sidebar-status" href="#ajustes"><span class="status-dot" id="sidebar-dot"></span><span>ChatGPT <small id="sidebar-plan">Por conectar</small></span><b aria-hidden="true">↗</b></a>
+    <a class="sidebar-status" href="#ajustes"><span class="status-dot" id="sidebar-dot"></span><span>Conexión <small id="sidebar-plan">Por conectar</small></span><b aria-hidden="true">↗</b></a>
   </aside>
 
   <main id="main">
@@ -29,7 +29,31 @@
       <button id="captcha-action" type="button" class="primary">Resolver verificación</button>
     </section>
 
-    <section class="screen" id="screen-bandeja" aria-labelledby="inbox-title">
+    <section class="screen chat-screen" id="screen-chat" aria-labelledby="chat-title">
+      <header class="chat-header"><h1 id="chat-title">FACTURAI</h1><a href="#ajustes" class="chat-settings" aria-label="Ajustes">Ajustes</a></header>
+      <div class="chat-content">
+        <div id="chat-thread" class="chat-thread" role="log" aria-live="polite" aria-label="Conversación"></div>
+        <section id="chat-progress" class="chat-progress" aria-label="Actividad del trámite" hidden>
+          <div class="chat-progress-heading"><strong id="chat-progress-title">Trámite</strong><span id="chat-progress-state"></span></div>
+          <p id="chat-progress-message"></p>
+          <div id="chat-progress-actions" class="buttons"></div>
+          <div id="chat-events" class="chat-events"></div>
+        </section>
+        <div id="chat-browser-slot" class="chat-browser-slot" hidden></div>
+      </div>
+      <form id="chat-form" class="chat-compose" aria-label="Enviar mensaje o fotos">
+        <div id="chat-attachments" class="chat-attachments" aria-live="polite"></div>
+        <div class="chat-compose-row">
+          <button id="chat-attach" type="button" class="chat-icon" aria-label="Adjuntar fotos o PDF" title="Adjuntar fotos o PDF">＋</button>
+          <textarea id="chat-text" rows="1" maxlength="4000" placeholder="Escribe un mensaje o adjunta fotos de un ticket…" aria-label="Mensaje"></textarea>
+          <button id="chat-send" type="submit" class="chat-send" aria-label="Enviar mensaje" title="Enviar mensaje">➜</button>
+        </div>
+        <p id="chat-status" role="status"></p>
+      </form>
+      <input id="chat-files" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,image/jpeg,image/png,image/webp,application/pdf" multiple hidden>
+    </section>
+
+    <section class="screen" id="screen-bandeja" hidden aria-labelledby="inbox-title">
       <header class="screen-header"><div><p class="eyebrow">OPERACIONES</p><h1 id="inbox-title">Tickets y facturas</h1><p>Revisa tus compras, sigue su facturación y conserva los comprobantes.</p></div><button id="primary-upload" class="primary"><span aria-hidden="true">＋</span> Añadir tickets</button></header>
       <div class="metrics" aria-label="Resumen de la bandeja">
         <div class="metric"><span class="metric-mark mint">▤</span><div><strong id="count-total">0</strong><span>Tickets registrados</span></div></div>
@@ -40,7 +64,7 @@
         <section class="card receipts">
           <div class="card-heading"><div><h2>Bandeja de tickets</h2><p>De la foto al PDF y XML.</p></div><button id="batch" class="secondary" disabled>Preparar listos</button></div>
           <div class="automation-panel">
-            <label class="check-row"><input type="checkbox" id="automation-enabled" disabled aria-describedby="automation-help"><strong>Procesar al subir con ChatGPT</strong></label>
+            <label class="check-row"><input type="checkbox" id="automation-enabled" disabled aria-describedby="automation-help"><strong>Procesar al subir</strong></label>
             <p id="automation-help">Lee los tickets y abre el portal cuando los datos estén completos. La bandeja te avisa si falta algo.</p>
             <p id="automation-status" role="status"></p>
             <button id="automation-review" type="button" class="primary" hidden></button>
@@ -55,7 +79,7 @@
             <button id="gmail-inbox" class="secondary wide-button">Importar desde Gmail</button>
             <button id="add-sample" class="plain wide-button">Cargar ticket de ejemplo</button>
           </section>
-          <section class="card connection-card"><span class="source-icon sand" aria-hidden="true">✳</span><h2>Tu plan de ChatGPT</h2><p id="plan-card-description">Conecta tu suscripción para leer tickets y preparar los portales.</p><a class="inline-link" href="#ajustes" id="plan-card-link">Conectar ChatGPT <span aria-hidden="true">→</span></a></section>
+          <section class="card connection-card"><span class="source-icon sand" aria-hidden="true">✳</span><h2>Conexión</h2><p id="plan-card-description">Conecta el servicio de lectura para preparar tickets y portales.</p><a class="inline-link" href="#ajustes" id="plan-card-link">Conectar <span aria-hidden="true">→</span></a></section>
         </aside>
       </div>
     </section>
@@ -104,7 +128,7 @@
     </section>
 
     <section class="screen" id="screen-ajustes" hidden aria-labelledby="settings-title">
-      <header class="screen-header"><div><h1 id="settings-title">Ajustes</h1><p>Vincula tu plan y configura los datos de los CFDI.</p></div></header>
+      <header class="screen-header"><div><a class="inline-link" href="#chat">← Volver al chat</a><h1 id="settings-title">Ajustes</h1><p>Configura tus datos fiscales y conexiones.</p></div></header>
       <div class="settings-grid">
         <section class="card settings-card"><div class="card-heading"><h2>Herramientas y recuperación</h2></div>
           <div class="settings-body"><p>Comprueba el navegador, la lectura de tickets y el almacenamiento con una muestra local.</p>
@@ -112,7 +136,7 @@
             <p id="tools-status" role="status"></p><dl id="tools-report" class="diagnostic-list"></dl>
           </div></section>
         <section class="card settings-card"><div class="card-heading"><div><h2>Datos fiscales</h2><p>Sube tu constancia del SAT en PDF o foto para llenar los datos del receptor.</p></div></div>
-          <form id="profile" class="settings-body"><div class="buttons"><button id="upload-csf" class="primary" type="button">Subir constancia</button><button id="read-csf" class="secondary" type="button">Leer con ChatGPT</button></div>
+          <form id="profile" class="settings-body"><div class="buttons"><button id="upload-csf" class="primary" type="button">Subir constancia</button><button id="read-csf" class="secondary" type="button">Leer constancia</button></div>
           <p id="csf-status" role="status"></p><div class="fields">
             <label>RFC<input name="rfc" required maxlength="13" autocomplete="off"></label>
             <label>Código postal<input name="postal_code" required pattern="[0-9]{5}" inputmode="numeric" maxlength="5"></label>
@@ -124,8 +148,8 @@
             <label class="full">Tu WhatsApp para registros que pidan teléfono (opcional)<input name="whatsapp_phone" type="tel" maxlength="32" placeholder="+52…"></label>
           </div><div class="buttons"><button class="primary">Guardar datos fiscales</button><button id="read-csf-local" class="secondary" type="button">Revisar texto de la constancia</button></div></form>
         </section>
-        <section class="card settings-card"><div class="card-heading"><div><h2>Suscripción de ChatGPT</h2><p>Usa el cupo de la cuenta que autorices.</p></div><span class="pill" id="plan-status">Por conectar</span></div>
-          <div class="settings-body"><p id="plan-email" class="muted"></p><p id="plan-message" class="muted"></p><div class="buttons"><button id="pod-connect" class="primary" data-oai-siwc-button>Continuar con ChatGPT</button><button id="pod-other" class="plain" hidden>Usar otra cuenta</button><button id="pod-disconnect" class="secondary" hidden>Desconectar</button><button id="pod-retry" class="secondary" hidden>Revisar cupo</button></div>
+        <section class="card settings-card"><div class="card-heading"><div><h2>Servicio de lectura</h2><p>Vincula la cuenta que autorices para procesar tus tickets.</p></div><span class="pill" id="plan-status">Por conectar</span></div>
+          <div class="settings-body"><p id="plan-email" class="muted"></p><p id="plan-message" class="muted"></p><div class="buttons"><button id="pod-connect" class="primary" data-oai-siwc-button>Conectar cuenta</button><button id="pod-other" class="plain" hidden>Usar otra cuenta</button><button id="pod-disconnect" class="secondary" hidden>Desconectar</button><button id="pod-retry" class="secondary" hidden>Revisar cupo</button></div>
           <div id="model-row" class="model-row" hidden><div><strong>Modelo</strong><p id="current-model"></p></div><button class="secondary" id="model-list">Elegir modelo</button></div></div>
         </section>
         <section class="card settings-card"><div class="card-heading"><div><h2>Gmail</h2><p>Lee los códigos de registro y recupera archivos PDF, XML y ZIP.</p></div><span class="pill" id="gmail-status">Por conectar</span></div><div class="settings-body"><p class="muted">Importa el JSON de un cliente OAuth de escritorio de Google. Al conectar, Google te pedirá en otra pestaña que autorices a FACTURAI a leer el buzón. Mantén abierto el acceso a FACTURAI hasta regresar.</p><div class="buttons"><button id="gmail-configure" class="secondary">Importar cliente OAuth</button><button id="gmail-connect" class="primary" disabled>Conectar Gmail</button><a class="secondary button-link" href="https://mail.google.com/" target="_blank" rel="noopener noreferrer">Abrir Gmail en mi Chrome</a><button id="gmail-disconnect" class="plain" hidden>Desvincular</button></div></div></section>
@@ -196,9 +220,9 @@
   <dialog id="prepare-dialog"><form id="prepare-form" class="dialog-body">
     <div class="dialog-heading"><div><h2>Preparar factura</h2><p id="prepare-summary"></p></div><button type="button" class="icon-button" data-close="prepare-dialog" aria-label="Cerrar">×</button></div>
     <label class="check-row"><input type="checkbox" name="consent" required><span>Autorizo usar el ticket y mis datos fiscales en los portales indicados.</span></label>
-    <label>Cómo tramitarlo<select id="run-mode" name="mode"><option value="agent">Con mi plan de ChatGPT</option><option value="manual">Operar el portal a mano</option></select></label>
+    <label>Cómo tramitarlo<select id="run-mode" name="mode"><option value="agent">Automáticamente</option><option value="manual">Operar el portal a mano</option></select></label>
     <p id="manual-notice" class="muted" hidden>El portal quedará bajo tu control. El expediente guardará un posible intento de emisión antes de habilitar el mouse y el teclado. Al terminar se cotejarán tus descargas.</p>
-    <label class="check-row" id="auto-row"><input type="checkbox" name="auto_issue"><span>Emitir CAPUFE automáticamente si coinciden los datos. El resto requiere revisión.</span></label>
+    <label class="check-row" id="auto-row"><input type="checkbox" name="auto_issue"><span>Emitir automáticamente cuando los datos coincidan y el portal lo permita.</span></label>
     <div class="dialog-actions"><button class="secondary" type="button" data-close="prepare-dialog">Cancelar</button><button class="primary">Iniciar facturación</button></div>
   </form></dialog>
 

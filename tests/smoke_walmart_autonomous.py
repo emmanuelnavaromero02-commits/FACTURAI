@@ -31,7 +31,7 @@ FISCAL = f'''<!doctype html><html><body><form>
   <label>Correo Electrónico<input value="{PROFILE.email}"></label>
   <label>Régimen Fiscal<select><option value="612" selected>Personas Físicas con Actividades Empresariales y Profesionales</option></select></label>
   <label>Uso Factura<select><option value="G03" selected>Gastos en general</option></select></label>
-  <button type="button" onclick="window.submits=(window.submits||0)+1;
+  <button type="button" onclick="window.submits=(window.submits||0)+1; console.log('TEST_WALMART_ISSUE');
     document.body.innerHTML='<p>Factura emitida</p>'">Aceptar</button>
 </form></body></html>'''
 
@@ -47,6 +47,10 @@ async def smoke():
         runner = Runner(store)
         try:
             await runner.start_browser()
+            issue_clicks = []
+            runner.context.on('page', lambda page: page.on('console',
+                              lambda message: issue_clicks.append(message.text)
+                              if message.text == 'TEST_WALMART_ISSUE' else None))
 
             async def portal(route):
                 if route.request.url == ROOT:
@@ -73,11 +77,11 @@ async def smoke():
                 await asyncio.wait_for(runner.job_tasks[key], timeout=30)
 
             page = runner.viewer.page
-            assert await page.evaluate('window.submits') == 1, {
+            assert issue_clicks == ['TEST_WALMART_ISSUE'], {
                 'url': page.url, 'row': store.get(key)['status'], 'message': store.get(key)['message'],
                 'events': [(event['kind'], event['detail']) for event in store.events(key)],
-                'body': (await page.locator('body').inner_text())[:500],
             }
+            assert not runner.browser_state()['open'] and runner.browser_state()['mode'] == 'idle'
             result = store.get(key)
             assert result['issue_attempted'] and result['issuance_seen']
             assert not result['human_exposed'] and result['status'] == 'issued_waiting_files'

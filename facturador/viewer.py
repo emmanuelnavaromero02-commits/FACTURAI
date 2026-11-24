@@ -38,6 +38,7 @@ class PortalUpload:
 class BrowserView:
     def __init__(self):
         self.page = None
+        self.visible = False
         self.revision = 0
         self.title = ''
         self.manual = False
@@ -57,13 +58,14 @@ class BrowserView:
         return self.page is not None and not self.page.is_closed()
 
     def state(self) -> dict:
-        address = urlsplit(self.page.url) if self.open else None
+        shown = self.visible and self.open
+        address = urlsplit(self.page.url) if shown else None
         url = address._replace(query='', fragment='').geturl() if address else ''
-        return {'open': self.open, 'revision': self.revision, 'label': self.title,
+        return {'open': shown, 'revision': self.revision, 'label': self.title if shown else '',
                 'url': url, 'manual': self.manual and self.open,
-                'upload': {'id': self.file_request.id, 'origin': self.file_request.origin} if self.file_request else None,
+                'upload': {'id': self.file_request.id, 'origin': self.file_request.origin} if shown and self.file_request else None,
                 'dialog': {'id': self.dialog_key, 'type': self.dialog.type, 'text': self.dialog.message[:400]}
-                if self.dialog else None}
+                if shown and self.dialog else None}
 
     async def show(self, page, title: str, *, manual=False):
         async with self.commands:
@@ -71,7 +73,26 @@ class BrowserView:
             self.page = page
             self.title = title
             self.manual = manual
+            self.visible = True
             self.revision += 1
+
+    async def hide(self, page=None):
+        """Stop streaming a completed ticket while retaining its page for safe recovery."""
+        async with self.commands:
+            if page is not None and self.page is not page:
+                return False
+            await self._release()
+            dialog = self.dialog
+            self.dialog, self.dialog_key = None, ''
+            self.manual = False
+            self.visible = False
+            self.revision += 1
+            if dialog:
+                try:
+                    await dialog.dismiss()
+                except Exception:
+                    pass
+            return True
 
     async def set_manual(self, enabled: bool):
         async with self.commands:
@@ -96,7 +117,7 @@ class BrowserView:
                 check()
             if self.channel and (check or self.channel_protected) and time.monotonic() - self.channel_activity < CAPTCHA_IDLE_SECONDS:
                 raise ValueError('Otra pestaña controla esta verificación. Si se desconectó, podrás retomarla en dos minutos.')
-            if not self.open or not self.manual or revision != self.revision or self.dialog:
+            if not self.visible or not self.open or not self.manual or revision != self.revision or self.dialog:
                 raise ValueError('Espera a que el navegador quede disponible para intervenir.')
             await self._release()
             self.channel = secrets.token_urlsafe(24)
@@ -122,7 +143,7 @@ class BrowserView:
             return True
 
     async def frame(self, revision: int) -> bytes | None:
-        if not self.open or revision != self.revision or self.dialog or self.capture.locked():
+        if not self.visible or not self.open or revision != self.revision or self.dialog or self.capture.locked():
             return None
         async with self.capture:
             page = self.page
@@ -157,7 +178,7 @@ class BrowserView:
                 await page.keyboard.press(request.value)
 
     def require_control(self, channel: str):
-        if not self.open or not self.manual or not self.channel or self.dialog or not secrets.compare_digest(channel, self.channel):
+        if not self.visible or not self.open or not self.manual or not self.channel or self.dialog or not secrets.compare_digest(channel, self.channel):
             raise ValueError('El control de esta página ya terminó. Vuelve a tomarlo desde el panel.')
         self.channel_activity = time.monotonic()
 
@@ -216,7 +237,7 @@ class BrowserView:
 
     async def receive_dialog(self, page, dialog):
         # The user reads and answers native dialogs in the panel. Never guess a response.
-        if page is not self.page or self.dialog is not None:
+        if page is not self.page or not self.visible or self.dialog is not None:
             await dialog.dismiss()
             return
         self.dialog = dialog

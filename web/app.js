@@ -2,9 +2,10 @@ import {installViewer} from './visor.js';
 import {installPortalMail} from './correo-portal.js';
 import {installReceiptTools} from './herramientas.js';
 import {installSAT, installWhatsApp} from './seguimiento.js';
+import {installChat} from './chat.js';
 
 const $ = id => document.getElementById(id);
-const sections = {bandeja: 'Bandeja', navegador: 'Navegador', comprobantes: 'Comprobantes', portales: 'Portales', ajustes: 'Ajustes'};
+const sections = {chat: 'Conversación', bandeja: 'Bandeja', navegador: 'Navegador', comprobantes: 'Comprobantes', portales: 'Portales', ajustes: 'Ajustes'};
 const jobLabels = {new: 'Por leer', review: 'Por revisar', external: 'Solicitar al comercio', ready: 'Listo', queued: 'En cola', running: 'En el portal',
   issuing: 'Emisión en trámite', needs_user: 'Requiere tu intervención', issued_waiting_files: 'Emitido · recuperar',
   verified: 'Comprobado', blocked: 'Pendiente', uncertain: 'Resultado incierto', duplicate: 'Duplicado',
@@ -29,7 +30,7 @@ const terminal = new Set(['verified', 'duplicate', 'attached', 'historical']);
 const amountFormat = new Intl.NumberFormat('es-MX', {style: 'currency', currency: 'MXN'});
 const currency = value => value && Number.isFinite(Number(value)) ? amountFormat.format(Number(value)) : '—';
 let state = {token: '', jobs: [], catalog: {}, plan: {}, browser: {}, gmail: 'disconnected'};
-let activeScreen = 'bandeja';
+let activeScreen = 'chat';
 let filter = 'all';
 let busy = false;
 let editing = null;
@@ -119,10 +120,31 @@ function route(screen) {
   openScreen();
 }
 
+function syncChatBrowser() {
+  const page = $('screen-navegador');
+  const slot = $('chat-browser-slot');
+  const challenge = $('captcha-alert');
+  if (activeScreen === 'chat') {
+    if (challenge.previousElementSibling !== $('chat-progress')) $('chat-progress').after(challenge);
+    if (page.parentElement !== slot) slot.append(page);
+    const row = state.jobs.find(job => job.id === state.active_job);
+    const showing = Boolean(row && ['running', 'issuing', 'needs_user'].includes(row.status) &&
+      (!state.browser.mode || state.browser.mode === 'job' || state.browser.job_id === row.id));
+    slot.hidden = !showing;
+    page.hidden = !showing;
+  } else {
+    if (challenge.closest('#screen-chat')) $('screen-chat').before(challenge);
+    if (page.parentElement === slot) $('screen-comprobantes').before(page);
+    slot.hidden = true;
+    page.hidden = activeScreen !== 'navegador';
+  }
+}
+
 function openScreen() {
   const current = location.hash.slice(1);
-  activeScreen = Object.hasOwn(sections, current) ? current : 'bandeja';
+  activeScreen = Object.hasOwn(sections, current) ? current : 'chat';
   for (const page of Object.keys(sections)) $('screen-' + page).hidden = page !== activeScreen;
+  syncChatBrowser();
   for (const anchor of document.querySelectorAll('[data-nav]')) {
     if (anchor.dataset.nav === activeScreen) anchor.setAttribute('aria-current', 'page');
     else anchor.removeAttribute('aria-current');
@@ -144,6 +166,8 @@ const receiptTools = installReceiptTools({api, el, button, link, perform, curren
 const showSAT = installSAT({api, currency});
 const showWhatsApp = installWhatsApp({api, currency, profile: () => state.profile,
   showBrowser: () => route('navegador'), showSettings: () => route('ajustes')});
+const chat = installChat({api, getState: () => state, actionsFor: row => chatActions(row)});
+$('chat-progress').after($('captcha-alert'));
 
 function blank(title, description, mark = '▤') {
   const box = el('div', '', 'empty');
@@ -237,7 +261,7 @@ function recoverGmail(row) {
 
 function readTicket(row) {
   const agent = state.plan.status === 'ready';
-  if (agent && !window.confirm('¿Leer el original con tu plan de ChatGPT?')) return;
+  if (agent && !window.confirm('¿Leer el original con el servicio vinculado?')) return;
   return perform(async () => {
     const result = await api('/api/jobs/' + row.id + '/analyze', 'POST', {mode: agent ? 'agent' : 'local', consent: agent});
     if (result.status === 'review') edit(result);
@@ -275,7 +299,7 @@ function renderCaptcha() {
   if (!row) return;
   const key = row.id;
   const viewing = captchaView(key);
-  const occupied = viewing && viewer.hasControl() && activeScreen === 'navegador';
+  const occupied = viewing && viewer.hasControl() && ['chat', 'navegador'].includes(activeScreen);
   const returning = state.browser.mode === 'personal' && state.browser.return_job_id === key;
   const title = 'Verificación del portal · ' + (row.receipt.merchant || row.receipt.ticket_number || 'Tu ticket');
   const detail = occupied ? 'Resuelve el reto en la imagen del portal. Cuando el portal avance, pulsa Devolver control.' :
@@ -291,7 +315,7 @@ function renderCaptcha() {
 
 if ($('captcha-action')) $('captcha-action').onclick = () => {
   const key = $('captcha-action').dataset.ticket;
-  const returningControl = captchaView(key) && activeScreen === 'navegador' && viewer.hasControl();
+  const returningControl = captchaView(key) && ['chat', 'navegador'].includes(activeScreen) && viewer.hasControl();
   perform(async () => {
     await refresh();
     if (captchaTicket()?.id !== key) throw Error('Este ticket ya no solicita tu verificación.');
@@ -301,12 +325,12 @@ if ($('captcha-action')) $('captcha-action').onclick = () => {
       return;
     }
     if (state.browser.mode === 'personal' && state.browser.return_job_id === key) {
-      if (!state.supports_captcha_control) { route('navegador'); return 'Pulsa Volver al trámite y comprueba el ticket antes de tomar control.'; }
+      if (!state.supports_captcha_control) { route('chat'); return 'Comprueba el ticket antes de tomar control.'; }
       await viewer.returnToCaptcha(key);
       await refresh();
     }
     if (captchaTicket()?.id !== key || !captchaView(key)) throw Error('El visor de este ticket ya no está disponible.');
-    route('navegador');
+    route('chat');
     if (!state.supports_captcha_control) return 'Comprueba el nombre del ticket y pulsa Tomar control.';
     await viewer.acquireControl(key);
     if (viewer.hasControl()) $('browser-image').scrollIntoView({block: 'center'});
@@ -316,7 +340,7 @@ if ($('captcha-action')) $('captcha-action').onclick = () => {
 function showLive(row) {
   handledLiveJobs.add(row.id);
   lastLiveJob = row.id;
-  route('navegador');
+  route('chat');
   if (state.browser.mode === 'personal' && state.browser.return_job_id === row.id) viewer.returnToJob();
 }
 
@@ -324,8 +348,7 @@ function trackLive(interacting) {
   const row = liveJob();
   if (!row || handledLiveJobs.has(row.id)) return;
   handledLiveJobs.add(row.id);
-  if (activeScreen === 'navegador') lastLiveJob = row.id;
-  if (state.automation?.enabled && !interacting && activeScreen === 'bandeja') showLive(row);
+  lastLiveJob = row.id;
 }
 
 function renderAutomation() {
@@ -403,6 +426,43 @@ function retryButton(row) {
   return control;
 }
 
+function chatActions(row) {
+  const actions = [];
+  const chatQueued = row.batch_id?.startsWith('chat-');
+  const pause = state.automation?.current_id === row.id ? state.automation.phase : '';
+  const retry = retryButton(row);
+  if (retry) actions.push(retry);
+  if (pause === 'waiting_profile') actions.push(link('Completar datos fiscales', '#ajustes', 'primary button-link'));
+  if (pause === 'waiting_plan') actions.push(link('Revisar conexión', '#ajustes', 'primary button-link'));
+  if (row.status === 'review') actions.push(button('Revisar datos del ticket', () => edit(row)));
+  if (row.status === 'new' && !chatQueued && !state.automation?.enabled && !row.receipt.source.startsWith('Ejemplo:')) {
+    actions.push(button('Leer ticket', () => readTicket(row)));
+  }
+  if (row.status === 'ready' && !chatQueued && !state.active_job && !state.automation?.enabled && !row.receipt.source.startsWith('Ejemplo:')) {
+    actions.push(button('Iniciar trámite', () => prepare([row])));
+  }
+  if (row.status === 'needs_user' && row.id === state.active_job) {
+    const kind = row.human_kind;
+    if (kind === 'issue') actions.push(button('Autorizar emisión', () => perform(() =>
+      api(`/api/jobs/${row.id}/decision`, 'POST', {decision: 'approve'})), 'primary'));
+    else if (kind === 'operator' || ['login', 'terms', 'confirm', 'attachment'].includes(kind)) {
+      actions.push(button(kind === 'operator' ? 'Terminar y cotejar' : 'Continuar trámite', () => perform(() =>
+        api(`/api/jobs/${row.id}/decision`, 'POST', {decision: 'resume'})), 'primary'));
+    } else if (kind === 'plan') actions.push(link('Revisar conexión', '#ajustes'));
+    else if (['unknown', 'blocked'].includes(kind) && !retry) {
+      actions.push(button('Volver a intentar', () => perform(() =>
+        api(`/api/jobs/${row.id}/decision`, 'POST', {decision: 'resume'})), 'primary'));
+    }
+  }
+  if (row.id === state.active_job && ['queued', 'running', 'issuing', 'needs_user'].includes(row.status)) {
+    actions.push(button('Detener', () => perform(() => api(`/api/jobs/${row.id}/stop`, 'POST'))));
+  }
+  for (const format of ['pdf', 'xml']) {
+    if (row[`has_${format}`]) actions.push(link('Descargar ' + format.toUpperCase(), `/api/jobs/${row.id}/files/${format}`, 'secondary button-link'));
+  }
+  return actions;
+}
+
 function renderRetryStrip() {
   const choices = state.jobs.filter(row => retryKind(row));
   retryStrip.hidden = !choices.length;
@@ -435,9 +495,9 @@ function primaryAction(row, realTicket) {
   if (isLive(row) || row.id === state.browser.return_job_id) return button('Ver en vivo', () => showLive(row), 'primary');
   if (reading(row)) return null;
   if (row.status === 'new' && realTicket) {
-    if (!state.automation?.enabled) return button(state.plan.status === 'ready' ? 'Leer con ChatGPT' : 'Leer en el contenedor',
+    if (!state.automation?.enabled) return button(state.plan.status === 'ready' ? 'Leer ticket' : 'Leer en el contenedor',
       () => readTicket(row), 'primary');
-    if (state.plan.status !== 'ready') return button('Conectar ChatGPT', () => route('ajustes'));
+    if (state.plan.status !== 'ready') return button('Conectar servicio', () => route('ajustes'));
     return null;
   }
   if (row.status === 'review') {
@@ -454,7 +514,7 @@ function primaryAction(row, realTicket) {
     const custom = row.receipt.provider === 'portal_ticket';
     if (!state.profile) return button('Completar perfil fiscal', () => route('ajustes'));
     if (custom || !state.automation?.enabled) return button(custom ? 'Confirmar portal' : 'Preparar', () => prepare([row]), 'primary');
-    if (state.plan.status !== 'ready') return button('Conectar ChatGPT', () => route('ajustes'));
+    if (state.plan.status !== 'ready') return button('Conectar servicio', () => route('ajustes'));
   }
   return null;
 }
@@ -479,7 +539,7 @@ function rowActions(row) {
   toggle.setAttribute('aria-label', 'Más acciones para ' + (row.receipt.merchant || 'el ticket'));
   const panel = el('div', '', 'more-panel');
   if (review.has(row.status) && !existingAttempt(row) && !reading(row)) {
-    const readLabel = state.plan.status === 'ready' ? 'Leer con ChatGPT' : 'Leer en el contenedor';
+    const readLabel = state.plan.status === 'ready' ? 'Leer ticket' : 'Leer en el contenedor';
     if (primary?.textContent !== readLabel) panel.append(button(readLabel, () => readTicket(row), 'plain'));
     if (row.status !== 'review') panel.append(button('Editar datos', () => edit(row), 'plain'));
     if (row.status === 'ready' && realTicket && row.receipt.provider !== 'portal_ticket' && state.automation?.enabled) {
@@ -549,7 +609,7 @@ function table(container, rows, isDocs = false) {
     if (extras.length) info.append(el('span', `${extras.length} imagen${extras.length === 1 ? '' : 'es'} complementaria${extras.length === 1 ? '' : 's'}`, 'ticket-meta'));
     if (row.message) info.append(el('p', row.message, 'ticket-note'));
     const stateCell = el('td');
-    const statusLabel = reading(row) ? 'Leyendo con ChatGPT' :
+    const statusLabel = reading(row) ? 'Leyendo ticket' :
       row.status === 'new' && state.automation?.enabled && !row.historical && state.plan.status === 'ready' ? 'En cola de lectura' :
       row.status === 'external' && row.issue_attempted ? 'Solicitud en seguimiento' : jobLabels[row.status];
     stateCell.append(el('span', statusLabel || row.status, 'job-status', row.status));
@@ -594,6 +654,7 @@ function renderTickets(force = false) {
 }
 
 function renderBrowser() {
+  syncChatBrowser();
   const personal = state.browser.mode === 'personal';
   const opening = !personal && state.active_job && state.browser.job_id !== state.active_job;
   const browser = opening ? {open: false, revision: state.browser.revision} : state.browser;
@@ -665,17 +726,18 @@ function renderSettings() {
   $('sidebar-dot').classList.toggle('ready', plan.status === 'ready');
   $('plan-status').textContent = labels;
   $('plan-email').textContent = plan.email || '';
-  $('plan-message').textContent = plan.message || '';
+  const planMessage = (plan.message || '').replace(/ChatGPT|OpenAI|\bgpt-[\w.]+\b/gi, 'el servicio');
+  $('plan-message').textContent = planMessage;
   $('pod-connect').hidden = ['ready', 'limit'].includes(plan.status);
-  $('pod-connect').textContent = plan.status === 'identity_only' ? 'Autorizar uso del plan' : 'Continuar con ChatGPT';
+  $('pod-connect').textContent = plan.status === 'identity_only' ? 'Autorizar servicio' : 'Conectar cuenta';
   $('pod-disconnect').hidden = !['ready', 'identity_only', 'limit'].includes(plan.status);
   $('pod-other').hidden = !plan.registered || ['ready', 'limit'].includes(plan.status);
   $('pod-retry').hidden = plan.status !== 'limit';
-  $('model-row').hidden = plan.status !== 'ready';
+  $('model-row').hidden = true;
   $('current-model').textContent = plan.model || '';
   $('plan-card-description').textContent = plan.status === 'ready' ? 'La lectura y la navegación usan tu suscripción.' :
-    plan.message || 'Conecta tu suscripción para leer tickets y preparar los portales.';
-  $('plan-card-link').textContent = plan.status === 'ready' ? 'Administrar plan →' : 'Conectar ChatGPT →';
+    planMessage || 'Conecta el servicio para leer tickets y preparar los portales.';
+  $('plan-card-link').textContent = plan.status === 'ready' ? 'Administrar conexión →' : 'Conectar →';
   $('gmail-status').textContent = state.gmail === 'connected' ? 'Conectado' : state.gmail === 'configured' ? 'Listo para vincular' : 'Por configurar';
   $('gmail-connect').disabled = state.gmail === 'disconnected';
   $('gmail-connect').textContent = state.gmail === 'connected' ? 'Vincular otra cuenta' : 'Conectar Gmail';
@@ -708,6 +770,7 @@ async function refresh() {
   renderBrowser();
   renderCaptcha();
   renderSettings();
+  await chat.refresh(state);
   if (activeScreen === 'portales' && !$('portal-list').children.length) renderPortals();
 }
 
@@ -800,7 +863,7 @@ $('csf-file').onchange = event => {
   if (!file) return;
   if (csfMode === 'local') return receiptTools.openReader(file);
   const mode = csfMode;
-  if (mode === 'agent' && !window.confirm('¿Usar tu plan de ChatGPT para leer esta constancia fiscal?')) return;
+  if (mode === 'agent' && !window.confirm('¿Usar el servicio vinculado para leer esta constancia fiscal?')) return;
   perform(async () => {
     const data = new FormData();
     data.append('file', file);
@@ -816,7 +879,7 @@ $('csf-file').onchange = event => {
     const fields = $('profile').elements;
     const previousRFC = fields.rfc.value.trim().toUpperCase();
     if (previousRFC && !draft.rfc) {
-      $('csf-status').textContent = 'No se pudo cotejar el RFC. Revisa el documento o usa Leer con ChatGPT.';
+      $('csf-status').textContent = 'No se pudo cotejar el RFC. Revisa el documento o usa Leer constancia.';
       return;
     }
     profileDirty = true;
@@ -952,7 +1015,7 @@ $('pod-other').onclick = () => perform(async () => {
 });
 $('pod-disconnect').onclick = () => perform(async () => {
   const result = await api('/api/chatgpt/disconnect', 'POST');
-  return result.remote_revoked ? 'Sesión de ChatGPT desconectada.' : 'Sesión local cerrada. Revisa la conexión en Ajustes de ChatGPT si quieres revocarla.';
+  return result.remote_revoked ? 'Conexión cerrada.' : 'Sesión local cerrada. Revisa la cuenta vinculada si quieres revocarla.';
 });
 $('pod-retry').onclick = () => perform(async () => {await api('/api/chatgpt/retry', 'POST'); return 'Puedes retomar la lectura o el trámite.';});
 $('model-list').onclick = () => perform(async () => {
@@ -1035,7 +1098,7 @@ if (outcome) {
     if (outcome === 'gmail-ok') notify('Gmail vinculado. Puedes cerrar esta pestaña y volver a la pestaña original de FACTURAI.');
     else notify(problems[connectionParams.get('motivo')] || 'La conexión con Gmail no se completó. Vuelve a la pestaña original de FACTURAI e inténtalo de nuevo.', true);
   } else if (outcome === 'chatgpt-error') notify('La conexión no se completó. Puedes volver a iniciarla.', true);
-  else if (outcome.startsWith('chatgpt')) notify('Conexión con ChatGPT guardada. Revisa el estado de tu plan.');
+  else if (outcome.startsWith('chatgpt')) notify('Conexión guardada. Revisa su estado en Ajustes.');
 }
 refresh().then(() => {
   if (activeScreen === 'portales') renderPortals();

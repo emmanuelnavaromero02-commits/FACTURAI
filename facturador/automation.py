@@ -216,7 +216,11 @@ def reconcile_uncertainties(messages: list[str], *, payment_confirmed: bool,
 
 def read_ticket(plan, row, automatic, root, companions=()):
     path = Path(row['source_path'])
-    result = AI(plan).extract(path, {k: v['name'] for k, v in CATALOG.items()}, list(companions))
+    catalog = {k: v['name'] for k, v in CATALOG.items()}
+    if row.get('batch_id', '').startswith('chat-'):
+        result = AI(plan).extract(path, catalog, list(companions), split_ticket=True)
+    else:
+        result = AI(plan).extract(path, catalog, list(companions))
     page = {}
     if not result.is_receipt:
         # A reverse side may contain only the fiscal QR or URL. Keep it readable
@@ -241,11 +245,16 @@ def read_ticket(plan, row, automatic, root, companions=()):
         if evidence and evidence == result.payment_code:
             payment = evidence
         else:
-            try:
-                page = read_local_page(path)
-                payment = printed_payment(page['text'])
-            except (ValueError, OSError, RuntimeError, PyPdfError):
-                pass
+            for original in [path, *companions]:
+                try:
+                    local_page = read_local_page(original)
+                    if original == path:
+                        page = local_page
+                    payment = printed_payment(local_page['text'])
+                    if payment:
+                        break
+                except (ValueError, OSError, RuntimeError, PyPdfError):
+                    continue
     details = result.details
     if 'factur' in page.get('text', '').casefold() and 'factur' not in details.casefold():
         details = (details + ' El original incluye acceso a facturación.').strip()
@@ -512,7 +521,36 @@ class TicketAutomation:
         self._set('queued', key, 'En cola para preparar el portal y continuar donde los datos sean comprobables.')
         return True
 
+    async def chat_step(self):
+        """Process chat uploads independently of the legacy inbox toggle."""
+        ready = self.plan.status()['status'] == 'ready' and self.plan_read_after <= time.time()
+        for row in self.store.chat_jobs():
+            key, stage = row['id'], row['auto_stage']
+            if row['status'] == 'new' or (row['status'] == 'review' and stage in {'offline', 'retry_read'}):
+                if stage == 'retry_read' and row['read_after'] > time.time():
+                    continue
+                if not ready and row['status'] == 'review':
+                    continue
+                self._set('reading', key, 'Leyendo las imágenes del ticket.')
+                await self.analyze(key, automatic=True, offline=not ready)
+                return True
+            if row['status'] == 'ready':
+                prepared = self._prepare(row)
+                updated = self.store.get(key)
+                if updated['status'] != 'ready':
+                    self.store.finish_chat_job(key)
+                if prepared:
+                    return True
+                continue
+            if row['status'] == 'review' and stage.startswith('reading:'):
+                continue
+            self.store.finish_chat_job(key)
+            return True
+        return False
+
     async def step(self):
+        if await self.chat_step():
+            return True
         if not self.enabled:
             return False
         # Explain already extracted tickets without another model request or a field change.
@@ -582,6 +620,6 @@ class TicketAutomation:
                 log.exception('Error al procesar la bandeja de tickets')
                 self._set('review', self._state.get('current_id'), 'Revisa el estado del ticket en la bandeja.')
             try:
-                await asyncio.wait_for(self.wake.wait(), timeout=2 if self.enabled else None)
+                await asyncio.wait_for(self.wake.wait(), timeout=2 if self.enabled or self.store.has_chat_jobs() else None)
             except asyncio.TimeoutError:
                 pass

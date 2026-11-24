@@ -18,6 +18,7 @@ ISSUE = Action(kind='click', target=Target(by='role', role='link', name='Factura
 GOOD_ROW = "<tr><td>1234567</td><td>Premium</td><td>42.567</td><td>1234.56</td></tr>"
 CROSSED_ROWS = ("<tr><td>1234567</td><td>Premium</td><td>42.567</td><td>999.00</td></tr>"
                 "<tr><td>7654321</td><td>Premium</td><td>1.000</td><td>1234.56</td></tr>")
+CHROME = os.getenv('FACTURADOR_CHROMIUM_PATH', '/usr/bin/google-chrome-stable')
 
 
 def simulated_portal(*, total='1234.56', crossed_rows=False, already_billed=False):
@@ -26,16 +27,24 @@ def simulated_portal(*, total='1234.56', crossed_rows=False, already_billed=Fals
         assert GOOD_ROW in html
         html = html.replace(GOOD_ROW, CROSSED_ROWS)
     return html + '''<script>
+      const originalAdd = window._JAEE;
+      window._JAEE = function(...args) {
+        const before = window.__addClicks || 0;
+        const result = originalAdd(...args);
+        if ((window.__addClicks || 0) > before) console.log('TEST_BP_ADD');
+        return result;
+      };
       window.__issueClicks=0;
       document.getElementById('A40').addEventListener('click', event => {
         event.preventDefault();
         window.__issueClicks++;
+        console.log('TEST_BP_ISSUE');
         document.body.insertAdjacentHTML('beforeend', '<p>Factura generada</p>');
       });
     </script>'''
 
 
-@unittest.skipUnless(os.path.isfile('/usr/bin/google-chrome-stable'), 'Requiere Google Chrome oficial')
+@unittest.skipUnless(os.path.isfile(CHROME), 'Requiere Google Chrome oficial')
 class BpRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -49,9 +58,11 @@ class BpRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.plan = Mock()
         self.runner = Runner(self.store, self.plan)
         self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(executable_path='/usr/bin/google-chrome-stable')
+        self.browser = await self.playwright.chromium.launch(executable_path=CHROME)
         self.runner.context = await self.browser.new_context()
         self.html = simulated_portal()
+        self.issue_count = 0
+        self.add_count = 0
         await self.runner.context.route('https://facturacion.grupocentra.mx/**',
                                         lambda route: route.fulfill(content_type='text/html', body=self.html))
         self.addAsyncCleanup(self.playwright.stop)
@@ -76,14 +87,21 @@ class BpRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.runner.execute = guarded_execute
 
     async def open_form(self, page, *_args):
+        def count_action(message):
+            if message.text == 'TEST_BP_ISSUE':
+                self.issue_count += 1
+            elif message.text == 'TEST_BP_ADD':
+                self.add_count += 1
+        page.on('console', count_action)
         await page.goto(FORM)
 
     async def issue_clicks(self):
-        return await self.runner.viewer.page.evaluate('window.__issueClicks')
+        return self.issue_count
 
     async def test_auto_issue_clicks_once_after_persisting_attempt(self):
         await self.runner.run(self.key, PROFILE, auto_issue=True)
         self.assertEqual(await self.issue_clicks(), 1)
+        self.assertFalse(self.runner.browser_state()['open'])
         self.assertEqual(self.execute_states, [True])
         self.assertTrue(self.store.get(self.key)['issue_attempted'])
         self.assertEqual(sum(event['kind'] == 'issue_attempt' for event in self.store.events(self.key)), 1)
@@ -92,6 +110,7 @@ class BpRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.html = simulated_portal(total='1234.57')
         await self.runner.run(self.key, PROFILE, auto_issue=True)
         self.assertEqual(await self.issue_clicks(), 0)
+        self.assertTrue(self.runner.viewer.page.is_closed())
         self.assertEqual(self.execute_states, [])
         self.assertFalse(self.store.get(self.key)['issue_attempted'])
 
@@ -99,6 +118,7 @@ class BpRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.html = simulated_portal(crossed_rows=True)
         await self.runner.run(self.key, PROFILE, auto_issue=True)
         self.assertEqual(await self.issue_clicks(), 0)
+        self.assertTrue(self.runner.viewer.page.is_closed())
         self.assertEqual(self.execute_states, [])
         self.assertFalse(self.store.get(self.key)['issue_attempted'])
 
@@ -108,8 +128,9 @@ class BpRunnerTests(unittest.IsolatedAsyncioTestCase):
                    return_value=False) as reprint:
             await self.runner.run(self.key, PROFILE, auto_issue=True)
         reprint.assert_awaited_once()
-        self.assertEqual(await self.runner.viewer.page.evaluate('window.__addClicks'), 1)
+        self.assertEqual(self.add_count, 1)
         self.assertEqual(await self.issue_clicks(), 0)
+        self.assertTrue(self.runner.viewer.page.is_closed())
         self.assertEqual(self.execute_states, [])
         row = self.store.get(self.key)
         self.assertFalse(row['issue_attempted'])

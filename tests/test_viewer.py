@@ -29,6 +29,22 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
             await viewer.send(event)
         page.keyboard.insert_text.assert_awaited_once()
 
+    async def test_hidden_job_revokes_control_and_does_not_stream_frames(self):
+        viewer = BrowserView()
+        page = SimpleNamespace(is_closed=lambda: False, url='https://example.test/?private=value',
+                               keyboard=SimpleNamespace(insert_text=AsyncMock()),
+                               screenshot=AsyncMock(return_value=b'image'))
+        await viewer.show(page, 'Portal de prueba', manual=True)
+        lease = await viewer.take_control(viewer.revision)
+        old_revision = viewer.revision
+        self.assertTrue(await viewer.hide(page))
+        self.assertFalse(viewer.state()['open'])
+        self.assertEqual(viewer.state()['url'], '')
+        self.assertIsNone(await viewer.frame(old_revision))
+        with self.assertRaises(ValueError):
+            await viewer.send(ViewerInput(channel=lease, kind='text', value='dato'))
+        page.keyboard.insert_text.assert_not_awaited()
+
     async def test_challenge_requires_pause_until_visible_challenge_clears(self):
         self.assertEqual(await visible_challenge(None, 'checkbox: No soy un robot'), 'captcha')
         self.assertIsNone(await visible_challenge(None, 'checkbox [checked]: No soy un robot'))
