@@ -22,6 +22,8 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.store = Store(self.root)
         self.runner = Runner(self.store)
         self.addAsyncCleanup(self.runner.close)
+        # These tests cover the pause itself, so the agent asks at once.
+        self.enterContext(patch('facturador.runner.SELF_HELP_LIMIT', 0))
         row, _ = self.store.add('synthetic.jpg', 'fixture-retry')
         self.key = row['id']
         self.store.save_receipt(self.key, RECEIPT, ready=True)

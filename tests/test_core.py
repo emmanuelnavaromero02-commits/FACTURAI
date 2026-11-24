@@ -193,9 +193,9 @@ class GuardTests(unittest.TestCase):
         self.assertFalse(SUCCESS.search('textbox "Folio fiscal UUID"'))
         self.assertTrue(SUCCESS.search('generic: Factura emitida'))
 
-    def test_enter_cannot_submit_an_unreviewed_form_by_accident(self):
+    def test_enter_goes_through_the_confirmation_check(self):
         action=Action(kind='press',target=Target(by='role',name='Correo',role='textbox',exact=True),value='Enter',reason='seguir',risk='normal')
-        self.assertEqual(action_risk(action),'unknown')
+        self.assertEqual(action_risk(action),'confirm')
         self.assertEqual(action_risk(action.model_copy(update={'target':action.target.model_copy(update={'name':'RFC'})})),'normal')
 
 

@@ -79,6 +79,26 @@ def decode_event_stream(lines):
             yield json.loads(payload)
 
 
+def strict_schema(output_type) -> dict:
+    """Strict structured output requires every property listed, even optional ones."""
+    schema = output_type.model_json_schema()
+
+    def visit(node):
+        if isinstance(node, dict):
+            if node.get('type') == 'object' and 'properties' in node:
+                node['required'] = list(node['properties'])
+                node.setdefault('additionalProperties', False)
+                for value in node['properties'].values():
+                    value.pop('default', None)
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+    visit(schema)
+    return schema
+
+
 class ChatGPTPlan:
     def __init__(self, root: Path, port: int = 8765, client: httpx.Client | None = None):
         self.root = root / 'auth'
@@ -352,7 +372,7 @@ class ChatGPTPlan:
         request = {'model': model, 'reasoning': {'effort': effort}, 'store': False, 'stream': True,
                    'instructions': instructions, 'input': [{'role': 'user', 'content': content}],
                    'text': {'format': {'type': 'json_schema', 'name': output_type.__name__.lower(),
-                                       'strict': True, 'schema': output_type.model_json_schema()}}}
+                                       'strict': True, 'schema': strict_schema(output_type)}}}
         if web_search:
             request.update(tools=[{'type':'web_search', 'search_context_size':'low'}],
                            include=['web_search_call.action.sources'])

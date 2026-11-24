@@ -188,6 +188,11 @@ class Extraction(BaseModel):
     uncertainties: list[str]
 
 
+class WebAnswer(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    answer: str
+
+
 class PortalSearch(BaseModel):
     model_config = ConfigDict(extra='forbid')
     billing_url: str | None
@@ -216,8 +221,14 @@ class Target(BaseModel):
 
 class Action(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["click", "fill", "select", "press", "goto", "scroll", "wait", "human", "done"]
+    # read_text, search_web, view_ticket, back, reload and upload are tools the agent
+    # uses to resolve a blocked step by itself before asking the person.
+    kind: Literal["click", "fill", "select", "press", "goto", "scroll", "wait", "human", "done",
+                  "read_text", "search_web", "view_ticket", "back", "reload", "upload"]
     target: Target | None
     value: str | None
     reason: str
     risk: Literal["normal", "issue", "captcha", "terms", "login", "unknown"]
+    # The agent's running notes: plan, what it tried and what it learned. They are
+    # returned on every step so it keeps the whole ticket in mind.
+    notes: str | None = None

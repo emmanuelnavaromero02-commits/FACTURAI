@@ -34,7 +34,7 @@ class AutomaticReobservationTests(unittest.IsolatedAsyncioTestCase):
                            value='Enter', reason='Avanzar', risk='normal')
         self.assertTrue(press_without_target(unbound))
         self.assertFalse(press_without_target(ambiguous))
-        self.assertEqual(action_risk(ambiguous), 'unknown')
+        self.assertEqual(action_risk(ambiguous), 'confirm')
 
     async def test_untouched_form_reobservation_does_not_claim_operator_approval(self):
         with tempfile.TemporaryDirectory() as directory:

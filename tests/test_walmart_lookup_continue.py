@@ -80,6 +80,7 @@ class WalmartLookupContinueTests(unittest.IsolatedAsyncioTestCase):
             await page.goto(LOOKUP)
 
         with (patch('facturador.runner.open_ticket_portal', side_effect=open_lookup),
+              patch('facturador.runner.PLAN_RETRIES', 0),
               patch('facturador.runner.AI.next_action', side_effect=PlanError('prueba', 'transient')) as model):
             self.runner.schedule(key, PROFILE, auto_issue=False)
             await asyncio.wait_for(self.runner.job_tasks[key], timeout=20)
@@ -105,6 +106,7 @@ class WalmartLookupContinueTests(unittest.IsolatedAsyncioTestCase):
             await page.goto(LOOKUP)
 
         with (patch('facturador.runner.open_ticket_portal', side_effect=open_lookup),
+              patch('facturador.runner.PLAN_RETRIES', 0),
               patch('facturador.runner.AI.next_action', side_effect=PlanError('prueba', 'transient')) as model):
             self.runner.schedule(key, PROFILE, auto_issue=False)
             await asyncio.wait_for(self.runner.job_tasks[key], timeout=20)

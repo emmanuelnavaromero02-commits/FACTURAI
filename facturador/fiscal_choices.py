@@ -109,11 +109,11 @@ async def choose(locator, frame, info, kind, expected):
     return actual and is_selected(actual, kind, expected)
 
 
-async def fiscal_choices(page, profile, receipt, *, apply=False):
+async def fiscal_choices(page, profile, receipt, *, apply=False, extra=()):
     """Only act on unambiguous recipient fields in an approved portal frame."""
     fields = {}
     for frame in getattr(page, 'frames', []):
-        if not allowed_url(frame.url, receipt.provider, receipt.portal_url):
+        if not allowed_url(frame.url, receipt.provider, receipt.portal_url, extra):
             continue
         controls = frame.locator(CONTROLS)
         values = await controls.evaluate_all('elements => elements.map(' + INFO + ')')

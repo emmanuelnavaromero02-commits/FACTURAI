@@ -221,7 +221,35 @@ CATALOG = {
 }
 
 
-def allowed_url(url: str, provider: str, portal_url: str = '') -> bool:
+# Billing operators (PAC and invoicing platforms) that merchants commonly hand the
+# ticket to. A merchant portal may redirect to them during the same request.
+BILLING_OPERATORS = (
+    'interfactura.com', 'edicomgroup.com', 'edicom.mx', 'facturehoy.com', 'tralix.com', 'factura.com',
+    'facturama.mx', 'diverza.com', 'sovos.com', 'ecodex.com.mx', 'masfacturas.com', 'facturacionmoderna.com',
+    'solucionfactible.com', 'formasdigitales.mx', 'emitefacturacion.mx', 'facturaelectronica.com.mx',
+    'facto.com.mx', 'facturador.com', 'gosocket.net', 'pegaso.com.mx', 'mysuitecfdi.com', 'mysuite.com.mx',
+    'expidetufactura.com.mx', 'facturacion.com.mx', 'digifact.com.mx', 'sicofi.com.mx', 'cfdi.com.mx',
+    'facturaexpress.mx', 'facturacionenlinea.mx', 'buzone.com.mx', 'efactura.com.mx', 'timbrafacil.com',
+)
+BILLING_PATH = re.compile(r'factur|cfdi|invoic|billing|timbr|comprobante|autofactura|ticket', re.I)
+
+
+def billing_destination(url: str) -> bool:
+    """A public HTTPS page that looks like an invoicing service, not an arbitrary site."""
+    origin = public_portal_origin(url)
+    if not origin:
+        return False
+    host = urlsplit(origin).hostname or ''
+    if any(host == domain or host.endswith('.' + domain) for domain in BILLING_OPERATORS):
+        return True
+    if host.endswith(('sat.gob.mx', 'google.com', 'facebook.com', 'whatsapp.com')):
+        return False
+    return bool(BILLING_PATH.search(host) or BILLING_PATH.search(urlsplit(url).path))
+
+
+def allowed_url(url: str, provider: str, portal_url: str = '', extra=()) -> bool:
+    if extra and public_portal_origin(url) in extra:
+        return True
     if provider == CUSTOM_PORTAL:
         origin = public_portal_origin(portal_url)
         return origin is not None and public_portal_origin(url) == origin
