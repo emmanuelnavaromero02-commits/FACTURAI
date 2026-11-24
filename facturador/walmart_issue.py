@@ -49,9 +49,15 @@ def _ticket_codes(receipt):
     return tc.group(1), next(iter(tr))
 
 
-async def _input_value(form, label):
+async def _input_value(form, label, *, allow_placeholder=False):
     fields = form.get_by_label(label).filter(visible=True)
-    if await fields.count() != 1:
+    count = await fields.count()
+    if count == 0 and allow_placeholder:
+        # Walmart's lookup form names its inputs through placeholders. Its
+        # visible "*" labels have no for/id association with those inputs.
+        fields = form.get_by_placeholder(label).filter(visible=True)
+        count = await fields.count()
+    if count != 1:
         return None
     field = fields.first
     if not await field.evaluate("e => e.matches('input:not([type=hidden]), textarea')"):
@@ -86,7 +92,8 @@ async def walmart_lookup_proof(page, profile, receipt) -> WalmartLookupProof | N
         forms = await page.locator('form:visible').all()
         found = []
         for form in forms or [page.locator('body')]:
-            values = [await _input_value(form, pattern) for pattern in (RFC, POSTAL, TC_FIELD, TR_FIELD)]
+            values = [await _input_value(form, pattern, allow_placeholder=True)
+                      for pattern in (RFC, POSTAL, TC_FIELD, TR_FIELD)]
             if all(value is not None for value in values):
                 found.append(values)
         if len(found) != 1:
@@ -124,7 +131,8 @@ async def walmart_lookup_continue(page, profile, receipt) -> tuple[WalmartLookup
         for container in containers:
             if await container.locator('form:visible').count() > 1:
                 continue
-            values = [await _input_value(container, pattern) for pattern in (RFC, POSTAL, TC_FIELD, TR_FIELD)]
+            values = [await _input_value(container, pattern, allow_placeholder=True)
+                      for pattern in (RFC, POSTAL, TC_FIELD, TR_FIELD)]
             if (values[0] is not None and values[0].upper() == proof.rfc
                     and values[1:] == [proof.postal_code, proof.ticket_number, proof.transaction]):
                 matched = True

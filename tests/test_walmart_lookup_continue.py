@@ -33,6 +33,17 @@ LOOKUP_HTML = f'''<!doctype html><html><body><form>
   <label># Transacción<input value="{TR}"></label>
   <button type="button" onclick="location.href='/address'">Continuar</button>
 </form></body></html>'''
+PLACEHOLDER_LOOKUP_HTML = f'''<!doctype html><html><body>
+<main id="app_main"><div id="invoice_tab_content">
+  <form id="facturar_form">
+    <label>*</label><input id="membershipOrRFC" placeholder="MEMBRESÍA O RFC" value="{PROFILE.rfc}">
+    <label>*</label><input id="postalCode" placeholder="Código Postal" value="{PROFILE.postal_code}">
+    <label>*</label><input id="ticketNumber" placeholder="Número de Ticket" value="{TC}">
+    <label>*</label><input id="transactionNumber" placeholder="# Transacción" value="{TR}">
+  </form>
+  <div id="form_actions_row"><button id="form_btn_accept" type="button"
+    onclick="location.href='/address'">Continuar</button></div>
+</div></main></body></html>'''
 
 
 @unittest.skipUnless(os.path.isfile(CHROME), 'Requiere Google Chrome oficial')
@@ -47,10 +58,11 @@ class WalmartLookupContinueTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(browser_env.stop)
         await self.runner.start_browser()
         self.addAsyncCleanup(self.runner.close)
+        self.lookup_html = LOOKUP_HTML
 
         async def portal(route):
             if route.request.url == LOOKUP:
-                await route.fulfill(content_type='text/html; charset=utf-8', body=LOOKUP_HTML)
+                await route.fulfill(content_type='text/html; charset=utf-8', body=self.lookup_html)
             elif route.request.url == ADDRESS:
                 await route.fulfill(content_type='text/html; charset=utf-8',
                                     body='<html><body><h1>Datos fiscales</h1></body></html>')
@@ -82,6 +94,38 @@ class WalmartLookupContinueTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result['issue_attempted'])
         self.assertFalse(result['human_exposed'])
         self.assertEqual(self.runner.browser_state()['mode'], 'idle')
+
+    async def test_runner_continues_real_placeholder_layout_without_model(self):
+        self.lookup_html = PLACEHOLDER_LOOKUP_HTML
+        row, _ = self.store.add('synthetic.png', 'walmart-placeholder-lookup')
+        key = row['id']
+        self.store.save_receipt(key, RECEIPT, ready=True)
+
+        async def open_lookup(page, *_args):
+            await page.goto(LOOKUP)
+
+        with (patch('facturador.runner.open_ticket_portal', side_effect=open_lookup),
+              patch('facturador.runner.AI.next_action', side_effect=PlanError('prueba', 'transient')) as model):
+            self.runner.schedule(key, PROFILE, auto_issue=False)
+            await asyncio.wait_for(self.runner.job_tasks[key], timeout=20)
+
+        events = [event['kind'] for event in self.store.events(key)]
+        self.assertEqual(events.count('ticket_lookup_verified'), 1)
+        self.assertEqual(events.count('issue_attempt'), 0)
+        self.assertEqual(model.call_count, 1)  # Only after the safe lookup reaches /address.
+        self.assertFalse(self.store.get(key)['issue_attempted'])
+
+    async def test_placeholder_lookup_requires_unique_exact_values(self):
+        page = await self.runner.context.new_page()
+        await page.goto(LOOKUP)
+        await page.set_content(PLACEHOLDER_LOOKUP_HTML)
+        self.assertIsNotNone(await walmart_lookup_continue(page, PROFILE, RECEIPT))
+        await page.set_content(PLACEHOLDER_LOOKUP_HTML.replace(TR, '99999'))
+        self.assertIsNone(await walmart_lookup_continue(page, PROFILE, RECEIPT))
+        duplicate = PLACEHOLDER_LOOKUP_HTML.replace('</form>',
+            '<input placeholder="Código Postal" value="76146"></form>')
+        await page.set_content(duplicate)
+        self.assertIsNone(await walmart_lookup_continue(page, PROFILE, RECEIPT))
 
     async def test_lookup_button_requires_unique_visible_verified_control(self):
         page = await self.runner.context.new_page()
