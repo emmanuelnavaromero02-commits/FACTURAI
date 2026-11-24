@@ -109,7 +109,7 @@ class SubscriptionTests(unittest.TestCase):
                                                evidence_url=evidence), [evidence])
         ai.discover_portal('Cafetería')
         self.assertEqual([call.kwargs.get('effort', 'max') for call in plan.infer.call_args_list],
-                         ['max', 'max', 'max', 'max'])
+                         ['max', 'max', 'medium', 'max'])
 
     def test_callback_rejects_wrong_state_and_validation_precedes_inference(self):
         with self.assertRaises(PlanError):

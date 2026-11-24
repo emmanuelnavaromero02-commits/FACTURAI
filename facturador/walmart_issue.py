@@ -210,3 +210,91 @@ async def walmart_issue_button(page, profile, receipt, lookup: WalmartLookupProo
     except BrowserError:
         return None
     return button
+
+
+PAYMENT_WORDS = re.compile(r'efectivo|tarjeta|d[eé]bito|cr[eé]dito|vales?|transferencia|monedero|cheque', re.I)
+PLACEHOLDER = re.compile(r'^\s*(?:-+\s*)?(?:seleccion[ae]|elige|select|escoge)\b', re.I)
+
+
+async def walmart_payment_issue(page, receipt, lookup: WalmartLookupProof | None) -> bool:
+    """True when Walmart's payment page shows exactly the ticket's payment form, ready to submit.
+
+    Walmart asks the payment form on its own page after the fiscal form and its
+    «¿Están correctos todos sus datos?» check. That page's submit is the emission.
+    """
+    if (not lookup or not _host(page) or urlsplit(page.url).path.rstrip('/') in {'', '/ticket', '/address'}
+            or _ticket_codes(receipt) != (lookup.ticket_number, lookup.transaction)
+            or lookup.payment_code != receipt.payment_code or not receipt.payment_code
+            or receipt.payment_code == '99'):
+        return False
+    try:
+        choices = await page.locator('select:visible').evaluate_all("""ss => ss.map(s => ({
+            options: Array.from(s.options).map(o => o.label || o.text || ''),
+            value: s.selectedOptions.length === 1 ? s.selectedOptions[0].value : '',
+            label: s.selectedOptions.length === 1 ? (s.selectedOptions[0].label || s.selectedOptions[0].text) : ''}))""")
+        choices = [item for item in choices
+                   if sum(bool(PAYMENT_WORDS.search(option)) for option in item['options']) >= 2]
+        if not choices:
+            choices = await page.locator('input[type=radio]:visible:checked').evaluate_all("""rs => rs.map(r => {
+                const own = r.labels && r.labels.length ? r.labels[0].innerText : (r.getAttribute('aria-label') || '');
+                return {options: [own], value: r.value || '', label: own};
+            })""")
+            choices = [item for item in choices if PAYMENT_WORDS.search(item['label'])]
+        if len(choices) != 1:
+            return False
+        chosen = choices[0]
+        if not chosen['label'].strip() or PLACEHOLDER.search(chosen['label']):
+            return False
+        if await page.locator('input[type=password]:visible, input[autocomplete="one-time-code"]:visible').count():
+            return False
+    except BrowserError:
+        return False
+    return matches(chosen['value'], chosen['label'], 'payment', receipt.payment_code)
+
+
+async def _payment_select(page):
+    """Walmart's single payment list on the payment page, or None."""
+    lists = page.locator('select:visible')
+    found = None
+    for index in range(await lists.count()):
+        control = lists.nth(index)
+        options = await control.locator('option').evaluate_all(
+            'os => os.filter(o => !o.disabled).map(o => [o.value, o.label || o.text || ""])')
+        if sum(bool(PAYMENT_WORDS.search(label)) for _, label in options) >= 2:
+            if found is not None:
+                return None
+            found = control, options
+    return found
+
+
+async def walmart_payment_options(page) -> list[str]:
+    """Visible payment choices of Walmart's payment page, for a question in the chat."""
+    try:
+        found = await _payment_select(page)
+    except BrowserError:
+        return []
+    if not found:
+        return []
+    return [' '.join(label.split())[:60] for _, label in found[1] if label.strip() and not PLACEHOLDER.search(label)][:12]
+
+
+async def walmart_select_payment(page, receipt) -> bool:
+    """Choose the ticket's payment form in Walmart's payment list. True when it changed the page."""
+    if (not _host(page) or urlsplit(page.url).path.rstrip('/') in {'', '/ticket', '/address'}
+            or not receipt.payment_code or receipt.payment_code == '99'):
+        return False
+    try:
+        found = await _payment_select(page)
+        if not found:
+            return False
+        control, options = found
+        valid = [value for value, label in options
+                 if value and not PLACEHOLDER.search(label) and matches(value, label, 'payment', receipt.payment_code)]
+        if len(valid) != 1:
+            return False
+        if await control.input_value() == valid[0]:
+            return False
+        await control.select_option(valid[0], timeout=3000)
+        return await control.input_value() == valid[0]
+    except BrowserError:
+        return False

@@ -210,6 +210,20 @@ def chat_router(store, plan, automation, runner, get_profile) -> APIRouter:
                 messages = store.save_chat_turn(request_id, text.strip(), asset_files, [waiting], 'answer',
                                                 'Gracias. Sigo con el trámite con lo que me dijiste.')
                 return {'messages': messages, 'job_ids': [waiting], 'intent': 'answer'}
+            running = runner.running_job() if not prepared and text.strip() else None
+            if running and not clearly_retry(text):
+                # A ticket is in the portal right now: whatever the person says goes to its agent live.
+                note = text.strip()
+                _, code = payment_correction(text)
+                if code:
+                    note += ' (forma de pago SAT ' + code + ' confirmada por el titular)'
+                runner.tell(running, note)
+                status = (store.get(running) or {}).get('message') or ''
+                answer = 'Se lo pasé al trámite en curso; lo toma en cuenta en su siguiente paso.'
+                if status:
+                    answer += ' Ahora: ' + status[:200]
+                messages = store.save_chat_turn(request_id, text.strip(), asset_files, [running], 'note', answer)
+                return {'messages': messages, 'job_ids': [running], 'intent': 'note'}
             earlier = next((m for m in reversed(store.chat_messages(8)) if m['role'] == 'user'), None)
             reference = clearly_example(text) or (bool(prepared) and not text.strip() and earlier is not None
                                                   and not earlier['files'] and clearly_example(earlier['text']))

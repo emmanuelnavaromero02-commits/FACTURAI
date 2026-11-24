@@ -31,7 +31,7 @@ from .cfdi import UUID_RE
 from .db import Store
 from .documents import job_candidates, reconcile
 from .fiscal_choices import NAMES as FISCAL_FIELDS, fiscal_choices
-from .models import Action, Profile, Receipt, Target
+from .models import SAT_PAYMENT_LABELS, Action, Profile, Receipt, Target
 from .personal_browser import PersonalBrowser
 from .profile_lock import close_context, launch_chrome
 from .portals import capufe_proof, capufe_recipient, normalize
@@ -42,8 +42,9 @@ from .tesoro_recipient import tesoro_recipient
 from .tesoro_result import tesoro_verification_failure
 from .viewer import BrowserView
 from .vianney_consulta import lookup_rejected, rejection_for_current_ticket, recover_vianney_consulta
-from .walmart_issue import (walmart_issue_button, walmart_lookup_continue,
-                           walmart_lookup_proof, walmart_lookup_rejection)
+from .walmart_issue import (walmart_lookup_continue, walmart_lookup_proof,
+                           walmart_lookup_rejection, walmart_payment_issue,
+                           walmart_payment_options, walmart_select_payment)
 
 ISSUE = re.compile(r'\b(facturar|emitir|timbrar|generar\s+(?:mi\s+)?(?:factura|cfdi)|solicitar\s+factura|enviar\s+(?:mi\s+)?(?:factura|cfdi)|s[ií] estoy seguro|confirmar (?:la )?emisi[oó]n)\b', re.I)
 EMISSION_PATH = re.compile(r'factur|invoice|invoic|cfdi|timbr|emisi|emit|creat|complet|generat|submit', re.I)
@@ -95,7 +96,13 @@ PAGE_TEXT = r"""(start) => {
   });
   return {text: document.body ? document.body.innerText : '', fields: fields, count: items.length};
 }"""
-ASK_TIMEOUT = 300
+ASK_TIMEOUT = 120
+# Each look-up tool may be used this many times per attempt; the page text comes in every step.
+TOOL_LIMITS = {'view_ticket': 2, 'search_web': 2, 'read_text': 4}
+WALMART_FINAL = re.compile(r'CONTINUAR|ACEPTAR|FACTURAR|GENERAR(?: FACTURA)?|EMITIR(?: FACTURA)?|TIMBRAR|'
+                           r'CONFIRMAR|FINALIZAR|SIGUIENTE')
+CONFIRM_STEP = re.compile(r'CONTINUAR|ACEPTAR|CONFIRMAR|SI|SÍ|FACTURAR|GENERAR(?: FACTURA)?|EMITIR(?: FACTURA)?|'
+                          r'TIMBRAR|FINALIZAR')
 MAX_QUESTIONS = 3
 IDLE_BEFORE_ASK = 10
 TOOLS = {'read_text', 'search_web', 'view_ticket', 'back', 'reload', 'upload'}
@@ -280,6 +287,8 @@ class Runner:
         self.soft_submitted: set[str] = set()
         # Questions the agent asked in the chat, answered by the person's next message.
         self.questions: dict[str, asyncio.Future] = {}
+        # Chat messages the person sent while their ticket was being processed.
+        self.live_notes: dict[str, list[str]] = {}
         self.manual_download_error = ''
 
     async def start_browser(self):
@@ -1071,6 +1080,22 @@ class Runner:
             start += int(result.get('count', 0))
         return '\n'.join(parts), fields
 
+    def running_job(self) -> str | None:
+        """The ticket the agent is working on right now, if any."""
+        key = self.active_id
+        task = self.job_tasks.get(key) if key else None
+        return key if task is not None and not task.done() else None
+
+    def tell(self, key: str, text: str) -> None:
+        """Hand a chat message to the agent of a ticket in progress; it reads it on its next step."""
+        text = ' '.join(text.split())[:600]
+        if not text:
+            return
+        notes = self.live_notes.setdefault(key, [])
+        notes.append(text)
+        del notes[:-6]
+        self.store.event(key, 'user_note', 'El agente recibió un mensaje del chat.')
+
     def open_question(self) -> str | None:
         """The ticket whose agent is waiting for an answer in the chat."""
         return next((key for key, future in self.questions.items() if not future.done()), None)
@@ -1334,6 +1359,7 @@ class Runner:
                 self.job_origins.pop(key, None)
                 self.session_hints.pop(key, None)
                 self.soft_submitted.discard(key)
+                self.live_notes.pop(key, None)
                 await self.viewer.set_manual(False)
                 await self.finish_job_browser(key)
 
@@ -1389,6 +1415,10 @@ class Runner:
         failures: dict[str, int] = {}
         idle_steps = 0
         questions = 0
+        tool_counts: dict[str, int] = {}
+        tool_streak = 0
+        emission_steps = 0
+        last_emission_view = None
         answer_note = ''
         before_action = None
         tesoro_lookup_attempted = False
@@ -1416,7 +1446,7 @@ class Runner:
                 self.store.event(key, 'notice_dismissed', 'Se cerró el aviso informativo de captura fiscal de Walmart.')
                 continue
             if (receipt.provider == 'walmart' and walmart_lookup is not None
-                    and urlsplit(page.url).path.rstrip('/') != '/address'):
+                    and urlsplit(page.url).path.rstrip('/') in {'', '/ticket'}):
                 walmart_lookup = None
             if receipt.provider == 'tesoro' and tesoro_lookup_attempted and not committed and not issued:
                 rejected = await tesoro_verification_failure(page, receipt, profile)
@@ -1542,6 +1572,9 @@ class Runner:
                 if changed:
                     self.store.event(key, 'campo_verificado', 'Selección cotejada: ' + FISCAL_FIELDS[changed])
                     continue
+                if receipt.provider == 'walmart' and await walmart_select_payment(page, receipt):
+                    self.store.event(key, 'campo_verificado', 'Forma de pago del ticket elegida en Walmart.')
+                    continue
                 try:
                     lookup_field = await prefill_ticket_lookup(page, receipt.ticket_number)
                 except BrowserError:
@@ -1627,12 +1660,18 @@ class Runner:
                 continue
             # Accessibility snapshots include complete hrefs on separate /url: lines.
             model_snapshot = '\n'.join(line for line in snapshot.splitlines() if not line.lstrip().startswith('- /url:'))
+            confirmed = {}
+            confirmed_payment = self.store.get(key)['confirmed_payment']
+            if confirmed_payment and confirmed_payment == receipt.payment_code:
+                confirmed['forma_de_pago_sat'] = confirmed_payment
             observation = json.dumps({'url': public_portal_origin(page.url), 'paso': number, 'pasos_maximos': MAX_STEPS,
                                       'emision_intentada': committed, 'emision_visible': issued,
                                       'tus_notas': agent_notes, 'acciones_recientes': recent[-15:],
                                       'ultimo_error': last_error, 'resultado_herramienta': tool_result,
                                       'campos_fiscales_pendientes': pending_fields,
                                       'campos': fields[:120], 'respuesta_del_titular': answer_note,
+                                      'mensajes_del_titular': self.live_notes.get(key, []),
+                                      'datos_confirmados': confirmed,
                                       'operadores_autorizados': sorted(self._extra()),
                                       'estado_visible': model_snapshot[:26_000]}, ensure_ascii=False)
             tool_result = ''
@@ -1661,7 +1700,10 @@ class Runner:
                     if (latest != snapshot or accounts.private_observation(latest) or await visible_challenge(page, latest) or
                             self.viewer.page is not page or not allowed_url(page.url, receipt.provider, receipt.portal_url, self._extra())):
                         continue
-                    action = await asyncio.to_thread(ai.next_action, instructions, observation, image, ticket_view)
+                    # Ordinary steps think briefly; a step after an error or without progress thinks harder.
+                    effort = 'high' if (last_error or idle_steps >= 3 or ticket_view) else 'medium'
+                    action = await asyncio.to_thread(ai.next_action, instructions, observation, image, ticket_view,
+                                                     effort)
                     ticket_view = None
                     plan_failures = 0
             except PlanError as exc:
@@ -1707,6 +1749,17 @@ class Runner:
                 recent.append({'tipo': 'ask', 'control': (action.value or '')[:120]})
                 continue
             if action.kind in TOOLS:
+                tool_counts[action.kind] = tool_counts.get(action.kind, 0) + 1
+                tool_streak += 1
+                limit = TOOL_LIMITS.get(action.kind)
+                if (limit is not None and tool_counts[action.kind] > limit) or (
+                        tool_streak > 2 and action.kind in {'read_text', 'view_ticket', 'search_web'}):
+                    idle_steps += 1
+                    last_error = ('Ya tienes esa información: el texto y los campos vienen en cada paso y el ticket ya '
+                                  'lo revisaste. No vuelvas a consultar: haz la siguiente acción del formulario. '
+                                  'No investigues si un botón emite; el ejecutor coteja y protege la emisión.')
+                    recent.append({'tipo': action.kind, 'control': 'rechazada: ya consultado'})
+                    continue
                 idle_steps += 1
                 tool_result, ticket_view, failure = await self.use_tool(key, page, action, receipt, ai, committed or issued)
                 last_error = failure
@@ -1716,9 +1769,25 @@ class Runner:
                 recent.append({'tipo': action.kind, 'control': label[:120]})
                 self.store.event(key, 'tool', action.kind + ' · ' + (action.reason or '')[:120])
                 continue
+            tool_streak = 0
             risk = action_risk(action)
             name = action.target.name if action.target else ''
-            if risk == 'confirm':
+            walmart_path = urlsplit(page.url).path.rstrip('/') if receipt.provider == 'walmart' else ''
+            walmart_payment = False
+            if (receipt.provider == 'walmart' and not committed and not issued and action.kind == 'click'
+                    and walmart_path not in {'', '/ticket', '/address'}
+                    and WALMART_FINAL.fullmatch(normalize(name))):
+                # After the fiscal form and its «¿Están correctos?» check, Walmart asks the payment
+                # form on its own page; that page's submit button is the emission.
+                risk = 'issue'
+                walmart_payment = True
+            elif (receipt.provider == 'walmart' and walmart_path == '/address' and risk in {'confirm', 'issue'}
+                    and normalize(name) in {'ACEPTAR', 'CONTINUAR'}):
+                # Aceptar and the confirmation dialog's Continuar only lead to the payment page.
+                risk = 'normal'
+            if risk == 'confirm' and (committed or issued):
+                risk = 'normal'
+            elif risk == 'confirm':
                 # «Aceptar», «Enviar» or Enter. On a page that already shows this ticket's RFC,
                 # folio and amount it may be the final submission, so it goes through the
                 # emission gate; otherwise it is an ordinary step of the form.
@@ -1732,22 +1801,14 @@ class Runner:
             walmart_issue_control = None
             walmart_lookup_candidate = None
             walmart_issue_element = None
-            walmart_issue_url = None
+            walmart_issue_url = page.url if walmart_payment else None
             walmart_auto = False
             if (receipt.provider == 'walmart' and not committed and not issued and walmart_lookup is None
-                    and action.kind == 'click' and normalize(name) == 'CONTINUAR'):
+                    and walmart_path in {'', '/ticket'} and action.kind == 'click' and normalize(name) == 'CONTINUAR'):
                 walmart_lookup_candidate = await walmart_lookup_proof(page, profile, receipt)
                 if walmart_lookup_candidate is None:
                     last_error = 'Antes de continuar, coteja RFC, código postal, TC y TR con el ticket.'
                     continue
-            if (receipt.provider == 'walmart' and not committed and not issued
-                    and action.kind == 'click' and action.target and action.target.by == 'role'
-                    and action.target.role == 'button' and action.target.exact
-                    and normalize(name) == 'ACEPTAR'):
-                walmart_issue_control = await walmart_issue_button(page, profile, receipt, walmart_lookup)
-                if walmart_issue_control is not None:
-                    walmart_issue_url = page.url
-                    risk = 'issue'
             if risk == 'forbidden':
                 raise ValueError('La acción no corresponde a solicitar el CFDI de esta compra.')
             if action.kind == 'done':
@@ -1847,6 +1908,20 @@ class Runner:
                         raise ValueError(mismatch)
                 if receipt.provider == 'bp' and not await bp_issue_proof(page, receipt, profile, bp_evidence):
                     raise ValueError('BP no mostró una única compra cotejada con el ticket y el perfil fiscal.')
+                if (walmart_payment and questions < MAX_QUESTIONS and key not in self.explicit_approval
+                        and not await walmart_payment_issue(page, receipt, walmart_lookup)):
+                    # Walmart does not show the ticket's payment form chosen: ask once, live, with its options.
+                    questions += 1
+                    idle_steps = 0
+                    options = await walmart_payment_options(page)
+                    answer = await self.ask_chat(key, 'En la página de pago de Walmart no puedo elegir la forma de pago '
+                                                 'del ticket (clave SAT ' + receipt.payment_code + ' ' +
+                                                 SAT_PAYMENT_LABELS.get(receipt.payment_code, '') + '). Opciones que muestra: ' +
+                                                 (', '.join(options) or 'no veo la lista') + '. ¿Cuál elijo?')
+                    answer_note = answer or 'Sin respuesta: elige la opción equivalente a la clave del expediente.'
+                    last_error = ('Elige en la página de pago la forma de pago del expediente o la que indicó el titular '
+                                  'y vuelve a pulsar el botón.')
+                    continue
                 _, pending_fields = await fiscal_choices(page, profile, receipt, extra=self._extra())
                 if pending_fields:
                     last_error = 'Antes de emitir, el portal debe reflejar ' + ', '.join(pending_fields) + '.'
@@ -1873,8 +1948,8 @@ class Runner:
                                await capufe_proof(page, profile, receipt))
                 bp_auto = (receipt.provider == 'bp' and normalize(name) == 'FACTURAR' and
                            await bp_issue_proof(page, receipt, profile, bp_evidence))
-                walmart_auto = (walmart_issue_element is not None and
-                                await walmart_issue_button(page, profile, receipt, walmart_lookup) is not None)
+                walmart_auto = (walmart_payment and
+                                await walmart_payment_issue(page, receipt, walmart_lookup))
                 # Any other portal emits on its own when the page itself shows this
                 # ticket's folio or code, its amount and the recipient RFC.
                 generic_auto = (receipt.provider not in {'capufe', 'bp', 'walmart'} and
@@ -1897,6 +1972,7 @@ class Runner:
                     continue
                 self.store.begin_emission(key, name)
                 committed = True
+                last_emission_view = page.url, snapshot
             elif committed or issued:
                 recovery_link = issued and action.kind == 'click' and RECOVERY_LINK.search(name)
                 recovery_field = (issued and action.kind == 'fill' and
@@ -1904,10 +1980,17 @@ class Runner:
                                   action.value in {receipt.ticket_number, *receipt.billing_codes, profile.rfc})
                 if (action.kind not in {'wait', 'scroll'} and not recovery_link and not recovery_field and
                         not (action.kind == 'click' and DOWNLOAD.search(name))):
-                    if action.kind == 'click' and re.fullmatch(r'continuar', name.strip(), re.I) and not issued:
+                    if (action.kind == 'click' and not issued and CONFIRM_STEP.fullmatch(normalize(name))
+                            and emission_steps < 3 and last_emission_view != (page.url, snapshot)):
+                        # The portal asks to confirm the emission already started: one click per new screen.
+                        emission_steps += 1
+                        last_emission_view = page.url, snapshot
+                        self.store.event(key, 'emission_step', 'Se confirmó el paso del portal: ' + name[:80])
+                    elif action.kind == 'click' and re.fullmatch(r'continuar', name.strip(), re.I) and not issued:
                         await self.human(key, page, 'confirm', 'Revisa la confirmación que muestra el portal y completa ese paso si coincide con tu ticket.')
                         continue
-                    raise ValueError('Revisa o recupera la factura del intento actual.')
+                    else:
+                        raise ValueError('Revisa o recupera la factura del intento actual.')
             try:
                 before_action = page.url, snapshot
                 if walmart_auto and walmart_issue_element is not None:

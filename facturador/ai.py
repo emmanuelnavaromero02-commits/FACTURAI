@@ -116,14 +116,15 @@ class AI:
         return found.billing_url, found.evidence_url
 
     def next_action(self, instructions: str, state: str, screenshot: bytes | None,
-                    ticket: list[dict] | None = None) -> Action:
+                    ticket: list[dict] | None = None, effort: str = 'medium') -> Action:
         content = [{'type': 'input_text', 'text': state}]
         if screenshot:
             content.append(image_part(screenshot, 'image/jpeg'))
         if ticket:
             content.append({'type': 'input_text', 'text': 'Foto original del ticket que pediste revisar:'})
             content.extend(ticket)
-        return self.plan.infer(instructions, content, Action, effort='max')
+        # Navigation runs many short steps: medium keeps each one fast; the runner raises it when stuck.
+        return self.plan.infer(instructions, content, Action, effort=effort)
 
     def research(self, question: str, merchant: str) -> str:
         """Answer a blocked step from public sources (where a field is, how a portal works)."""

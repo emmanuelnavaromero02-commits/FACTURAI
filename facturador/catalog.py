@@ -111,7 +111,7 @@ CATALOG = {
         "name": "Walmart / Bodega Aurrera",
         "url": "https://facturacion-clientes.walmart.com/",
         "hosts": ["facturacion-clientes.walmart.com", "facturacion.walmartmexico.com.mx"],
-        "guide": "Usar TC y TR completos del ticket, tienda, fecha e importe. Guardar TR y tienda en detalles si no caben en el número de ticket. No asumir crédito a partir de la marca Mastercard: verificar débito/crédito.",
+        "guide": "Usar TC y TR completos del ticket, tienda, fecha e importe. Guardar TR y tienda en detalles si no caben en el número de ticket. Flujo: TC, TR, RFC y CP y Continuar; ficha fiscal y Aceptar; en el aviso «¿Están correctos todos sus datos?» pulsa Continuar; en la página de pago elige la forma de pago del expediente y pulsa su botón: el ejecutor coteja y emite. Si el titular confirmó la forma de pago, úsala aunque la tarjeta diga Mastercard o Visa.",
     },
     "samara": {
         "name": "FUNO / Samara Shops",
