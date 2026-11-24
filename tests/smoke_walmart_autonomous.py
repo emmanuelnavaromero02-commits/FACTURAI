@@ -22,7 +22,7 @@ LOOKUP = f'''<!doctype html><html><body><form>
   <label>Código Postal<input value="{PROFILE.postal_code}"></label>
   <label>Número de Ticket<input value="{TC}"></label>
   <label># Transacción<input value="{TR}"></label>
-  <button type="button" onclick="location.href='/address'">Continuar</button>
+  <button type="button" onclick="setTimeout(() => location.href='/address', 350)">Continuar</button>
 </form></body></html>'''
 FISCAL = f'''<!doctype html><html><body><form>
   <label>RFC<input value="{PROFILE.rfc}"></label>

@@ -1475,6 +1475,13 @@ class Runner:
                     await walmart_issue_element.click(timeout=5000)
                 else:
                     await self.execute(page, action, receipt)
+                if (walmart_lookup_candidate is not None and
+                        urlsplit(page.url).path.rstrip('/') != '/address'):
+                    try:
+                        await page.wait_for_url(re.compile(
+                            r'^https://facturacion-clientes\.walmart\.com/address(?:[/?#].*)?$'), timeout=5000)
+                    except BrowserError:
+                        pass
                 last_error = ''
             except Exception as exc:
                 if committed:
