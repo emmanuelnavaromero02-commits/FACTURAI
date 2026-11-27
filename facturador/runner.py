@@ -1742,7 +1742,8 @@ class Runner:
 
         unbound_press_count = 0
         accounts = PortalAccountFlow(self.store.root, provider['url'], profile, key,
-                                     progress=lambda message: self.store.running_message(key, message))
+                                     progress=lambda message: self.store.running_message(key, message),
+                                     ai=ai, medidor=meter, ticket=receipt)
         for number in range(MAX_STEPS):
             own = None             # the complement's own next action for this pass, when it has one
             page = self.viewer.page

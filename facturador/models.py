@@ -294,3 +294,34 @@ class Plan(BaseModel):
         if not value:
             raise ValueError('El plan debe traer al menos una acción.')
         return value[:PLAN_STEPS]
+
+
+# Where the value of a registration field may come from. It is a closed list: the model picks
+# a source and the program writes the value, so no secret or personal datum travels to the model.
+RegistrationSource = Literal[
+    # Tax profile.
+    'rfc', 'nombre', 'codigo_postal', 'correo', 'regimen', 'uso_cfdi',
+    # «Datos para registros», one per saved key.
+    'nombres', 'apellido_paterno', 'apellido_materno', 'telefono', 'fecha_nacimiento', 'calle',
+    'numero_exterior', 'numero_interior', 'colonia', 'municipio', 'estado', 'pais',
+    # Parts the program derives from them, in the format of the field.
+    'nombre_completo', 'apellidos', 'dia_nacimiento', 'mes_nacimiento', 'anio_nacimiento', 'calle_y_numero',
+    # Written or decided by the program alone.
+    'contrasena_nueva', 'confirmar_contrasena', 'aceptar_terminos', 'opcion', 'omitir', 'falta_dato']
+
+
+class RegistrationField(BaseModel):
+    """The source of one field of a registration form; never its value."""
+    model_config = ConfigDict(extra='forbid')
+    field: str                      # «c3», as numbered in the description of the form
+    source: RegistrationSource
+    option: str | None              # with «opcion»: the visible text of one option that was shown
+    missing: str | None             # with «falta_dato»: the name of the datum the person did not leave
+
+
+class RegistrationPlan(BaseModel):
+    """What one consultation decides for a registration screen described without values."""
+    model_config = ConfigDict(extra='forbid')
+    is_registration: bool           # False when the form does not create a user account
+    fields: list[RegistrationField]
+    submit: str | None              # «b2»: the button that sends this screen, or null when there is none

@@ -61,7 +61,7 @@ async def main():
             password = posted[0][1]['pass'][0]
             assert password == site_password(key, False) and password not in key.read_text()
             paused = await step()
-            assert paused[0] == 'unknown' and 'Gmail' in paused[1]
+            assert paused[0] == 'unknown' and 'correo' in paused[1]  # Any connected mailbox serves, not only Gmail.
             assert page.url == ORIGIN+'/alta'
             (root/'gmail_token.json').write_text('{}')
             msg = enrollment_message()

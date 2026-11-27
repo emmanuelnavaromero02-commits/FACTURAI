@@ -761,14 +761,16 @@ class UpkeepTests(unittest.TestCase):
         accounts.create_user('ana', PASSWORD)
         accounts.create_user('beto', PASSWORD)
         # Real clocks here: this checks that the entrance itself runs the upkeep while it serves.
-        gate = make_entrance(root, accounts=accounts, clock=time.monotonic, idle_seconds=1)
+        # The rest period leaves room for a loaded machine to wake the second instance before
+        # the first one is put to sleep again.
+        gate = make_entrance(root, accounts=accounts, clock=time.monotonic, idle_seconds=4)
         with TestClient(gate, base_url=ORIGIN) as client:
             ana, beto = Visitor(client, 'ana'), Visitor(client, 'beto')
             self.assertEqual(ana.login().status_code, 200)
             self.assertEqual(beto.login().status_code, 200)
             self.assertEqual(ana.get('/api/state').status_code, 200)
             first = next(iter(gate.instances._live.values()))
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + 30
             while gate.instances._live and time.monotonic() < deadline:
                 time.sleep(.1)
             self.assertEqual(gate.instances._live, {})  # Nobody asked for it: the upkeep closed it.

@@ -71,7 +71,7 @@ class RegistrationWaitTests(unittest.IsolatedAsyncioTestCase):
                 patch('facturador.account_flow.asyncio.sleep', new_callable=AsyncMock) as sleeper:
             self.assertEqual(await self.flow._message(self.record, 'code'), 'validado')
         self.assertEqual(lookup.call_count, 7)
-        self.assertEqual([call.args[0] for call in sleeper.await_args_list], [3, 7, 15, 20, 30, 35])
+        self.assertEqual([call.args[0] for call in sleeper.await_args_list], [10, 10, 10, 15, 15, 20])
         self.assertIn('Esperando el correo', self.progress.call_args_list[0].args[0])
         self.assertIn('encontró el correo', self.progress.call_args_list[-1].args[0])
 
@@ -80,7 +80,7 @@ class RegistrationWaitTests(unittest.IsolatedAsyncioTestCase):
                 patch('facturador.account_flow.asyncio.sleep', new_callable=AsyncMock) as sleeper:
             with self.assertRaisesRegex(ValueError, 'Continuar'):
                 await self.flow._message(self.record, 'code')
-        self.assertEqual(sum(call.args[0] for call in sleeper.await_args_list), 145)
+        self.assertEqual(sum(call.args[0] for call in sleeper.await_args_list), 600)
         with patch('facturador.account_flow.registration_email', return_value='validado'):
             self.assertEqual(await self.flow._message(self.record, 'code'), 'validado')
 
