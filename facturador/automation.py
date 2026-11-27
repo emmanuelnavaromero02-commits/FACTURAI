@@ -585,7 +585,7 @@ class TicketAutomation:
 
     async def analyze(self, key: str, automatic=False, offline=False):
         if not offline and self.plan_read_after > time.time():
-            raise ValueError('ChatGPT solicitó una espera. Mientras tanto puedes usar la lectura local.')
+            raise ValueError('La IA pidió una espera. Mientras tanto puedes usar la lectura local.')
         claimed = self.store.claim_read(key, automatic)
         if not claimed:
             return self.store.get(key)
@@ -650,11 +650,11 @@ class TicketAutomation:
     def _plan_ready(self, key):
         state = self.plan.status()
         if state['status'] == 'ready' and self.plan_read_after > time.time():
-            self._set('waiting_read', key, 'ChatGPT solicitó una espera temporal. La bandeja sigue leyendo los originales localmente.')
+            self._set('waiting_read', key, 'La IA pidió una espera temporal. La bandeja sigue leyendo los originales localmente.')
             return False
         if state['status'] == 'ready':
             return True
-        self._set('waiting_plan', key, state.get('message') or 'Conecta o reactiva tu plan de ChatGPT en Ajustes.')
+        self._set('waiting_plan', key, state.get('message') or 'Conecta o reactiva tu conexión de IA en Ajustes.')
         return False
 
     def _prepare(self, row):
@@ -763,7 +763,7 @@ class TicketAutomation:
             if not self._plan_ready(key):
                 read = self._launch_read(key, offline=True)
             else:
-                self._set('reading', key, 'Leyendo el ticket con tu plan de ChatGPT.')
+                self._set('reading', key, 'Leyendo el ticket con la IA.')
                 read = self._launch_read(key, explain=True)
             if wait:
                 await read

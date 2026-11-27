@@ -22,6 +22,7 @@
       <a href="#navegador" data-nav="navegador"><span aria-hidden="true">⊞</span>Navegador</a>
       <a href="#comprobantes" data-nav="comprobantes"><span aria-hidden="true">▣</span>Comprobantes</a>
       <a href="#portales" data-nav="portales"><span aria-hidden="true">↗</span>Portales</a>
+      <a href="#medicion" data-nav="medicion"><span aria-hidden="true">≡</span>Medición</a>
       <a href="#ajustes" data-nav="ajustes"><span aria-hidden="true">⚙</span>Ajustes</a>
     </nav>
     <a class="sidebar-status" href="#ajustes"><span class="status-dot" id="sidebar-dot"></span><span>Conexión <small id="sidebar-plan">Por conectar</small></span><b aria-hidden="true">↗</b></a>
@@ -141,8 +142,16 @@
       <details><summary>Consultar comercios guardados</summary><button type="button" class="secondary" id="open-catalog">Abrir catálogo en el navegador</button><label class="search">Buscar comercio<input id="portal-search" type="search" aria-label="Buscar portal"></label><div class="portal-list" id="portal-list"></div></details>
     </section>
 
+    <section class="screen" id="screen-medicion" hidden aria-labelledby="medicion-title">
+      <header class="screen-header"><div><a class="inline-link" href="#ajustes">← Volver a Ajustes</a><h1 id="medicion-title">Medición</h1><p>Cuántos tickets salen solos, cuánto tardan y cuánto cuestan.</p></div>
+        <div class="filters" role="group" aria-label="Periodo"><button type="button" data-periodo="hoy" aria-pressed="false">Hoy</button><button type="button" data-periodo="7d" aria-pressed="true">7 días</button><button type="button" data-periodo="30d" aria-pressed="false">30 días</button><button type="button" data-periodo="todo" aria-pressed="false">Todo</button></div></header>
+      <p id="medicion-status" class="muted" role="status"></p>
+      <div id="medicion-resumen" class="kpi-grid" aria-label="Resumen del periodo"></div>
+      <section class="card medicion-card" aria-labelledby="medicion-portales-title"><div class="card-heading"><div><h2 id="medicion-portales-title">Por portal</h2><p>«Repetido de memoria» son los pasos que ya sabía de antes, sin preguntar a la IA.</p></div></div><div id="medicion-portales"></div></section>
+    </section>
+
     <section class="screen" id="screen-ajustes" hidden aria-labelledby="settings-title">
-      <header class="screen-header"><div><a class="inline-link" href="#chat">← Volver al chat</a><h1 id="settings-title">Ajustes</h1><p>Configura tus datos fiscales y conexiones.</p></div></header>
+      <header class="screen-header"><div><a class="inline-link" href="#chat">← Volver al chat</a><h1 id="settings-title">Ajustes</h1><p>Configura tus datos fiscales y conexiones.</p></div><nav class="buttons" aria-label="Otras pantallas"><a class="secondary button-link" href="#medicion">Medición</a><a class="secondary button-link" href="#bandeja">Bandeja de tickets</a></nav></header>
       <div class="settings-grid">
         <section class="card settings-card"><div class="card-heading"><h2>Herramientas y recuperación</h2></div>
           <div class="settings-body"><p>Comprueba el navegador, la lectura de tickets y el almacenamiento con una muestra local.</p>
@@ -166,7 +175,49 @@
           <div class="settings-body"><p id="plan-email" class="muted"></p><p id="plan-message" class="muted"></p><div class="buttons"><button id="pod-connect" class="primary" data-oai-siwc-button>Conectar cuenta</button><button id="pod-other" class="plain" hidden>Usar otra cuenta</button><button id="pod-disconnect" class="secondary" hidden>Desconectar</button><button id="pod-retry" class="secondary" hidden>Revisar cupo</button></div>
           <div id="model-row" class="model-row" hidden><div><strong>Modelo</strong><p id="current-model"></p></div><button class="secondary" id="model-list">Elegir modelo</button></div></div>
         </section>
-        <section class="card settings-card"><div class="card-heading"><div><h2>Gmail</h2><p>Lee los códigos de registro y recupera archivos PDF, XML y ZIP.</p></div><span class="pill" id="gmail-status">Por conectar</span></div><div class="settings-body"><p class="muted">Importa el JSON de un cliente OAuth de escritorio de Google. Al conectar, Google te pedirá en otra pestaña que autorices a FACTURAI a leer el buzón. Mantén abierto el acceso a FACTURAI hasta regresar.</p><div class="buttons"><button id="gmail-configure" class="secondary">Importar cliente OAuth</button><button id="gmail-connect" class="primary" disabled>Conectar Gmail</button><a class="secondary button-link" href="https://mail.google.com/" target="_blank" rel="noopener noreferrer">Abrir Gmail en mi Chrome</a><button id="gmail-disconnect" class="plain" hidden>Desvincular</button></div></div></section>
+        <section class="card settings-card"><div class="card-heading"><div><h2>Gmail</h2><p>Lee los códigos de registro y recupera archivos PDF, XML y ZIP.</p></div><span class="pill" id="gmail-status">Por conectar</span></div><div class="settings-body"><p class="muted">Importa el JSON de un cliente OAuth de escritorio de Google. Al conectar, Google te pedirá en otra pestaña que autorices a FACTURAI a leer el buzón. Mantén abierto el acceso a FACTURAI hasta regresar.</p><div class="buttons"><button id="gmail-configure" class="secondary">Importar cliente OAuth</button><button id="gmail-connect" class="primary" disabled>Conectar Gmail</button><a class="secondary button-link" href="https://mail.google.com/" target="_blank" rel="noopener noreferrer">Abrir Gmail en mi Chrome</a><button id="gmail-disconnect" class="plain" hidden>Desvincular</button></div><p id="gmail-send-status" class="muted" hidden></p><div class="buttons"><button id="gmail-send" class="secondary" type="button" hidden>Permitir que Gmail también envíe</button></div></div></section>
+        <section class="card settings-card" id="mail-card" aria-labelledby="mail-title"><div class="card-heading"><div><h2 id="mail-title">Correo</h2><p>Tu buzón para encontrar facturas y pedirlas a los comercios.</p></div><span class="pill" id="mail-pill">Por conectar</span></div>
+          <div class="settings-body"><p id="mail-summary" class="muted"></p>
+            <form id="mail-form"><fieldset id="mail-fields" class="followup-fields">
+              <legend class="visually-hidden">Cuenta de correo</legend>
+              <div class="fields">
+                <label class="full">Usuario de la cuenta (normalmente tu correo)<input name="user" required maxlength="254" autocomplete="off" autocapitalize="none" spellcheck="false" inputmode="email"></label>
+                <label class="full">Contraseña de aplicación<input name="password" type="password" required maxlength="512" autocomplete="new-password" aria-describedby="mail-password-help"></label>
+                <details class="full help-note" id="mail-password-help"><summary>¿Qué es una contraseña de aplicación?</summary><p>Es una contraseña aparte que tu proveedor de correo crea solo para un programa. No es la contraseña con la que entras a tu correo. Créala en la seguridad de tu cuenta (en Gmail, Outlook o Yahoo se llama así) y pégala aquí. Puedes borrarla allá cuando quieras.</p></details>
+                <label>Servidor de entrada (IMAP)<input name="imap_host" required maxlength="253" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="imap.ejemplo.com"></label>
+                <label>Puerto de entrada<input name="imap_port" type="number" required min="1" max="65535" value="993" inputmode="numeric"></label>
+                <label>Servidor de salida (SMTP)<input name="smtp_host" maxlength="253" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="smtp.ejemplo.com" aria-describedby="mail-smtp-help"></label>
+                <label>Puerto de salida<input name="smtp_port" type="number" min="1" max="65535" value="465" inputmode="numeric"></label>
+                <p id="mail-smtp-help" class="muted full">Sin servidor de salida solo busco facturas; con él también puedo pedirlas.</p>
+                <details class="full help-note"><summary>Más opciones</summary><div class="fields">
+                  <label class="full">Dirección que envía, si es distinta del usuario<input name="address" type="email" maxlength="254" autocomplete="off" spellcheck="false"></label>
+                  <label class="full">Cifrado de salida<select name="smtp_tls"><option value="">Automático según el puerto</option><option value="ssl">SSL (puerto 465)</option><option value="starttls">STARTTLS (puerto 587)</option></select></label>
+                </div></details>
+              </div>
+              <div class="buttons"><button class="primary" type="submit">Conectar correo</button></div>
+            </fieldset></form>
+            <div class="buttons" id="mail-actions" hidden><button id="mail-test" class="secondary" type="button">Probar conexión</button><button id="mail-disconnect" class="plain" type="button">Desconectar</button></div>
+            <p id="mail-feedback" role="status"></p>
+          </div></section>
+        <section class="card settings-card" aria-labelledby="wa-title"><div class="card-heading"><div><h2 id="wa-title">WhatsApp</h2><p>WhatsApp Web en el navegador de FACTURAI, para pedir facturas a los comercios.</p></div><span class="pill" id="wa-link-pill">Sin revisar</span></div>
+          <div class="settings-body"><p id="wa-link-message" role="status"></p><p id="wa-link-checked" class="muted"></p>
+            <div class="buttons"><button id="wa-link-check" class="secondary" type="button">Comprobar</button><button id="wa-link-open" class="secondary" type="button">Abrir WhatsApp Web</button></div>
+            <p id="wa-photos" class="muted"></p></div></section>
+        <section class="card settings-card" id="ia-card" aria-labelledby="ia-title"><div class="card-heading"><div><h2 id="ia-title">Inteligencia artificial</h2><p>Qué IA lee tus tickets y llena los portales.</p></div><span class="pill" id="ia-pill">Plan de ChatGPT</span></div>
+          <div class="settings-body">
+            <fieldset class="followup-fields ia-choice"><legend>IA en uso</legend><div id="ia-options" class="ia-options"></div></fieldset>
+            <p id="ia-feedback" role="status"></p>
+            <div id="ia-keys" class="ia-keys"></div>
+            <details class="help-note ia-details"><summary>Precios por millón de tokens</summary>
+              <form id="ia-prices-form" class="ia-prices"><p class="muted">Copia los precios de la página de tu proveedor. Sin precio, el costo sale como «sin precio».</p>
+                <label class="ia-currency">Moneda<input name="moneda" required maxlength="3" minlength="3" pattern="[A-Za-z]{3}" autocomplete="off" value="USD"></label>
+                <div id="ia-price-rows" class="ia-price-rows"></div><p id="ia-price-empty" class="muted">Aún no hay precios.</p>
+                <div class="buttons"><button type="button" id="ia-price-add" class="secondary">Agregar modelo</button><button class="primary" type="submit">Guardar precios</button></div>
+              </form></details>
+            <section class="ia-usage" aria-labelledby="ia-usage-title"><div class="ia-usage-head"><h3 id="ia-usage-title">Uso de la IA</h3>
+              <label>Periodo<select id="ia-usage-period"><option value="hoy">Hoy</option><option value="7d">7 días</option><option value="30d" selected>30 días</option><option value="todo">Todo</option></select></label></div>
+              <div id="ia-usage" aria-live="polite"></div></section>
+          </div></section>
         <section class="card settings-card"><div class="card-heading"><div><h2>Historial anterior</h2><p>Incorpora el registro del facturador anterior.</p></div></div><div class="settings-body"><p class="muted">Importa el JSON de historial para reconocer tickets ya registrados.</p><button class="secondary" id="import-history">Importar historial</button></div></section>
       </div>
     </section>
@@ -205,6 +256,12 @@
       <label class="full">Códigos de facturación<textarea name="billing_codes" placeholder="Un código por línea" rows="2" maxlength="2500"></textarea></label>
       <label class="full">Detalles<textarea name="details" placeholder="Tienda, carril, hora u otra referencia" rows="2" maxlength="1800"></textarea></label>
     </div>
+    <fieldset class="fields merchant-contact">
+      <legend>Contacto del comercio (opcional)</legend>
+      <label>RFC del comercio<input name="issuer_rfc" maxlength="13" autocomplete="off" autocapitalize="characters" spellcheck="false" pattern="[A-Za-zÑñ&amp;]{3,4}[0-9]{6}[A-Za-z0-9]{3}" title="12 o 13 caracteres, como aparece en el ticket"></label>
+      <label>WhatsApp para facturar<input name="merchant_whatsapp" type="tel" maxlength="32" autocomplete="off" placeholder="+52…" pattern="\+?[0-9 .\(\)\-]{8,24}" title="Número con código de país, por ejemplo +52 55 1234 5678"></label>
+      <label class="full">Correo para facturar<input name="merchant_email" type="email" maxlength="254" autocomplete="off" spellcheck="false"></label>
+    </fieldset>
     <div class="dialog-actions"><a id="view-source" class="inline-link" target="_blank" rel="noopener">Ver original ↗</a><button class="primary">Guardar revisión</button></div>
   </form></dialog>
 
@@ -256,11 +313,15 @@
     <div class="followup-result" aria-live="polite" aria-atomic="true">
       <strong id="wa-job-state"></strong><p id="wa-job-message"></p><p class="muted" id="wa-job-record" hidden></p>
     </div>
+    <p id="wa-job-attention" class="attention-note" role="alert" hidden></p>
+    <p id="wa-job-conversation" class="muted" aria-live="polite" hidden></p>
+    <p id="wa-job-link-state" class="muted" hidden></p>
     <form id="wa-job-form" hidden>
       <fieldset id="wa-job-fields" class="followup-fields">
         <legend>Solicitud al comercio</legend>
         <label>Número de WhatsApp del comercio, con código de país
-          <input id="wa-job-phone" name="phone" type="tel" required maxlength="30" placeholder="+52 664 123 4567" autocomplete="off"></label>
+          <input id="wa-job-phone" name="phone" type="tel" required maxlength="30" placeholder="+52 664 123 4567" autocomplete="off" aria-describedby="wa-job-phone-hint"></label>
+        <p id="wa-job-phone-hint" class="muted" hidden>Lo tomé del ticket. Puedes cambiarlo si no es correcto.</p>
         <div class="fields">
           <label>Constancia fiscal (opcional)<input name="csf" type="file" accept=".pdf,.jpg,.jpeg,.png,.webp"></label>
           <label>Comprobante de pago (opcional)<input name="voucher" type="file" accept=".pdf,.jpg,.jpeg,.png,.webp"></label>
@@ -270,6 +331,8 @@
           <span>Autorizo enviar a este número el ticket original, mis datos fiscales, mi correo y los archivos que seleccioné.</span></label>
         <label class="check-row"><input name="watch" type="checkbox" checked>
           <span>Buscar automáticamente la respuesta de este comercio y guardar los comprobantes de este ticket. Requiere Docker en ejecución y WhatsApp Web vinculado.</span></label>
+        <label class="check-row"><input name="reply" type="checkbox">
+          <span>Contestar al comercio por mí<small>Si su robot pide datos, contesto con tus datos fiscales guardados. Si pide algo que no sé, te aviso.</small></span></label>
         <div class="buttons"><button class="primary" type="submit">Enviar solicitud por WhatsApp</button></div>
       </fieldset>
     </form>
@@ -279,6 +342,21 @@
         <span>Buscar automáticamente el PDF y XML de este ticket</span></label>
       <p id="wa-job-tracking-detail" class="muted"></p>
     </div>
+    <div id="wa-job-reply-row" class="followup-fields" hidden>
+      <label class="check-row"><input id="wa-job-reply" type="checkbox">
+        <span>Contestar al comercio por mí<small>Contesto con tus datos fiscales guardados. Si pide algo que no sé, te aviso.</small></span></label>
+    </div>
+    <form id="wa-job-complete-form" hidden>
+      <fieldset id="wa-job-complete-fields" class="followup-fields">
+        <legend>Completar envío</legend>
+        <p class="muted">El envío quedó a medias. Reviso el chat y mando solo lo que falte, una sola vez. Si el primer envío llevaba constancia o comprobante, vuelve a elegirlos.</p>
+        <div class="fields">
+          <label>Constancia fiscal (si la enviaste)<input name="csf" type="file" accept=".pdf,.jpg,.jpeg,.png,.webp"></label>
+          <label>Comprobante de pago (si lo enviaste)<input name="voucher" type="file" accept=".pdf,.jpg,.jpeg,.png,.webp"></label>
+        </div>
+        <div class="buttons"><button class="primary" type="submit">Completar envío</button></div>
+      </fieldset>
+    </form>
     <div class="buttons followup-actions">
       <button type="button" id="wa-job-recover" class="primary" hidden>Buscar PDF y XML en el chat</button>
       <button type="button" id="wa-job-chat" class="secondary" hidden>Abrir conversación</button>
@@ -286,6 +364,39 @@
       <button type="button" id="wa-job-settings" class="secondary" hidden>Completar datos fiscales</button>
       <button type="button" id="wa-job-refresh" class="plain">Actualizar estado</button>
     </div>
+  </div></dialog>
+
+  <dialog id="mail-job-dialog" aria-labelledby="mail-job-title"><div class="dialog-body">
+    <div class="dialog-heading"><div><h2 id="mail-job-title">Factura por correo</h2><p id="mail-job-ticket"></p></div>
+      <button type="button" class="icon-button" data-close="mail-job-dialog" aria-label="Cerrar solicitud por correo">×</button></div>
+    <div class="followup-result" aria-live="polite" aria-atomic="true">
+      <strong id="mail-job-state"></strong><p id="mail-job-message"></p><p class="muted" id="mail-job-record" hidden></p>
+    </div>
+    <form id="mail-job-form" hidden>
+      <fieldset id="mail-job-fields" class="followup-fields">
+        <legend>Pedir la factura al comercio</legend>
+        <label>Correo del comercio para facturar
+          <input id="mail-job-to" name="to" type="email" required maxlength="254" autocomplete="off" spellcheck="false" aria-describedby="mail-job-to-hint"></label>
+        <p id="mail-job-to-hint" class="muted" hidden>Lo tomé del ticket. Puedes cambiarlo si no es correcto.</p>
+        <p id="mail-job-profile" class="muted"></p>
+        <label class="check-row" id="mail-job-consent-row"><input name="consent" type="checkbox" required>
+          <span>Autorizo enviar a esta dirección el ticket original y mis datos fiscales.</span></label>
+        <p id="mail-job-permission" class="muted" hidden>Tienes activo el permiso de pedir facturas por correo sin confirmar cada ticket.</p>
+        <div class="buttons"><button class="primary" type="submit">Pedir la factura por correo</button></div>
+      </fieldset>
+    </form>
+    <p class="muted" id="mail-job-hint" hidden></p>
+    <div class="buttons followup-actions">
+      <button type="button" id="mail-job-search" class="primary" hidden>Buscar la factura en mi correo</button>
+      <button type="button" id="mail-job-settings" class="secondary" hidden>Ir a Ajustes</button>
+      <button type="button" id="mail-job-refresh" class="plain">Actualizar estado</button>
+    </div>
+  </div></dialog>
+
+  <dialog id="medicion-dialog" aria-labelledby="medicion-dialog-title"><div class="dialog-body">
+    <div class="dialog-heading"><div><h2 id="medicion-dialog-title">Medición del ticket</h2><p id="medicion-ticket"></p></div>
+      <button type="button" class="icon-button" data-close="medicion-dialog" aria-label="Cerrar medición del ticket">×</button></div>
+    <div id="medicion-detalle" aria-live="polite"></div>
   </div></dialog>
 
   <dialog id="logs-dialog"><div class="dialog-body"><div class="dialog-heading"><div><h2>Actividad del ticket</h2><p id="logs-label"></p></div><button type="button" class="icon-button" data-close="logs-dialog" aria-label="Cerrar actividad">×</button></div><div id="logs"></div></div></dialog>

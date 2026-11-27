@@ -57,7 +57,7 @@ from .registro_datos import registro_router
 
 BASE = Path(__file__).resolve().parent.parent
 STATIC_FILES = ('app.js', 'chat.js', 'style.css', 'visor.js', 'navegacion.js', 'cuentas-portal.js', 'correo-portal.js',
-                'herramientas.js', 'seguimiento.js', 'avance.js', 'subida.js')
+                'herramientas.js', 'seguimiento.js', 'avance.js', 'subida.js', 'correo.js', 'ia.js', 'medicion.js')
 IMMUTABLE = 'public, max-age=31536000, immutable'
 RECENT_JOBS = 60
 HISTORY_PAGE = 100
@@ -647,7 +647,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     @app.post("/api/jobs/{key}/analyze")
     async def analyze(key: str, consent: bool = Body(default=False), mode: Literal['agent', 'local'] = Body(default='agent')):
         if mode == 'agent' and not consent:
-            raise ValueError('Autoriza la lectura de la imagen con tu plan de ChatGPT.')
+            raise ValueError('Autoriza la lectura de la imagen con tu conexión de IA.')
         return await automation.analyze(key, offline=mode == 'local')
 
     @app.put("/api/jobs/{key}")
@@ -682,7 +682,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         if row['receipt']['source'].startswith('Ejemplo:'):
             raise ValueError('Este ejemplo sirve para practicar la revisión. Sube un ticket real para abrir el portal.')
         if value.mode == 'agent' and plan.status()['status'] != 'ready':
-            raise ValueError('Conecta tu plan de ChatGPT en Ajustes antes de encolar.')
+            raise ValueError('Conecta tu IA en Ajustes antes de encolar.')
         if row['receipt']['provider'] == CUSTOM_PORTAL and (not value.confirmed_url or value.confirmed_url != row['receipt'].get('portal_url')):
             raise ValueError('Confirma la dirección actual del comercio antes de iniciar el trámite.')
         runner.schedule(key, profile(), value.auto_issue, manual=value.mode == 'manual', confirmed_url=value.confirmed_url)

@@ -9,7 +9,7 @@ const statuses = {
   uncertain: 'Comprobando el resultado', duplicate: 'Ya registrado', attached: 'Imagen agregada',
   external: 'Esperando al comercio', whatsapp_preparing: 'Preparando solicitud'
 };
-const eventLabels = {
+export const eventLabels = {
   browser_opened: 'Abrió el portal', browser_reopened: 'Reabrió el portal', browser_closed: 'Cerró el navegador',
   notice_dismissed: 'Leyó un aviso del portal', portal_entry: 'Abrió el formulario',
   ticket_lookup_verified: 'Cotejó los datos del ticket', ticket_lookup_rejected: 'El portal rechazó un dato',
@@ -23,13 +23,17 @@ const eventLabels = {
   brand_entry: 'Abrió el formulario del comercio', gmail_recovery: 'Buscó archivos en el correo',
   chat_parts: 'Unió las fotos del ticket', payment_confirmed: 'Confirmó la forma de pago',
   fuentes_de_campos: 'Identificó datos del ticket',
-  memory_replay: 'Repitió lo que ya sabía de este portal', memory_learned: 'Aprendió este portal'
+  memory_replay: 'Repitió una pantalla que ya conocía', memory_learned: 'Aprendió este portal',
+  memory_disabled: 'Dejó de repetir una pantalla que falló', limit_reached: 'Se agotó lo previsto para este intento',
+  question_waiting: 'Espera tu respuesta',
+  mail_attempt: 'Pidió la factura por correo', mail_sent: 'Envió el correo al comercio',
+  mail_uncertain: 'El correo pudo no llegar', whatsapp_needs_person: 'WhatsApp necesita tu ayuda'
 };
-// Measurements kept for the owner's dashboard, not steps of the ticket.
-const hiddenEvents = new Set(['read_timing', 'session_metrics', 'memory_miss']);
+// Measurements kept for the owner's dashboard and permission audits are not steps of the ticket.
+export const hiddenEvents = new Set(['read_timing', 'session_metrics', 'memory_miss', 'permiso']);
 const safeEventDetails = new Set(['browser_opened', 'browser_closed', 'notice_dismissed', 'portal_entry',
   'ticket_lookup_verified', 'campo_verificado', 'automatic_reobservation', 'captcha_reviewed',
-  'recovery_checked', 'ticket_already_billed', 'chat_parts']);
+  'recovery_checked', 'ticket_already_billed', 'chat_parts', 'question', 'question_waiting']);
 
 function safeSummary(value) {
   return String(value || '')

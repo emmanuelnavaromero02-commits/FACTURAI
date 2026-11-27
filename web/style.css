@@ -329,6 +329,59 @@ main { margin-left: 0; }
 @keyframes stage-pulse { 50% { opacity: .45; } }
 @media (prefers-reduced-motion: reduce) { .stages li.current::before { animation: none; } }
 .type-form input { flex: 1; min-width: 140px; }
+
+/* Mail, WhatsApp, AI and measurement screens. */
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.check-row small { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; font-weight: 400; }
+.pill.ready { background: var(--mint); border-color: #c4e2d2; color: var(--green); }
+.help-note summary { cursor: pointer; width: fit-content; color: var(--green); font-size: 12px; font-weight: 670; }
+.help-note > p { margin-top: 6px; color: var(--muted); font-size: 12px; font-weight: 400; }
+.help-note > .fields { margin-top: 10px; }
+.merchant-contact { margin: 0; padding: 12px 0 0; border: 0; border-top: 1px solid var(--line); min-width: 0; }
+.merchant-contact legend { padding: 0; margin-bottom: 10px; color: #3d564b; font-size: 12px; font-weight: 700; }
+.attention-note { padding: 10px 12px; border: 1px solid #d0a761; border-radius: 8px; background: #fff8ea; color: #372911; font-size: 13px; }
+#mail-feedback, #ia-feedback { font-size: 13px; }
+#mail-feedback:empty, #ia-feedback:empty, #medicion-status:empty { display: none; }
+#mail-feedback.error, #ia-feedback.error { color: var(--danger); }
+#mail-summary, #wa-link-message { overflow-wrap: anywhere; }
+.ia-options { display: grid; gap: 10px; }
+.ia-option span { font-size: 13px; }
+.ia-keys { display: grid; gap: 12px; }
+.ia-provider { display: grid; gap: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; }
+.ia-provider-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.ia-key-form, .ia-models, .ia-prices { display: grid; gap: 10px; }
+.ia-models { margin-top: 8px; }
+.ia-prices { margin-top: 10px; }
+.ia-currency { max-width: 130px; }
+.ia-price-rows { display: grid; gap: 10px; }
+.ia-price-row { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.6fr) minmax(0, .8fr) minmax(0, .8fr) auto; gap: 8px; align-items: end; padding-bottom: 10px; border-bottom: 1px solid #edf1ed; }
+.ia-usage { display: grid; gap: 10px; padding-top: 12px; border-top: 1px solid var(--line); }
+.ia-usage-head { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 10px; }
+.ia-usage-head label { min-width: 140px; }
+.number-table th.num, .number-table td.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.number-table th[scope=row] { background: transparent; color: var(--ink); font-size: 12px; font-weight: 650; text-transform: none; letter-spacing: 0; overflow-wrap: anywhere; }
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; margin-bottom: 18px; }
+.kpi { display: grid; gap: 4px; align-content: start; padding: 15px 16px; border: 1px solid var(--line); border-radius: 13px; background: #fcfdfb; }
+.kpi-label { color: var(--muted); font-size: 12px; }
+.kpi-value { font-size: 26px; font-weight: 650; line-height: 1.1; letter-spacing: -.03em; font-variant-numeric: normal; overflow-wrap: anywhere; }
+.kpi-detail { color: var(--muted); font-size: 11px; }
+.kpi-empty { color: var(--muted); }
+.kpi-value.kpi-empty { font-size: 18px; font-weight: 600; letter-spacing: 0; }
+.medicion-card { margin-top: 4px; }
+.medicion-empty { padding: 0 20px 18px; }
+.medicion-lista { margin: 0; font-size: 13px; }
+.medicion-lista div { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid #edf2ed; }
+.medicion-lista dt { color: var(--muted); }
+.medicion-lista dd { margin: 0; text-align: right; font-weight: 650; overflow-wrap: anywhere; }
+@media (max-width: 710px) {
+  .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .kpi { padding: 11px 12px; }
+  .kpi-value { font-size: 21px; }
+  .ia-price-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ia-price-row > button { justify-self: start; }
+  .number-table th, .number-table td { padding: 9px 10px; }
+  .merchant-contact.fields { grid-template-columns: minmax(0, 1fr); }
+}
 @media (max-width: 710px) {
   .chat-screen { padding: 0 12px; }
   .chat-header { min-height: 58px; }

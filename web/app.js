@@ -1,13 +1,17 @@
 import {installViewer} from './visor.js';
 import {installPortalMail} from './correo-portal.js';
 import {installReceiptTools} from './herramientas.js';
-import {installSAT, installWhatsApp} from './seguimiento.js';
-import {installChat} from './chat.js';
+import {installSAT, installWhatsApp, installWhatsAppLink} from './seguimiento.js';
+import {eventLabels, hiddenEvents, installChat} from './chat.js';
+import {installMail} from './correo.js';
+import {installAI} from './ia.js';
+import {installMeasurement} from './medicion.js';
 import {startStageClock, stageView, ticketStage, uploadStage} from './avance.js';
 import {prepareFiles, sendForm, sizeLabel} from './subida.js';
 
 const $ = id => document.getElementById(id);
-const sections = {chat: 'Conversación', bandeja: 'Bandeja', navegador: 'Navegador', comprobantes: 'Comprobantes', portales: 'Portales', ajustes: 'Ajustes'};
+const sections = {chat: 'Conversación', bandeja: 'Bandeja', navegador: 'Navegador', comprobantes: 'Comprobantes', portales: 'Portales',
+  medicion: 'Medición', ajustes: 'Ajustes'};
 const jobLabels = {new: 'Por leer', review: 'Por revisar', external: 'Solicitar al comercio', ready: 'Listo', queued: 'En cola', running: 'En el portal',
   issuing: 'Emisión en trámite', needs_user: 'Requiere tu intervención', issued_waiting_files: 'Emitido · recuperar',
   verified: 'Comprobado', blocked: 'Pendiente', uncertain: 'Resultado incierto', duplicate: 'Duplicado',
@@ -227,8 +231,18 @@ function openScreen() {
   }
   $('breadcrumb').textContent = sections[activeScreen];
   if (activeScreen === 'portales') renderPortals();
+  // Settings cards and measurements are read when their screen opens, not on every poll.
+  if (activeScreen !== loadedScreen) {
+    loadedScreen = activeScreen;
+    if (activeScreen === 'ajustes') {
+      mail.refresh();
+      ai.refresh().then(renderSettings);
+      whatsappLink.refresh();
+    } else if (activeScreen === 'medicion') measurement.show();
+  }
   renderCaptcha();
 }
+let loadedScreen = '';
 
 const viewer = installViewer({api, token: () => state.token, showError: error => notify(error, true), perform,
   captchaId: () => state.supports_captcha_control && captchaTicket()?.id,
@@ -240,8 +254,15 @@ const receiptTools = installReceiptTools({api, el, button, link, perform, curren
     notify('Conecta Gmail para elegir el correo que contiene el ticket.');
   }});
 const showSAT = installSAT({api, currency});
+const changedElsewhere = () => { renderSettings(); refresh().catch(() => {}); };
+const whatsappLink = installWhatsAppLink({api, showBrowser: () => route('navegador')});
 const showWhatsApp = installWhatsApp({api, currency, profile: () => state.profile,
-  showBrowser: () => route('navegador'), showSettings: () => route('ajustes')});
+  showBrowser: () => route('navegador'), showSettings: () => route('ajustes'),
+  linkState: whatsappLink.read, changed: changedElsewhere});
+const mail = installMail({api, currency, profile: () => state.profile, showSettings: () => route('ajustes'),
+  changed: changedElsewhere});
+const ai = installAI({api, changed: changedElsewhere});
+const measurement = installMeasurement({api, catalog: () => state.catalog});
 const chat = installChat({api, getState: () => state, actionsFor: row => chatActions(row)});
 $('chat-progress').after($('captcha-alert'));
 
@@ -305,9 +326,7 @@ function request(row) {
 async function logs(row) {
   const events = await api(`/api/jobs/${row.id}/events`);
   $('logs-label').textContent = row.receipt.merchant || 'Ticket por identificar';
-  // Measurements kept for the owner's dashboard are not steps of the ticket.
-  const technical = new Set(['read_timing', 'session_metrics', 'memory_miss']);
-  const values = events.filter(event => !technical.has(event.kind)).toReversed().map(event => {
+  const values = events.filter(event => !hiddenEvents.has(event.kind)).toReversed().map(event => {
     const item = el('div', '', 'log-item');
     let detail = event.detail;
     if (event.kind === 'fuentes_de_campos') {
@@ -317,7 +336,8 @@ async function logs(row) {
         detail = `Campos: ${fields.join(', ') || 'sin cambios'}. Herramientas: ${(record.tools || []).join(', ') || 'ninguna'}.`;
       } catch { /* Preserve the original event if it predates this format. */ }
     }
-    item.append(el('strong', event.kind === 'fuentes_de_campos' ? 'Origen de datos' : event.kind.replaceAll('_', ' ')), el('p', detail),
+    const label = event.kind === 'fuentes_de_campos' ? 'Origen de datos' : eventLabels[event.kind] || event.kind.replaceAll('_', ' ');
+    item.append(el('strong', label), el('p', detail),
       el('small', new Date(event.at).toLocaleString('es-MX')));
     return item;
   });
@@ -463,6 +483,31 @@ function existingAttempt(row) {
     ['issued_waiting_files', 'uncertain'].includes(row.status));
 }
 
+// The engine holds a ticket with this message when its question in the chat got no answer.
+const QUESTION_PAUSE = 'Necesito tu respuesta para seguir:';
+
+function waitsForAnswer(row) {
+  return row?.status === 'needs_user' && String(row.message || '').startsWith(QUESTION_PAUSE);
+}
+
+// Same resume as «Volver a intentar» / «Continuar» for this pause, then back to the chat.
+function answeredButton(row) {
+  return button('Ya contesté', () => {
+    lastLiveJob = row.id;
+    return perform(async () => {
+      await api('/api/jobs/' + encodeURIComponent(row.id) + '/decision', 'POST', {decision: 'resume'});
+      showLive(row);
+      return 'Retomé el trámite con tu respuesta.';
+    });
+  }, 'primary');
+}
+
+function answerInChat(row) {
+  const go = button('Contestar en el chat', () => showLive(row));
+  go.title = 'La pregunta está en la conversación; contéstala ahí.';
+  return go;
+}
+
 function retryKind(row) {
   if (!row || row.historical || terminal.has(row.status) || row.receipt.source.startsWith('Ejemplo:')) return null;
   if (state.supports_ticket_retry) return ['resume', 'queue', 'recover'].includes(row.retry_action) ? row.retry_action : null;
@@ -475,6 +520,7 @@ function retryKind(row) {
 function retryButton(row) {
   const kind = retryKind(row);
   if (!kind) return null;
+  if (kind === 'resume' && waitsForAnswer(row)) return answeredButton(row);
   const recovery = kind === 'recover' || kind === 'local';
   const label = recovery ? 'Recuperar comprobantes' : kind === 'resume' ? 'Retomar trámite' : 'Reintentar';
   const control = button(label, () => {
@@ -504,8 +550,28 @@ function retryButton(row) {
   return control;
 }
 
+function canAskByMail(row) {
+  return ['ready', 'external'].includes(row.status) && !existingAttempt(row);
+}
+
+function waitsForMail(row) {
+  return ['issued_waiting_files', 'uncertain', 'external'].includes(row.status) && Boolean(row.issue_attempted);
+}
+
+function searchMail(row) {
+  if (mail.status() && !mail.status().conectado) {
+    route('ajustes');
+    return notify('Conecta tu correo en Ajustes para buscar la factura.');
+  }
+  return perform(async () => {
+    const result = await api('/api/jobs/' + encodeURIComponent(row.id) + '/correo/buscar', 'POST');
+    return result.message || 'Búsqueda terminada.';
+  });
+}
+
 function chatActions(row) {
   const actions = [];
+  const realTicket = !row.historical && !row.receipt.source.startsWith('Ejemplo:');
   const chatQueued = row.batch_id?.startsWith('chat-');
   const pause = state.automation?.current_id === row.id ? state.automation.phase : '';
   const retry = retryButton(row);
@@ -527,6 +593,7 @@ function chatActions(row) {
       actions.push(button(kind === 'operator' ? 'Terminar y cotejar' : 'Continuar trámite', () => perform(() =>
         api(`/api/jobs/${row.id}/decision`, 'POST', {decision: 'resume'})), 'primary'));
     } else if (kind === 'plan') actions.push(link('Revisar conexión', '#ajustes'));
+    else if (kind === 'unknown' && !retry && waitsForAnswer(row)) actions.push(answeredButton(row));
     else if (['unknown', 'blocked'].includes(kind) && !retry) {
       actions.push(button('Volver a intentar', () => perform(() =>
         api(`/api/jobs/${row.id}/decision`, 'POST', {decision: 'resume'})), 'primary'));
@@ -534,6 +601,16 @@ function chatActions(row) {
   }
   if (row.id === state.active_job && ['queued', 'running', 'issuing', 'needs_user'].includes(row.status)) {
     actions.push(button('Detener', () => perform(() => api(`/api/jobs/${row.id}/stop`, 'POST'))));
+  }
+  if (realTicket && ['external', 'whatsapp_preparing'].includes(row.status)) {
+    actions.push(button(row.issue_attempted || row.status === 'whatsapp_preparing' ? 'Ver solicitud WhatsApp' : 'Pedir por WhatsApp',
+      () => showWhatsApp(row)));
+  }
+  if (realTicket && row.status === 'external') {
+    actions.push(button(row.issue_attempted ? 'Solicitud por correo' : 'Pedir por correo', () => mail.openRequest(row)));
+  }
+  if (realTicket && waitsForMail(row) && mail.status()?.conectado) {
+    actions.push(button('Buscar la factura en mi correo', () => searchMail(row)));
   }
   for (const format of ['pdf', 'xml']) {
     if (row[`has_${format}`]) actions.push(link('Descargar ' + format.toUpperCase(), `/api/jobs/${row.id}/files/${format}`, 'secondary button-link'));
@@ -604,6 +681,10 @@ function rowActions(row) {
   const primary = primaryAction(row, realTicket);
   const retry = retryButton(row);
   if (retry) group.append(retry);
+  if (waitsForAnswer(row)) {
+    if (!retry && row.id === state.active_job) group.append(answeredButton(row));
+    group.append(answerInChat(row));
+  }
   if (primary) group.append(primary);
   if (row.status === 'verified' && row.has_pdf && row.has_xml) group.append(button('Vigencia SAT', () => showSAT(row)));
   for (const format of ['pdf', 'xml']) {
@@ -645,10 +726,16 @@ function rowActions(row) {
   if (realTicket && !whatsappPrimary && (row.status === 'ready' || row.issue_attempted) && !working.has(row.status)) {
     panel.append(button(row.issue_attempted ? 'Ver solicitud WhatsApp' : 'Solicitar por WhatsApp', () => showWhatsApp(row), 'plain'));
   }
+  if (realTicket && canAskByMail(row)) panel.append(button('Pedir la factura por correo', () => mail.openRequest(row), 'plain'));
+  else if (realTicket && row.status === 'external' && row.issue_attempted) {
+    panel.append(button('Solicitud por correo', () => mail.openRequest(row), 'plain'));
+  }
+  if (realTicket && waitsForMail(row)) panel.append(button('Buscar la factura en mi correo', () => searchMail(row), 'plain'));
   if (!row.issue_attempted && !terminal.has(row.status) && !working.has(row.status) && row.status !== 'whatsapp_preparing') {
     panel.append(button('Copiar solicitud al comercio', () => request(row), 'plain'));
   }
   panel.append(button('Ver actividad', () => perform(() => logs(row)), 'plain'));
+  if (realTicket) panel.append(button('Ver medición', () => measurement.showTicket(row), 'plain'));
   menu.append(toggle, panel);
   group.append(menu);
   return group;
@@ -789,9 +876,8 @@ function renderBrowser() {
   if (row.human_kind && !personal) {
     const issue = row.human_kind === 'issue';
     const label = issue ? 'Aprobar emisión' : row.human_kind === 'operator' ? 'Terminar y cotejar' : 'Continuar';
-    const resume = button(label, () => perform(() =>
-      api(`/api/jobs/${row.id}/decision`, 'POST', {decision: issue ? 'approve' : 'resume'})), 'primary');
-    if (!retry || (row.human_kind !== 'plan' && row.human_kind !== 'blocked' && row.human_kind !== 'unknown')) actions.append(resume);
+    const resume = waitsForAnswer(row) ? answeredButton(row) : button(label, () => perform(() =>
+      api(`/api/jobs/${row.id}/decision`, 'POST', {decision: issue ? 'approve' : 'resume'})), 'primary');    if (!retry || (row.human_kind !== 'plan' && row.human_kind !== 'blocked' && row.human_kind !== 'unknown')) actions.append(resume);
     if (['plan', 'blocked', 'unknown'].includes(row.human_kind)) {
       actions.append(button('Continuar a mano', () => perform(async () => {
         await api(`/api/jobs/${row.id}/decision`, 'POST', {decision: 'manual'});
@@ -814,21 +900,25 @@ function renderSettings() {
   }
   const plan = state.plan;
   const labels = planLabels[plan.status] || 'Por conectar';
-  $('sidebar-plan').textContent = labels;
+  // state.plan describes the AI in use; when it is a pay-per-use key, the ChatGPT card shows the plan's own state.
+  const ia = ai.status();
+  const other = ia && ia.activo !== 'chatgpt' ? ia.proveedores.find(provider => provider.activo) : null;
+  const planStatus = other ? ia.proveedores.find(provider => provider.id === 'chatgpt')?.estado || 'disconnected' : plan.status;
+  $('sidebar-plan').textContent = other ? (plan.status === 'ready' ? 'IA conectada' : labels) : labels;
   $('sidebar-dot').classList.toggle('ready', plan.status === 'ready');
-  $('plan-status').textContent = labels;
-  $('plan-email').textContent = plan.email || '';
-  const planMessage = (plan.message || '').replace(/ChatGPT|OpenAI|\bgpt-[\w.]+\b/gi, 'el servicio');
-  $('plan-message').textContent = planMessage;
-  $('pod-connect').hidden = ['ready', 'limit'].includes(plan.status);
-  $('pod-connect').textContent = plan.status === 'identity_only' ? 'Autorizar servicio' : 'Conectar cuenta';
-  $('pod-disconnect').hidden = !['ready', 'identity_only', 'limit'].includes(plan.status);
-  $('pod-other').hidden = !plan.registered || ['ready', 'limit'].includes(plan.status);
-  $('pod-retry').hidden = plan.status !== 'limit';
+  $('plan-status').textContent = planLabels[planStatus] || 'Por conectar';
+  $('plan-email').textContent = other ? '' : plan.email || '';
+  const planMessage = (plan.message || '').replace(/ChatGPT|OpenAI|\bgpt-[\w.]+\b/gi, 'la IA');
+  $('plan-message').textContent = other ? 'Ahora uso ' + other.nombre + '. Este plan queda guardado por si lo vuelves a elegir en Inteligencia artificial.' : planMessage;
+  $('pod-connect').hidden = ['ready', 'limit'].includes(planStatus);
+  $('pod-connect').textContent = planStatus === 'identity_only' ? 'Autorizar servicio' : 'Conectar cuenta';
+  $('pod-disconnect').hidden = !['ready', 'identity_only', 'limit'].includes(planStatus);
+  $('pod-other').hidden = Boolean(other) || !plan.registered || ['ready', 'limit'].includes(planStatus);
+  $('pod-retry').hidden = Boolean(other) || planStatus !== 'limit';
   $('model-row').hidden = true;
   $('current-model').textContent = plan.model || '';
-  $('plan-card-description').textContent = plan.status === 'ready' ? 'La lectura y la navegación usan tu suscripción.' :
-    planMessage || 'Conecta el servicio para leer tickets y preparar los portales.';
+  $('plan-card-description').textContent = plan.status === 'ready' ? 'La lectura y la navegación usan tu conexión de IA.' :
+    planMessage || 'Conecta la IA para leer tickets y preparar los portales.';
   $('plan-card-link').textContent = plan.status === 'ready' ? 'Administrar conexión →' : 'Conectar →';
   $('gmail-status').textContent = state.gmail === 'connected' ? 'Conectado' : state.gmail === 'configured' ? 'Listo para vincular' : 'Por configurar';
   $('gmail-connect').disabled = state.gmail === 'disconnected';
@@ -1260,6 +1350,7 @@ if (outcome) {
   else if (outcome.startsWith('chatgpt')) notify('Conexión guardada. Revisa su estado en Ajustes.');
 }
 startStageClock();
+if (activeScreen !== 'ajustes') mail.refresh();
 refresh().then(() => {
   if (activeScreen === 'portales') renderPortals();
   resumePersonalIfIdle();
