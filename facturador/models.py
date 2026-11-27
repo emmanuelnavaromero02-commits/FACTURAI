@@ -276,3 +276,21 @@ class Action(BaseModel):
     # The agent's running notes: plan, what it tried and what it learned. They are
     # returned on every step so it keeps the whole ticket in mind.
     notes: str | None = None
+
+
+PLAN_STEPS = 10
+
+
+class Plan(BaseModel):
+    """Everything one consultation decides for the visible screen, in order."""
+    model_config = ConfigDict(extra="forbid")
+    # From 1 to 10 actions. The bounds are checked here and not declared in the schema
+    # sent to the model, like every other answer type of this application.
+    steps: list[Action]
+
+    @field_validator('steps')
+    @classmethod
+    def bounded(cls, value: list[Action]) -> list[Action]:
+        if not value:
+            raise ValueError('El plan debe traer al menos una acción.')
+        return value[:PLAN_STEPS]

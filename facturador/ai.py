@@ -171,7 +171,8 @@ class AI:
         return found.billing_url, found.evidence_url
 
     def next_action(self, instructions: str, state: str, screenshot: bytes | None,
-                    ticket: list[dict] | None = None, effort: str = 'medium') -> Action:
+                    ticket: list[dict] | None = None, effort: str = 'medium', output=Action):
+        """One consultation about the visible screen, answered as ``output``: an Action or a Plan."""
         content = [{'type': 'input_text', 'text': state}]
         if screenshot:
             content.append(image_part(screenshot, 'image/jpeg'))
@@ -179,7 +180,19 @@ class AI:
             content.append({'type': 'input_text', 'text': 'Foto original del ticket que pediste revisar:'})
             content.extend(ticket)
         # Navigation runs many short steps: medium keeps each one fast; the runner raises it when stuck.
-        return self.plan.infer(instructions, content, Action, effort=effort)
+        return self.plan.infer(instructions, content, output, effort=effort)
+
+    def next_actions(self, instructions: str, state: str, screenshot: bytes | None,
+                     ticket: list[dict] | None = None, effort: str = 'medium'):
+        """Decide the whole visible screen in one consultation: a Plan of 1 to 10 actions.
+
+        The consultation itself is ``next_action``, so there is a single place that
+        talks to the model. An answer that is one Action counts as a one-step plan.
+        """
+        from .models import Plan
+
+        answer = self.next_action(instructions, state, screenshot, ticket, effort, Plan)
+        return answer if isinstance(answer, Plan) else Plan(steps=[answer])
 
     def research(self, question: str, merchant: str) -> str:
         """Answer a blocked step from public sources (where a field is, how a portal works)."""

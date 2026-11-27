@@ -9,8 +9,11 @@ import os
 import re
 import secrets
 import sys
+import time
 import traceback
 import weakref
+from collections import deque
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import unicodedata
 from pathlib import Path
@@ -30,9 +33,10 @@ from .captcha_transport import WidgetTransport, widget_origin
 from .cfdi import UUID_RE
 from .db import Store
 from .documents import job_candidates, reconcile
-from .fiscal_choices import NAMES as FISCAL_FIELDS, fiscal_choices
-from .models import SAT_PAYMENT_LABELS, Action, Profile, Receipt, Target
+from .fiscal_choices import NAMES as FISCAL_FIELDS, fiscal_choices, matches as sat_option
+from .models import SAT_PAYMENT_LABELS, Action, Plan, Profile, Receipt, Target
 from .personal_browser import PersonalBrowser
+from .portal_memory import Attempt, Known, PortalMemory, describe, fold, locate, screen_signature
 from .profile_lock import close_context, launch_chrome
 from .portals import capufe_proof, capufe_recipient, normalize
 from .ticket_lookup import prefill_ticket_lookup, prepare_tesoro_lookup
@@ -40,6 +44,7 @@ from .ticket_retry import FINAL, REOBSERVE, RecoveryRequested, may_have_issued, 
 from .tesoro_consulta import existing_invoice_folio, recover_tesoro_consulta
 from .tesoro_recipient import tesoro_recipient
 from .tesoro_result import tesoro_verification_failure
+from .uso_ia import en_ticket
 from .viewer import BrowserView
 from .vianney_consulta import lookup_rejected, rejection_for_current_ticket, recover_vianney_consulta
 from .walmart_issue import (walmart_lookup_continue, walmart_lookup_proof,
@@ -62,6 +67,9 @@ RETRYABLE = re.compile(r'se cerr[oó]|cambi[oó] (?:a un|de) dominio|'
 # Visible text plus a numbered list of every visible field: its label (or the text
 # right before it when the page has no label), what is typed or chosen, and its errors.
 # Each field gets data-facturai-campo=n so the agent can target it as by="field".
+# The numbers are assigned again on every reading, so they only hold for that reading.
+# ``items`` and ``buttons`` describe the same fields and the visible buttons without
+# their values: the screen signature and the stable field descriptions come from them.
 PAGE_TEXT = r"""(start) => {
   const clean = s => (s || '').replace(/\s+/g, ' ').trim();
   const shown = e => e.type !== 'password' && e.type !== 'hidden' &&
@@ -79,6 +87,7 @@ PAGE_TEXT = r"""(start) => {
     return '';
   };
   const items = [...document.querySelectorAll('input, textarea, select')].filter(shown);
+  const described = [];
   const fields = items.map((e, i) => {
     const n = start + i;
     e.setAttribute('data-facturai-campo', String(n));
@@ -91,10 +100,18 @@ PAGE_TEXT = r"""(start) => {
       (e.type === 'checkbox' || e.type === 'radio') ? (e.checked ? 'marcado' : 'sin marcar') : e.value;
     const notes = [e.required ? 'obligatorio' : '', e.disabled ? 'deshabilitado' : '',
                    e.validationMessage ? 'error: ' + clean(e.validationMessage) : ''].filter(Boolean);
+    described.push({n: n, kind: kind, label: label.slice(0, 80), key: (e.name || '') + '|' + (e.id || ''),
+      filled: (e.type === 'checkbox' || e.type === 'radio') ? e.checked : Boolean(e.value)});
     return '#' + n + ' ' + kind + ' «' + label.slice(0, 80) + '»: ' + String(value).slice(0, 120) +
       (notes.length ? ' (' + notes.join(', ') + ')' : '');
   });
-  return {text: document.body ? document.body.innerText : '', fields: fields, count: items.length};
+  const buttons = [...document.querySelectorAll('button, [role="button"], input[type="submit"], ' +
+      'input[type="button"], input[type="reset"], input[type="image"]')]
+    .filter(e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length))
+    .map(e => clean(e.innerText || e.value || e.getAttribute('aria-label') || e.title).slice(0, 80))
+    .filter(Boolean);
+  return {text: document.body ? document.body.innerText : '', fields: fields, count: items.length,
+          items: described, buttons: buttons};
 }"""
 ASK_TIMEOUT = 120
 # Each look-up tool may be used this many times per attempt; the page text comes in every step.
@@ -128,6 +145,105 @@ MAX_STEPS = 120
 SELF_HELP_LIMIT = 4
 PLAN_RETRIES = 3
 REOBSERVE_DELAY = 3
+# What one attempt may spend. Time waiting for a person does not count.
+MAX_AI_CALLS = 40
+MAX_ACTIVE_SECONDS = 600
+# Attempts that start over «by another route». A lost browser is reopened apart from these.
+MAX_ROUTE_ATTEMPTS = 2
+LIMIT_MESSAGE = ('No pude terminar este portal en el tiempo previsto. No se envió nada; '
+                 'puedes reintentar o tomar el control.')
+# These actions travel alone in a plan: their result changes what comes next.
+SOLO = TOOLS | {'ask', 'human', 'done'}
+# A repeated screen gets this long to move on before it counts as not having advanced.
+SETTLE_TRIES = 12
+SETTLE_PAUSE = 0.5
+# Breath between repeated actions, so the page reacts as it does between the agent's own.
+REPLAY_PAUSE = 0.15
+QUESTION_NOISE = {'el', 'la', 'los', 'las', 'de', 'del', 'que', 'en', 'un', 'una', 'y', 'o', 'a', 'al', 'me',
+                  'mi', 'tu', 'su', 'es', 'para', 'por', 'con', 'lo', 'se', 'te'}
+
+
+# The planner is reached through the class function, so anything that answers
+# ``next_action`` (the real client or a stand-in) is asked for a whole plan the same way.
+PLAN_SCREEN = AI.next_actions
+
+
+class AttemptLimit(ValueError):
+    """The attempt spent its budget. It stops for good instead of starting another one."""
+
+
+class Meter:
+    """What one attempt spends: consultations, actions and active time."""
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self.waited = 0.0
+        self.ai_calls = self.actions = self.replayed = 0
+        self.agent = False
+        self.outcome = ''
+
+    def active(self) -> float:
+        return time.monotonic() - self.started - self.waited
+
+
+@dataclass
+class Planned:
+    """An action decided for the visible screen that waits for its turn."""
+    action: Action
+    source: str                    # 'ia' or 'memoria'
+    index: int = 0                 # place in its plan; only 0 was decided on a fresh observation
+    field: dict | None = None      # stable description of the field it writes in or presses
+    anchor: str = ''               # name and id of that field when planned (same page session only)
+    screen: tuple | None = None    # memory: the screen this step was learned on
+    link: str = ''                 # memory: value still to choose among the options on the page
+    last: bool = False             # memory: last step of its recipe
+
+
+class Course:
+    """The plan in course. Its actions run one per pass, each through the whole pipeline."""
+
+    def __init__(self):
+        self.steps: deque[Planned] = deque()
+        self.context: tuple = ()
+        self.written: list[Planned] = []
+
+    def start(self, steps: list[Planned], context: tuple) -> None:
+        self.steps, self.context, self.written = deque(steps), context, []
+
+    def drop(self) -> None:
+        self.steps.clear()
+        self.written = []
+
+    def broken(self, error: str, context: tuple, items: list[dict]) -> str:
+        """Why the rest of the plan can no longer be trusted; '' when it can go on."""
+        if not self.steps:
+            return ''
+        if error:
+            return 'un paso falló'
+        if context != self.context:
+            return 'la página cambió o intervino una persona'
+        if self.steps[0].source != 'ia':
+            return ''
+        if any(step.field and locate(items, step.field, step.anchor) is None for step in self.steps):
+            return 'un campo del plan ya no está'
+        for step in self.written:
+            number = locate(items, step.field, step.anchor)
+            if number is None or not any(item.get('n') == number and item.get('filled') for item in items):
+                return 'cambió un campo ya capturado'
+        return ''
+
+    def carry(self, items: list[dict], screen: tuple) -> None:
+        """The screen changed under a repeated recipe: only its field values still due and valid stay."""
+        kept = [step for step in self.steps if step.field and step.action.kind in {'fill', 'select'}
+                and locate(items, step.field) is not None]
+        for step in kept:
+            step.screen, step.last = screen, False
+        self.steps = deque(kept)
+
+
+def question_key(text: str) -> str:
+    """The same question worded with other accents, case, numbers or filler words."""
+    return ' '.join(word for word in re.findall(r'[a-zñ]+', fold(text)) if word not in QUESTION_NOISE)[:400]
 
 
 def action_risk(action: Action) -> str:
@@ -290,6 +406,18 @@ class Runner:
         # Chat messages the person sent while their ticket was being processed.
         self.live_notes: dict[str, list[str]] = {}
         self.manual_download_error = ''
+        # What each solved portal taught, as data. A new portal needs no code.
+        self.memory = PortalMemory(store.root)
+        self.learning: dict[str, Attempt] = {}
+        # Per ticket in progress: what its attempt spends, how many times a person was
+        # asked to step in or wrote in the chat, and every question of the whole run
+        # with its answer ('' while unanswered), so none is asked twice.
+        self.meters: dict[str, Meter] = {}
+        self.pauses: dict[str, int] = {}
+        self.handled: dict[str, list[str]] = {}
+        self.told: dict[str, int] = {}
+        self.asked: dict[str, dict[str, str]] = {}
+        self.insisted: dict[str, set[str]] = {}
 
     async def start_browser(self):
         async with self.browser_start:
@@ -884,7 +1012,19 @@ class Runner:
             if reobserve is not None:
                 observed, seen = reobserve
                 timer = asyncio.create_task(self.reobserve_untouched_form(key, pending, observed, seen))
-            decision = await future
+            # Whatever was planned before a person steps in is decided again afterwards,
+            # and the time the person takes is not charged to the attempt.
+            self.pauses[key] = self.pauses.get(key, 0) + 1
+            if kind in MANUAL:
+                # The person may act on this page; the memory will not repeat it by itself.
+                self.handled.setdefault(key, []).append(page.url)
+            waiting_since = time.monotonic()
+            try:
+                decision = await future
+            finally:
+                meter = self.meters.get(key)
+                if meter:
+                    meter.waited += time.monotonic() - waiting_since
             if (decision == 'recover' or (decision != 'cancel' and self.store.checked_preparation(key)
                     and kind in MANUAL and self.operator_may_have_acted(pending))):
                 raise RecoveryRequested()
@@ -1064,7 +1204,16 @@ class Runner:
 
     async def page_fields(self, page, receipt: Receipt) -> tuple[str, list[str]]:
         """Visible text and the numbered fields of the portal page and its same-portal frames."""
-        parts, fields, start = [], [], 1
+        state = await self.page_state(page, receipt)
+        return state['text'], state['fields']
+
+    async def page_state(self, page, receipt: Receipt) -> dict:
+        """One reading of the page: its text, its numbered fields and what identifies the screen.
+
+        Every reading numbers the fields again. ``items`` describes each field without its
+        value and ``signature`` is the hash of those descriptions and the visible buttons.
+        """
+        parts, fields, items, buttons, start = [], [], [], [], 1
         for frame in getattr(page, 'frames', []):
             if frame.parent_frame and not allowed_url(frame.url, receipt.provider, receipt.portal_url, self._extra()):
                 continue
@@ -1077,8 +1226,100 @@ class Runner:
                 continue
             parts.append(result.get('text', ''))
             fields.extend(result.get('fields', []))
+            items.extend(result.get('items', []))
+            buttons.extend(result.get('buttons', []))
             start += int(result.get('count', 0))
-        return '\n'.join(parts), fields
+        return {'text': '\n'.join(parts), 'fields': fields, 'items': items, 'buttons': buttons,
+                'signature': screen_signature(items, buttons)}
+
+    async def planned_steps(self, page, receipt: Receipt, plan: Plan, items: list[dict]) -> tuple[list[Planned], str]:
+        """Turn the model's plan into queued steps. Returns them and, if it had to be cut, why.
+
+        A field picked by its number is kept by what it is (kind, label and place among
+        equal ones), because the numbers change on every reading. Steps after the first
+        must point at something visible now; the plan is cut where one does not, and
+        before any action that has to travel alone.
+        """
+        steps, cut = [], ''
+        for index, action in enumerate(plan.steps):
+            if action.kind in SOLO and index:
+                cut = 'una herramienta o pregunta va sola'
+                break
+            step = Planned(action, 'ia', index)
+            target, number = action.target, None
+            if target is not None and target.by == 'field':
+                number = target.name.strip().lstrip('#')
+                if not number.isdigit() or describe(items, int(number)) is None:
+                    if index:
+                        cut = 'un número de campo que no está en la lista'
+                        break
+                    return [], 'Ese número no está en la lista campos de este paso. Usa uno de los números que ves ahora.'
+            elif target is not None and action.kind in {'click', 'fill', 'select', 'press'}:
+                try:
+                    control = await self.action_control(page, action, receipt)
+                    number = await control.get_attribute('data-facturai-campo')
+                except (ValueError, BrowserError, AttributeError, TypeError):
+                    if index:
+                        cut = 'un control que todavía no se ve'
+                        break
+            if isinstance(number, str) and number.isdigit():
+                step.field = describe(items, int(number))
+                step.anchor = next((item.get('key', '') for item in items if item.get('n') == int(number)), '')
+            steps.append(step)
+            if action.kind in SOLO:
+                if len(plan.steps) > 1:
+                    cut = 'una herramienta o pregunta va sola'
+                break
+        return steps, cut
+
+    def recalled_steps(self, recipe: list[dict], screen: tuple, items: list[dict], known: Known) -> list[Planned] | None:
+        """Build this ticket's actions from a remembered recipe; None when it does not fit this screen or ticket."""
+        steps = []
+        for index, stored in enumerate(recipe):
+            target, field, link = stored.get('target'), None, ''
+            value = stored.get('value')
+            if stored['kind'] not in {'click', 'fill', 'select', 'press', 'upload'}:
+                return None
+            if target is not None and target.get('by') == 'campo':
+                number = locate(items, target)
+                if number is None:
+                    return None
+                field = {key: target[key] for key in ('by', 'kind', 'label', 'ordinal', 'count')}
+                aim = Target(by='field', name=str(number), role=None, exact=True)
+            elif target is not None:
+                aim = Target(by=target['by'], name=target['name'], role=target.get('role'), exact=bool(target.get('exact')))
+            else:
+                aim = None
+            if value is not None and value.startswith('$sat.'):
+                link, text = value, None
+            elif value is not None:
+                text = known.value(value)
+                if text is None:
+                    return None
+            else:
+                text = None
+            action = Action(kind=stored['kind'], target=aim, value=text, reason='Paso aprendido de un trámite anterior en este portal.',
+                            risk='issue' if stored.get('risk') == 'issue' else 'normal')
+            steps.append(Planned(action, 'memoria', index, field, '', screen, link, index == len(recipe) - 1))
+        return steps or None
+
+    async def chosen_option(self, page, action: Action, receipt: Receipt, kind: str, expected: str) -> str | None:
+        """The single option of a list that means this SAT code for the profile or ticket."""
+        try:
+            control = await self.action_control(page, action, receipt)
+            options = await control.locator('option').evaluate_all('(options) => options.map(o => [o.value, o.label])')
+        except (ValueError, BrowserError, AttributeError):
+            return None
+        found = [value for value, label in options if value and sat_option(value, label, kind, expected)]
+        return found[0] if len(found) == 1 else None
+
+    async def chosen_label(self, page, action: Action, receipt: Receipt) -> str | None:
+        """The text of the option a list shows after choosing, to remember it by what it says."""
+        try:
+            control = await self.action_control(page, action, receipt)
+            return await control.evaluate("e => e.selectedOptions && e.selectedOptions[0] ? e.selectedOptions[0].label : null")
+        except (ValueError, BrowserError, AttributeError):
+            return None
 
     def running_job(self) -> str | None:
         """The ticket the agent is working on right now, if any."""
@@ -1094,6 +1335,7 @@ class Runner:
         notes = self.live_notes.setdefault(key, [])
         notes.append(text)
         del notes[:-6]
+        self.told[key] = self.told.get(key, 0) + 1
         self.store.event(key, 'user_note', 'El agente recibió un mensaje del chat.')
 
     def open_question(self) -> str | None:
@@ -1115,6 +1357,7 @@ class Runner:
                                          [key])
         self.store.running_message(key, 'Te pregunté en el chat: ' + question[:200])
         self.store.event(key, 'question', question[:200])
+        waiting_since = time.monotonic()
         try:
             answer = await asyncio.wait_for(asyncio.shield(future), ASK_TIMEOUT)
         except asyncio.TimeoutError:
@@ -1123,8 +1366,70 @@ class Runner:
             self.questions.pop(key, None)
             if not future.done():
                 future.cancel()
+            meter = self.meters.get(key)
+            if meter:
+                meter.waited += time.monotonic() - waiting_since
         self.store.event(key, 'answer', 'Respuesta recibida en el chat.' if answer else 'Sin respuesta; el agente asume y sigue.')
         return answer
+
+    def can_ask(self, key: str, question: str) -> bool:
+        """A new question while the run has some left, or one already asked that can still be settled."""
+        topic = question_key(question)
+        asked = self.asked.get(key, {})
+        if topic in asked:
+            return bool(asked[topic]) or topic not in self.insisted.get(key, ())
+        return len(asked) < MAX_QUESTIONS
+
+    async def ask_once(self, key: str, page, question: str) -> tuple[str, str]:
+        """Ask only what this run has not asked. Returns the answer and the person's decision, if any.
+
+        A question already answered gives its answer back. One left without an answer is
+        not sent again: the ticket waits for the person, once, with the question as its message.
+        """
+        topic = question_key(question)
+        asked = self.asked.setdefault(key, {})
+        if topic not in asked:
+            asked[topic] = ''
+            asked[topic] = await self.ask_chat(key, question)
+            return asked[topic], ''
+        if asked[topic]:
+            return asked[topic], ''
+        self.insisted.setdefault(key, set()).add(topic)
+        asked[topic], decision = await self.wait_for_answer(key, page, question)
+        return asked[topic], decision
+
+    async def wait_for_answer(self, key: str, page, question: str) -> tuple[str, str]:
+        """Hold the ticket for the person with the pending question as its message.
+
+        It is an ordinary pause: no attempt is spent and the waiting time is not charged.
+        An answer in the chat, or the person resuming from the panel, ends it.
+        """
+        question = ' '.join(question.split())[:600]
+        future = asyncio.get_running_loop().create_future()
+        self.questions[key] = future
+
+        async def resume_when_answered():
+            await future
+            try:
+                await self.continue_job(key, 'resume')
+            except (ValueError, BrowserError):
+                pass  # The panel explains what is missing; the pause stays for the person.
+
+        watcher = asyncio.create_task(resume_when_answered())
+        self.store.event(key, 'question_waiting', question[:200])
+        try:
+            decision = await self.human(key, page, 'unknown', 'Necesito tu respuesta para seguir: ' + question[:400])
+        finally:
+            answered = future.done() and not future.cancelled()
+            if not future.done():
+                future.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+            if self.questions.get(key) is future:
+                self.questions.pop(key, None)
+        answer = future.result() if answered else ''
+        self.store.event(key, 'answer', 'Respuesta recibida en el chat.' if answer
+                         else 'El titular retomó el trámite sin contestar la pregunta.')
+        return answer, decision
 
     async def generic_issue_proof(self, page, profile: Profile, receipt: Receipt) -> bool:
         """The page shows this recipient RFC, this ticket's folio or code and its amount."""
@@ -1272,6 +1577,50 @@ class Runner:
             return False
         return True
 
+    def out_of_budget(self, key: str, what: str, attempted: bool) -> ValueError:
+        """The attempt spent its steps, consultations or time: it stops instead of circling.
+
+        Before any emission the ticket is left stopped with a clear message and is not
+        retried by itself. After an emission attempt the result is recovered as always.
+        """
+        meter = self.meters.get(key)
+        if meter:
+            meter.outcome = 'limit_' + what
+        self.store.event(key, 'limit_reached', what)
+        if attempted:
+            return ValueError('La factura requiere revisar el resultado del portal.')
+        return AttemptLimit(LIMIT_MESSAGE)
+
+    def close_learning(self, key: str, *, spared: bool = False) -> None:
+        """Settle what the last attempt noted: it is learned only if its invoice was verified."""
+        attempt = self.learning.pop(key, None)
+        if attempt is None:
+            return
+        try:
+            row = self.store.get(key)
+        except KeyError:
+            attempt.abandon(penalize=False)
+            return
+        if row['status'] == 'verified':
+            learned = attempt.commit()
+            self.memory.release(key)
+            if learned:
+                self.store.event(key, 'memory_learned', f'{learned} pantallas aprendidas de este portal.')
+        elif row['issuance_seen'] and row['status'] == 'issued_waiting_files':
+            # The portal confirmed the invoice; it is learned when its files arrive and match.
+            attempt.hold(key)
+        else:
+            attempt.abandon(penalize=not spared)
+
+    def settle_memory(self) -> None:
+        """Learn from earlier attempts whose files arrived and were verified after they ended."""
+        def status_of(job_id):
+            try:
+                return self.store.get(job_id)['status']
+            except KeyError:
+                return None
+        self.memory.settle(status_of)
+
     async def manual_job(self, key, page, profile):
         row = self.store.get(key)
         if self.store.checked_preparation(key):
@@ -1288,16 +1637,23 @@ class Runner:
                 self.store.update(key, status='uncertain', message='Sesión manual terminada sin comprobante confirmado. Recupera el resultado antes de repetir.')
 
     async def run(self, key: str, profile: Profile, auto_issue: bool = False, manual: bool = False):
+        with en_ticket(key):  # Every model call of this run is counted for this ticket.
+            await self._run(key, profile, auto_issue, manual)
+
+    async def _run(self, key: str, profile: Profile, auto_issue: bool = False, manual: bool = False):
         async with self.lock:
             if not self.store.claim(key):
                 return
             self.active_id = key
+            spared = False
+            route_attempts = 1
             try:
                 for attempt in range(3):
                     try:
                         await self._session(key, profile, auto_issue, manual)
                         return
                     except RecoveryRequested:
+                        spared = True
                         self.store.claim_recovery(key)
                         await self.recover_only(key, profile)
                         return
@@ -1317,9 +1673,13 @@ class Runner:
                         failure = sys.exc_info()[1]
                         retryable = (isinstance(failure, ValueError) and RETRYABLE.search(str(failure))
                                      and key not in self.soft_submitted and not manual)
-                        if attempt >= 2 or not (lost or retryable):
+                        # An attempt that spent its budget is never started again by itself.
+                        if isinstance(failure, AttemptLimit) or attempt >= 2 or not (lost or retryable):
                             raise
                         if not lost:
+                            if route_attempts >= MAX_ROUTE_ATTEMPTS:
+                                raise
+                            route_attempts += 1
                             # Nothing was submitted: start over on a fresh page and tell the
                             # agent what went wrong so it takes another route.
                             self.session_hints[key] = ('Intento anterior falló: ' + str(failure)[:300] +
@@ -1350,6 +1710,8 @@ class Runner:
                         message += ' Busca los comprobantes de este ticket antes de intentar otra emisión.'
                     self.store.update(key, status='issued_waiting_files' if issued else 'uncertain' if attempted else 'blocked', message=message)
                     self.store.event(key, 'stopped', message)
+                # A ticket the person stopped says nothing against what it repeated from memory.
+                spared = spared or isinstance(exc, asyncio.CancelledError) or str(exc) == 'Proceso detenido por el usuario.'
                 if isinstance(exc, asyncio.CancelledError):
                     raise
             finally:
@@ -1360,10 +1722,49 @@ class Runner:
                 self.session_hints.pop(key, None)
                 self.soft_submitted.discard(key)
                 self.live_notes.pop(key, None)
+                for record in (self.pauses, self.handled, self.told, self.asked, self.insisted, self.meters):
+                    record.pop(key, None)
+                try:
+                    self.close_learning(key, spared=spared)
+                except Exception as fault:
+                    # The memory is a help, never a reason to leave a ticket half closed.
+                    self.store.event(key, 'internal_error', type(fault).__name__ + ' en la memoria de portales')
                 await self.viewer.set_manual(False)
                 await self.finish_job_browser(key)
 
     async def _session(self, key: str, profile: Profile, auto_issue: bool, manual: bool):
+        """One attempt at the portal, measured from start to end."""
+        meter = self.meters[key] = Meter()
+        # What an earlier attempt of this run noted is not learned: it did not end well.
+        earlier = self.learning.pop(key, None)
+        if earlier is not None:
+            earlier.abandon()
+        try:
+            await self._attempt(key, profile, auto_issue, manual, meter)
+        except RecoveryRequested:
+            meter.outcome = 'recovery'
+            raise
+        except asyncio.CancelledError:
+            meter.outcome = 'cancelled'
+            raise
+        except Exception:
+            meter.outcome = meter.outcome or 'error'
+            raise
+        finally:
+            if self.meters.get(key) is meter:
+                self.meters.pop(key, None)
+            if meter.agent:
+                try:
+                    row = self.store.get(key)
+                    outcome = meter.outcome or ('verified' if row['status'] == 'verified' else
+                                                'issued' if row['issuance_seen'] else 'stopped')
+                except KeyError:
+                    outcome = meter.outcome or 'stopped'
+                self.store.event(key, 'session_metrics', json.dumps({
+                    'ai_calls': meter.ai_calls, 'actions': meter.actions, 'replayed_actions': meter.replayed,
+                    'seconds': round(meter.active(), 1), 'outcome': outcome}))
+
+    async def _attempt(self, key: str, profile: Profile, auto_issue: bool, manual: bool, meter: Meter):
         committed = issued = False
         await self.close_parked_job_pages(key)
         job = self.store.get(key)
@@ -1414,7 +1815,21 @@ class Runner:
         stalled_hints = 0
         failures: dict[str, int] = {}
         idle_steps = 0
-        questions = 0
+        meter.agent = True
+        # The plan in course, what this attempt notes for the memory and its bookkeeping.
+        # An attempt that starts over «by another route» does not repeat the remembered one.
+        # FACTURADOR_MEMORIA=0 turns the repetition off; what is solved is still learned.
+        remembering = not last_error and os.getenv('FACTURADOR_MEMORIA', '1') != '0'
+        known = Known(profile, receipt)
+        self.settle_memory()
+        learner = self.learning[key] = Attempt(self.memory, known)
+        course = Course()
+        screen = None              # (origin, path, signature) of the last screen read
+        acted_on = None            # screen of the last action that ran
+        volatile = False           # the last action was a press or click that may change the screen
+        seen_pauses = len(self.handled.get(key, ()))
+        settling: dict[tuple, int] = {}
+        rounds: list[list] = []    # [what the plan was, state before it, whether anything changed]
         tool_counts: dict[str, int] = {}
         tool_streak = 0
         emission_steps = 0
@@ -1434,6 +1849,8 @@ class Runner:
             status = self.store.get(key)['status']
             if status in {'verified', 'duplicate', 'historical'}:
                 return
+            if meter.active() > MAX_ACTIVE_SECONDS:
+                raise self.out_of_budget(key, 'tiempo', committed or issued)
             if page.is_closed() or not allowed_url(page.url, receipt.provider, receipt.portal_url, self._extra()):
                 raise ValueError('El portal se cerró o cambió a un dominio distinto del autorizado.')
             snapshot = await page.locator('body').aria_snapshot()
@@ -1472,6 +1889,12 @@ class Runner:
             if before_action is not None and recent:
                 recent[-1]['cambio_visible'] = before_action != (page.url, snapshot)
                 before_action = None
+                if volatile and recent[-1]['cambio_visible'] and course.steps and course.steps[0].source == 'ia':
+                    # A button, a link or a key changed the screen: what was planned after it
+                    # was decided for the screen before. It is observed and planned again.
+                    course.drop()
+                    recent.append({'tipo': 'plan_interrumpido', 'control': 'la pantalla cambió'})
+            volatile = False
             if ACCESS_DENIED.search(snapshot):
                 raise ValueError('El portal rechazó el acceso a este navegador. El ticket quedó pendiente.')
             issued = issued or bool(SUCCESS.search(snapshot)) or already_billed(snapshot)
@@ -1489,6 +1912,7 @@ class Runner:
                 account_step = await accounts.step(page, snapshot, challenge)
                 if account_step:
                     kind, message = account_step
+                    course.drop()
                     if kind == 'advanced':
                         self.store.event(key, 'portal_account', message)
                     else:
@@ -1645,19 +2069,92 @@ class Runner:
                                          'TC, TR, RFC y código postal coincidieron al continuar.')
                         continue
             try:
-                _, fields = await self.page_fields(page, receipt)
+                state = await self.page_state(page, receipt)
             except BrowserError:
-                fields = []
+                state = {'fields': [], 'items': [], 'signature': screen_signature([], [])}
+            fields, items = state['fields'], state['items']
+            # Where the agent stands: the screen every remembered step and every note refers to.
+            screen = (public_portal_origin(page.url) or '', known.route(urlsplit(page.url).path), state['signature'])
+            touched = self.handled.get(key, [])
+            if len(touched) != seen_pauses:
+                # A person had the browser. What they did is unknown, so neither the screen
+                # they were on nor the one they left is repeated from memory later.
+                for address in touched[seen_pauses:]:
+                    place = (public_portal_origin(address) or '', known.route(urlsplit(address).path))
+                    if acted_on is not None and acted_on[:2] == place:
+                        learner.taint(acted_on)
+                seen_pauses = len(touched)
+                learner.taint(screen)
+            if accounts.credential_values and not learner.blocked:
+                learner.block(screen)
             # Long without progress: ask in the chat once, then keep going with an assumption.
-            if (idle_steps >= IDLE_BEFORE_ASK and questions < MAX_QUESTIONS and not committed and not issued
-                    and not accounts.credential_values):
-                questions += 1
-                idle_steps = 0
-                answer = await self.ask_chat(key, 'No he podido avanzar en el portal de ' + receipt.merchant[:80] +
-                                             '. Lo que me frena: ' + (last_error or 'el formulario no acepta lo que capturo')[:250] +
-                                             ' ¿Me dices qué hago o qué dato falta?')
-                answer_note = answer or 'Sin respuesta: asume lo más razonable y toma otra ruta.'
-                continue
+            if idle_steps >= IDLE_BEFORE_ASK and not committed and not issued and not accounts.credential_values:
+                stuck = ('No he podido avanzar en el portal de ' + receipt.merchant[:80] + '. Lo que me frena: ' +
+                         (last_error or 'el formulario no acepta lo que capturo')[:250] +
+                         ' ¿Me dices qué hago o qué dato falta?')
+                if self.can_ask(key, stuck):
+                    idle_steps = 0
+                    answer, decision = await self.ask_once(key, page, stuck)
+                    if decision == 'manual':
+                        return await self.manual_job(key, page, profile)
+                    answer_note = answer or 'Sin respuesta: asume lo más razonable y toma otra ruta.'
+                    continue
+            # What must stay the same for a plan to go on: the address, no person stepping in
+            # or writing in the chat, and the same side of the emission.
+            context = (page.url, self.pauses.get(key, 0), self.told.get(key, 0), committed, issued)
+            if course.steps:
+                head = course.steps[0]
+                reason = 'el ejecutor emite por sus propias reglas' if bp_auto_ready else course.broken(
+                    last_error, context, items)
+                if reason:
+                    if head.source == 'memoria' and last_error and learner.replay_failed(head.screen):
+                        self.store.event(key, 'memory_disabled', 'Una pantalla aprendida falló tres veces seguidas.')
+                    course.drop()
+                    recent.append({'tipo': 'plan_interrumpido', 'control': reason})
+                elif head.source == 'memoria' and head.screen != screen:
+                    # The screen changed under a repeated recipe. Its field values still due and
+                    # valid here are kept; whatever else it had belonged to the screen before.
+                    learner.replay_done(head.screen)
+                    course.carry(items, screen)
+            if (not course.steps and not bp_auto_ready and not accounts.credential_values and remembering
+                    and not (last_error or tool_result or ticket_view or answer_note or self.live_notes.get(key))):
+                # Nothing planned: a screen already solved is repeated from memory before asking the model.
+                # Not after an error, nor once the person wrote or answered something: the model must read it.
+                progress = learner.state(screen)
+                if progress == 'done' and acted_on == screen:
+                    if settling.get(screen, 0) < SETTLE_TRIES:
+                        # Just repeated and still here: give the portal a moment to move on.
+                        settling[screen] = settling.get(screen, 0) + 1
+                        await asyncio.sleep(SETTLE_PAUSE)
+                        continue
+                    # Repeated without advancing: it counts against the recipe and the model takes over.
+                    if learner.replay_failed(screen):
+                        self.store.event(key, 'memory_disabled', 'Una pantalla aprendida falló tres veces seguidas.')
+                elif not progress or (progress == 'running' and learner.starts(screen) < 2):
+                    if await page.locator('body').aria_snapshot() != snapshot:
+                        continue  # The page is still drawing itself: read it again before recalling anything.
+                    related = (allowed_url(page.url, receipt.provider, receipt.portal_url)
+                               or public_portal_origin(page.url) in self._extra())
+                    recipe, family = learner.recall(screen, related)
+                    if recipe and (committed or issued) and any(step.get('risk') == 'issue' for step in recipe):
+                        recipe = None  # After an emission nothing remembered may emit again.
+                    try:
+                        remembered = self.recalled_steps(recipe, screen, items, known) if recipe else None
+                    except (KeyError, TypeError, ValueError):
+                        remembered = None  # A recipe that cannot be read is the same as none.
+                    if remembered and remembered[0].field is None and remembered[0].action.target is not None:
+                        try:
+                            await self.action_control(page, remembered[0].action, receipt)
+                        except (ValueError, BrowserError, AttributeError, TypeError):
+                            remembered = None  # Same shape, another screen: its first control is not here.
+                    if remembered:
+                        course.start(remembered, context)
+                        learner.replay_started(screen, recipe, family)
+                        self.store.event(key, 'memory_replay', f'{len(remembered)} pasos sin consultar al asistente' +
+                                         (' (portal de la misma familia).' if family else '.'))
+                    elif screen not in learner.missed:
+                        learner.missed.add(screen)
+                        self.store.event(key, 'memory_miss', 'Pantalla sin receta aprendida: decide el asistente.')
             # Accessibility snapshots include complete hrefs on separate /url: lines.
             model_snapshot = '\n'.join(line for line in snapshot.splitlines() if not line.lstrip().startswith('- /url:'))
             confirmed = {}
@@ -1665,6 +2162,7 @@ class Runner:
             if confirmed_payment and confirmed_payment == receipt.payment_code:
                 confirmed['forma_de_pago_sat'] = confirmed_payment
             observation = json.dumps({'url': public_portal_origin(page.url), 'paso': number, 'pasos_maximos': MAX_STEPS,
+                                      'consultas': meter.ai_calls, 'consultas_maximas': MAX_AI_CALLS,
                                       'emision_intentada': committed, 'emision_visible': issued,
                                       'tus_notas': agent_notes, 'acciones_recientes': recent[-15:],
                                       'ultimo_error': last_error, 'resultado_herramienta': tool_result,
@@ -1674,7 +2172,7 @@ class Runner:
                                       'datos_confirmados': confirmed,
                                       'operadores_autorizados': sorted(self._extra()),
                                       'estado_visible': model_snapshot[:26_000]}, ensure_ascii=False)
-            tool_result = ''
+            entry = None
             try:
                 if bp_auto_ready:
                     latest = await page.locator('body').aria_snapshot()
@@ -1683,7 +2181,9 @@ class Runner:
                         continue
                     action = Action(kind='click', target=Target(by='role', role='link', name='Facturar', exact=True),
                                     value=None, reason='Emitir el único ticket BP cotejado con el perfil.', risk='issue')
-                else:
+                elif not course.steps:
+                    if meter.ai_calls >= MAX_AI_CALLS:
+                        raise self.out_of_budget(key, 'consultas', committed or issued)
                     try:
                         # Once a credential has been used, pixels could echo it outside the
                         # accessibility tree (canvas, QR or a transient toast). Use verified text.
@@ -1702,10 +2202,38 @@ class Runner:
                         continue
                     # Ordinary steps think briefly; a step after an error or without progress thinks harder.
                     effort = 'high' if (last_error or idle_steps >= 3 or ticket_view) else 'medium'
-                    action = await asyncio.to_thread(ai.next_action, instructions, observation, image, ticket_view,
-                                                     effort)
+                    meter.ai_calls += 1
+                    # One consultation decides the whole screen: every safe action it can settle now.
+                    plan = await asyncio.to_thread(PLAN_SCREEN, ai, instructions, observation, image, ticket_view,
+                                                   effort)
                     ticket_view = None
                     plan_failures = 0
+                    tool_result = ''
+                    decided, cut = await self.planned_steps(page, receipt, plan, items)
+                    if not decided:
+                        last_error = cut
+                        continue
+                    outline = [(step.action.kind, step.action.target.by + '=' + step.action.target.name
+                                if step.action.target else '', step.action.value) for step in decided]
+                    if rounds and rounds[-1][2] is None:
+                        rounds[-1][2] = rounds[-1][1] != (page.url, snapshot)
+                    if len(decided) > 1 and len(rounds) >= 2 and all(
+                            before[0] == outline and before[2] is False for before in rounds[-2:]):
+                        # The same plan twice with nothing to show for it: a third time will not help.
+                        if stalled_hints < 2:
+                            stalled_hints += 1
+                            last_error = ('Repetiste el mismo plan sin cambio visible. Lee los errores con read_text, '
+                                          'revisa campos obligatorios vacíos y prueba otro control o ruta.')
+                            recent.append({'tipo': 'atasco', 'control': 'plan repetido'})
+                            continue
+                        decision = await self.human(key, page, 'blocked', 'El portal no avanzó tras varios pasos. Toma el control para revisar.')
+                        if decision == 'manual':
+                            return await self.manual_job(key, page, profile)
+                        continue
+                    rounds.append([outline, (page.url, snapshot), None])
+                    course.start(decided, context)
+                    if cut:
+                        recent.append({'tipo': 'plan_recortado', 'control': cut})
             except PlanError as exc:
                 diagnostic = {'status': exc.status}
                 for field in ('code', 'event_type'):
@@ -1727,6 +2255,33 @@ class Runner:
                 if decision == 'manual':
                     return await self.manual_job(key, page, profile)
                 continue
+            if not bp_auto_ready:
+                # One action per pass. Whatever its origin, it goes through everything below.
+                entry = course.steps.popleft()
+                action = entry.action
+            located = action
+            if entry is not None and entry.field is not None:
+                # A field is found again by what it is; its number belongs to this reading only.
+                position = locate(items, entry.field, entry.anchor)
+                if position is None:
+                    if entry.source == 'memoria':
+                        learner.replay_failed(entry.screen)
+                    course.drop()
+                    recent.append({'tipo': 'plan_interrumpido', 'control': 'un campo del plan ya no está'})
+                    continue
+                located = action.model_copy(update={'target': Target(by='field', name=str(position), role=None, exact=True)})
+                if action.target.by == 'field':
+                    action = located
+            if entry is not None and entry.link:
+                # A remembered choice among the SAT options is made with this profile and ticket.
+                chosen = await self.chosen_option(page, located, receipt, entry.link[5:], known.sat.get(entry.link[5:], ''))
+                if chosen is None:
+                    learner.replay_failed(entry.screen)
+                    course.drop()
+                    recent.append({'tipo': 'plan_interrumpido', 'control': 'la lista no ofrece el dato del expediente'})
+                    continue
+                action = action.model_copy(update={'value': chosen})
+                located = located.model_copy(update={'value': chosen})
             if press_without_target(action):
                 unbound_press_count += 1
                 last_error = 'Indica el control visible exacto antes de pulsar una tecla; no se ejecutó la acción.'
@@ -1739,12 +2294,15 @@ class Runner:
             if action.notes:
                 agent_notes = action.notes.strip()[:2000]
             if action.kind == 'ask':
-                if questions >= MAX_QUESTIONS or committed or issued:
+                question = action.value or action.reason
+                if committed or issued or not self.can_ask(key, question):
                     last_error = 'Ya no puedes preguntar más: asume el dato más razonable y sigue.'
                     continue
-                questions += 1
                 idle_steps = 0
-                answer = await self.ask_chat(key, action.value or action.reason)
+                # A question is asked once in the whole run; see ask_once.
+                answer, decision = await self.ask_once(key, page, question)
+                if decision == 'manual':
+                    return await self.manual_job(key, page, profile)
                 answer_note = answer or 'Sin respuesta: asume lo más razonable y sigue.'
                 recent.append({'tipo': 'ask', 'control': (action.value or '')[:120]})
                 continue
@@ -1761,10 +2319,27 @@ class Runner:
                     recent.append({'tipo': action.kind, 'control': 'rechazada: ya consultado'})
                     continue
                 idle_steps += 1
-                tool_result, ticket_view, failure = await self.use_tool(key, page, action, receipt, ai, committed or issued)
+                if action.kind == 'search_web':
+                    if meter.ai_calls >= MAX_AI_CALLS:
+                        raise self.out_of_budget(key, 'consultas', committed or issued)
+                    meter.ai_calls += 1
+                tool_result, ticket_view, failure = await self.use_tool(key, page, located, receipt, ai, committed or issued)
                 last_error = failure
                 if not failure and action.kind in {'back', 'reload', 'upload'}:
                     before_action = page.url, snapshot
+                    meter.actions += 1
+                    acted_on = screen
+                    if action.kind == 'upload':
+                        learner.step(screen, action, entry.field if entry else None, 'normal', entry.source if entry else 'ia')
+                        if entry is not None and entry.source == 'memoria':
+                            meter.replayed += 1
+                            if entry.last:
+                                learner.replay_done(entry.screen)
+                    else:
+                        learner.mark(screen, action.kind)
+                elif failure and entry is not None and entry.source == 'memoria':
+                    learner.replay_failed(entry.screen)
+                    course.drop()
                 label = action.value or (action.target.name if action.target else '')
                 recent.append({'tipo': action.kind, 'control': label[:120]})
                 self.store.event(key, 'tool', action.kind + ' · ' + (action.reason or '')[:120])
@@ -1785,6 +2360,14 @@ class Runner:
                     and normalize(name) in {'ACEPTAR', 'CONTINUAR'}):
                 # Aceptar and the confirmation dialog's Continuar only lead to the payment page.
                 risk = 'normal'
+            if (entry is not None and entry.source == 'ia' and entry.index
+                    and (action_risk(action) != 'normal' or walmart_payment)):
+                # Lock: an action that emits, confirms or belongs to the person runs only as the
+                # first step of a plan just asked for with a fresh observation. Found further
+                # back, it and the rest are discarded and the screen is observed and planned again.
+                course.drop()
+                recent.append({'tipo': 'plan_interrumpido', 'control': 'una acción de riesgo va sola y al final'})
+                continue
             if risk == 'confirm' and (committed or issued):
                 risk = 'normal'
             elif risk == 'confirm':
@@ -1834,10 +2417,13 @@ class Runner:
                 recent.append({'tipo': 'autoayuda', 'control': (action.reason or '')[:120]})
                 continue
             if ((action.kind == 'human' or risk in {'unknown', 'terms', 'blocked'}) and risk not in {'captcha', 'login'}
-                    and questions < MAX_QUESTIONS and not committed and not issued and not accounts.credential_values):
-                questions += 1
+                    and not committed and not issued and not accounts.credential_values
+                    and self.can_ask(key, action.reason or 'Necesito un dato para continuar con el portal.')):
                 idle_steps = 0
-                answer = await self.ask_chat(key, action.reason or 'Necesito un dato para continuar con el portal.')
+                answer, decision = await self.ask_once(
+                    key, page, action.reason or 'Necesito un dato para continuar con el portal.')
+                if decision == 'manual':
+                    return await self.manual_job(key, page, profile)
                 answer_note = answer or 'Sin respuesta: asume lo más razonable y sigue.'
                 continue
             if risk in MANUAL or action.kind == 'human':
@@ -1897,6 +2483,11 @@ class Runner:
                 recent.append({'bloqueo': last_error})
                 continue
             if risk == 'issue' and not preparing_capufe:
+                if (committed or issued) and entry is not None and entry.source == 'memoria':
+                    # A remembered emission step never runs again after an emission: the model decides.
+                    course.drop()
+                    last_error = 'Ya hubo un intento de emisión: solo quedan descargas o recuperar el resultado.'
+                    continue
                 if committed or issued:
                     raise ValueError('Ya hubo un intento de emisión. Consulta o recupera ese CFDI.')
                 if action.kind != 'click' or not action.target.exact:
@@ -1908,20 +2499,25 @@ class Runner:
                         raise ValueError(mismatch)
                 if receipt.provider == 'bp' and not await bp_issue_proof(page, receipt, profile, bp_evidence):
                     raise ValueError('BP no mostró una única compra cotejada con el ticket y el perfil fiscal.')
-                if (walmart_payment and questions < MAX_QUESTIONS and key not in self.explicit_approval
+                if (walmart_payment and key not in self.explicit_approval
                         and not await walmart_payment_issue(page, receipt, walmart_lookup)):
                     # Walmart does not show the ticket's payment form chosen: ask once, live, with its options.
-                    questions += 1
-                    idle_steps = 0
+                    # The question goes through the run's register like any other: it is never sent twice,
+                    # and if it is still needed without an answer the ticket waits for the person once.
                     options = await walmart_payment_options(page)
-                    answer = await self.ask_chat(key, 'En la página de pago de Walmart no puedo elegir la forma de pago '
-                                                 'del ticket (clave SAT ' + receipt.payment_code + ' ' +
-                                                 SAT_PAYMENT_LABELS.get(receipt.payment_code, '') + '). Opciones que muestra: ' +
-                                                 (', '.join(options) or 'no veo la lista') + '. ¿Cuál elijo?')
-                    answer_note = answer or 'Sin respuesta: elige la opción equivalente a la clave del expediente.'
-                    last_error = ('Elige en la página de pago la forma de pago del expediente o la que indicó el titular '
-                                  'y vuelve a pulsar el botón.')
-                    continue
+                    question = ('En la página de pago de Walmart no puedo elegir la forma de pago '
+                                'del ticket (clave SAT ' + receipt.payment_code + ' ' +
+                                SAT_PAYMENT_LABELS.get(receipt.payment_code, '') + '). Opciones que muestra: ' +
+                                (', '.join(options) or 'no veo la lista') + '. ¿Cuál elijo?')
+                    if self.can_ask(key, question):
+                        idle_steps = 0
+                        answer, decision = await self.ask_once(key, page, question)
+                        if decision == 'manual':
+                            return await self.manual_job(key, page, profile)
+                        answer_note = answer or 'Sin respuesta: elige la opción equivalente a la clave del expediente.'
+                        last_error = ('Elige en la página de pago la forma de pago del expediente o la que indicó el titular '
+                                      'y vuelve a pulsar el botón.')
+                        continue
                 _, pending_fields = await fiscal_choices(page, profile, receipt, extra=self._extra())
                 if pending_fields:
                     last_error = 'Antes de emitir, el portal debe reflejar ' + ', '.join(pending_fields) + '.'
@@ -1929,7 +2525,7 @@ class Runner:
                     continue
                 try:
                     issue_button = (walmart_issue_control if walmart_issue_control is not None
-                                    else await self.action_control(page, action, receipt))
+                                    else await self.action_control(page, located, receipt))
                     if walmart_issue_control is not None:
                         walmart_issue_element = await issue_button.element_handle()
                         if walmart_issue_element is None:
@@ -1989,14 +2585,29 @@ class Runner:
                     elif action.kind == 'click' and re.fullmatch(r'continuar', name.strip(), re.I) and not issued:
                         await self.human(key, page, 'confirm', 'Revisa la confirmación que muestra el portal y completa ese paso si coincide con tu ticket.')
                         continue
+                    elif entry is not None and entry.source == 'memoria':
+                        # A remembered step that does not fit after the emission is dropped, not an error.
+                        learner.replay_failed(entry.screen)
+                        course.drop()
+                        last_error = 'Tras la emisión solo quedan descargas o recuperar el resultado.'
+                        continue
                     else:
                         raise ValueError('Revisa o recupera la factura del intento actual.')
+            worked = False
             try:
                 before_action = page.url, snapshot
                 if walmart_auto and walmart_issue_element is not None:
                     await walmart_issue_element.click(timeout=5000)
                 else:
-                    await self.execute(page, action, receipt)
+                    if entry is not None and entry.field is not None:
+                        # Lock: never write by an old number. The page is read again right before
+                        # acting and the field is found by what it is, or the step does not run.
+                        position = locate((await self.page_state(page, receipt))['items'], entry.field, entry.anchor)
+                        if position is None:
+                            raise ValueError('El campo planeado ya no está en la pantalla. Lee de nuevo el formulario.')
+                        located = located.model_copy(update={
+                            'target': Target(by='field', name=str(position), role=None, exact=True)})
+                    await self.execute(page, located, receipt)
                 if (walmart_lookup_candidate is not None and
                         urlsplit(page.url).path.rstrip('/') != '/address'):
                     try:
@@ -2006,6 +2617,7 @@ class Runner:
                         pass
                 last_error = ''
                 idle_steps = 0
+                worked = True
             except Exception as exc:
                 if committed:
                     raise ValueError('El portal no confirmó el resultado del intento de emisión. Busca el CFDI antes de repetir.')
@@ -2016,8 +2628,36 @@ class Runner:
                 if failures[control] >= 2:
                     last_error += (' Ese control ya falló ' + str(failures[control]) + ' veces. Si no tiene etiqueta usable, '
                                    'apúntalo por número: target.by="field" y name con su número de la lista campos.')
-            recent.append({'tipo': action.kind, 'control': name[:120]})
-            self.store.event(key, 'action', action.kind + ' · ' + name[:120])
+            logged = {'tipo': action.kind, 'control': name[:120]}
+            if worked:
+                meter.actions += 1
+                acted_on = screen
+            if worked and entry is not None:
+                if entry.field is not None:
+                    logged['campo'] = entry.field['label']
+                    if action.kind in {'fill', 'select'} and located.value:
+                        course.written.append(entry)
+                # A button, a link or a key may change the screen the rest of the plan was decided for.
+                volatile = entry.source == 'ia' and entry.field is None and action.kind in {'click', 'press', 'goto'}
+                shown = await self.chosen_label(page, located, receipt) if action.kind == 'select' else None
+                learner.step(screen, action.model_copy(update={'value': shown}) if shown else action,
+                             entry.field, risk, entry.source, '' if entry.field else name)
+                if entry.source == 'memoria':
+                    logged['origen'] = 'memoria'
+                    meter.replayed += 1
+                    if entry.last:
+                        learner.replay_done(entry.screen)
+                    await asyncio.sleep(REPLAY_PAUSE)
+            elif entry is not None:
+                # A failed step ends its plan; a remembered one also counts against its recipe.
+                if entry.source == 'memoria' and learner.replay_failed(entry.screen):
+                    self.store.event(key, 'memory_disabled', 'Una pantalla aprendida falló tres veces seguidas.')
+                course.drop()
+            recent.append(logged)
+            # A field picked by number is named by its label, unless the portal echoes personal data there.
+            by_number = entry is not None and entry.field and action.target.by == 'field'
+            shown_name = entry.field['label'] if by_number and not known.reveals(entry.field['label']) else name
+            self.store.event(key, 'action', action.kind + ' · ' + shown_name[:120])
             if (walmart_lookup_candidate is not None and
                     urlsplit(page.url).path.rstrip('/') == '/address'):
                 walmart_lookup = walmart_lookup_candidate
@@ -2033,7 +2673,7 @@ class Runner:
                 decision = await self.human(key, page, 'blocked', 'El portal no avanzó tras varios pasos. Toma el control para revisar.')
                 if decision == 'manual':
                     return await self.manual_job(key, page, profile)
-        raise ValueError('La factura requiere revisar el resultado del portal.')
+        raise self.out_of_budget(key, 'pasos', committed or issued)
 
     async def close(self):
         jobs = list(self.job_tasks.values())
