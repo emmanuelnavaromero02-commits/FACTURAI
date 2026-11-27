@@ -71,7 +71,7 @@ class SubscriptionTests(unittest.TestCase):
             record = json.loads(request.content)
             assert record['stream'] is True and record['store'] is False
             assert record['text']['format']['strict'] and record['model'] == 'gpt-6.1-sol'
-            assert record['reasoning'] == {'effort': 'max'}
+            assert record['reasoning'] == {'effort': 'medium'}
             assert 'previous_response_id' not in record
             data = {'type': 'response.completed', 'response': {'output': [{'type': 'message',
                     'content': [{'type': 'output_text', 'text': json.dumps(REPLY)}]}]}}
@@ -96,20 +96,109 @@ class SubscriptionTests(unittest.TestCase):
         self.assertEqual(login['ext_agent_host_id'], self.auth_attempt['ext_agent_host_id'])
         self.assertNotEqual(login['state'], self.auth_attempt['state'])
 
-    def test_all_ai_tasks_request_max_reasoning(self):
+    def test_each_ai_task_requests_its_own_reasoning_level(self):
         source = Path(self.tmp.name) / 'sample.txt'
         source.write_text('Ticket de prueba', encoding='utf-8')
         plan = Mock()
         ai = AI(plan)
+        plan.infer.return_value = Extraction.model_validate(REPLY)
         ai.extract(source, {})
+        plan.infer.return_value = Mock()
         ai.tax_profile(source)
         ai.next_action('Instrucciones', '{}', None)
         evidence = 'https://cafeteria.example.org/facturacion'
         plan.infer.return_value = (PortalSearch(billing_url='https://facturas.example.org/emitir',
                                                evidence_url=evidence), [evidence])
         ai.discover_portal('Cafetería')
-        self.assertEqual([call.kwargs.get('effort', 'max') for call in plan.infer.call_args_list],
-                         ['max', 'max', 'medium', 'max'])
+        plan.infer.return_value = (Mock(answer='Respuesta'), [])
+        ai.research('¿Dónde está el folio?', 'Cafetería')
+        self.assertEqual([call.kwargs.get('effort', 'default') for call in plan.infer.call_args_list],
+                         ['low', 'medium', 'medium', 'medium', 'medium'])
+
+    def test_doubtful_ticket_gets_one_closer_look_and_clear_ticket_one_call(self):
+        source = Path(self.tmp.name) / 'sample.txt'
+        source.write_text('Ticket de prueba', encoding='utf-8')
+        clear = Extraction.model_validate(REPLY)
+        doubtful_cases = {
+            'no es ticket': {'is_receipt': False},
+            'sin importe': {'amount': None},
+            'sin fecha': {'date': ' '},
+            'sin folio ni códigos': {'ticket_number': None, 'billing_codes': []},
+        }
+        plan = Mock()
+        plan.infer.return_value = clear
+        self.assertIs(AI(plan).extract(source, {}), clear)
+        self.assertEqual([call.kwargs['effort'] for call in plan.infer.call_args_list], ['low'])
+        # A complete ticket with a side note (how it was paid) is settled later, not read twice.
+        noted = Extraction.model_validate({**REPLY, 'payment_code': None,
+                                           'uncertainties': ['No se distingue si la tarjeta es de débito o crédito.']})
+        plan = Mock()
+        plan.infer.return_value = noted
+        self.assertIs(AI(plan).extract(source, {}), noted)
+        self.assertEqual(plan.infer.call_count, 1)
+        codes_only = Extraction.model_validate({**REPLY, 'ticket_number': None, 'billing_codes': ['ABC123']})
+        plan = Mock()
+        plan.infer.return_value = codes_only
+        AI(plan).extract(source, {})
+        self.assertEqual(plan.infer.call_count, 1)
+        for name, change in doubtful_cases.items():
+            with self.subTest(name):
+                closer = Extraction.model_validate({**REPLY, 'ticket_number': 'SEGUNDA'})
+                plan = Mock()
+                plan.infer.side_effect = [Extraction.model_validate({**REPLY, **change}), closer]
+                ai = AI(plan)
+                self.assertIs(ai.extract(source, {}), closer)
+                self.assertEqual([call.kwargs['effort'] for call in plan.infer.call_args_list], ['low', 'high'])
+                # The same input is sent again; only the level changes.
+                self.assertEqual(plan.infer.call_args_list[0].args, plan.infer.call_args_list[1].args)
+                self.assertEqual((ai.timing['effort'], ai.timing['escalated']), ('high', True))
+
+    def test_rejected_reasoning_level_falls_back_once_and_is_remembered(self):
+        self.finish()
+        asked = []
+
+        def handler(request):
+            if str(request.url) != RESOURCE + '/responses':
+                return self.fake_openai(request)
+            effort = json.loads(request.content)['reasoning']['effort']
+            asked.append(effort)
+            if effort == 'low':
+                return httpx.Response(400, json={'error': {
+                    'type': 'invalid_request_error', 'code': 'unsupported_value', 'param': 'reasoning.effort',
+                    'message': "Unsupported value: 'low' is not supported with this model."}})
+            data = {'type': 'response.completed', 'response': {'output': [{'type': 'message',
+                    'content': [{'type': 'output_text', 'text': json.dumps(REPLY)}]}]}}
+            return httpx.Response(200, text='data: ' + json.dumps(data) + '\n\n',
+                                  headers={'Content-Type': 'text/event-stream'})
+
+        plan = self.new_plan(handler)
+        first = plan.infer('Lee', [], Extraction, effort='low')
+        second = plan.infer('Lee otra vez', [], Extraction, effort='low')
+        self.assertEqual((first.ticket_number, second.ticket_number), ('0000042', '0000042'))
+        self.assertEqual(asked, ['low', 'medium', 'medium'])
+        self.assertEqual(plan.infer('Lee', [], Extraction, effort='high').ticket_number, '0000042')
+        self.assertEqual(asked[-1], 'high')
+
+    def test_other_bad_requests_do_not_change_the_reasoning_level(self):
+        self.finish()
+        asked = []
+
+        def handler(request):
+            asked.append(json.loads(request.content)['reasoning']['effort'])
+            return httpx.Response(400, json={'error': {'code': 'invalid_request_error', 'param': 'input',
+                                                       'message': 'Invalid image.'}})
+
+        plan = self.new_plan(handler)
+        with self.assertRaises(PlanError) as raised:
+            plan.infer('Lee', [], Extraction, effort='low')
+        self.assertEqual(raised.exception.status, 'model')
+        self.assertEqual(asked, ['low'])
+        medium = []
+        rejected = self.new_plan(lambda request: (medium.append(1), httpx.Response(400, json={'error': {
+            'param': 'reasoning.effort', 'message': 'Unsupported value.'}}))[1])
+        with self.assertRaises(PlanError):
+            rejected.infer('Lee', [], Extraction)
+        self.assertEqual(len(medium), 1)  # medium itself is never retried at another level.
 
     def test_callback_rejects_wrong_state_and_validation_precedes_inference(self):
         with self.assertRaises(PlanError):

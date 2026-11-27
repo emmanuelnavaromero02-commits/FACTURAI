@@ -27,6 +27,7 @@ PUBLIC_CLIENT = 'dynamic_agent_client'
 SCOPES = 'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct'
 PLAN_SCOPES = {'resource.invoke', 'chatgpt.tokens.use.direct'}
 DEFAULT_MODEL = 'gpt-6.1-sol'
+FALLBACK_EFFORT = 'medium'
 CALLBACK = '/auth/chatgpt/callback'
 
 
@@ -107,6 +108,7 @@ class ChatGPTPlan:
         self.redirect = f'http://127.0.0.1:{port}{CALLBACK}'
         self.lock = threading.RLock()
         self.pending: dict | None = None
+        self._rejected_efforts: set[tuple[str, str]] = set()  # (model, effort) refused by the API
         self.client = client or httpx.Client(timeout=httpx.Timeout(90, connect=12), follow_redirects=False)
 
     @staticmethod
@@ -367,9 +369,12 @@ class ChatGPTPlan:
             record['model'] = model
             write_private(self.session_path, record)
 
-    def infer(self, instructions, content, output_type, *, effort='max', web_search=False):
+    def infer(self, instructions, content, output_type, *, effort='medium', web_search=False):
         access, model = self._credentials()
-        request = {'model': model, 'reasoning': {'effort': effort}, 'store': False, 'stream': True,
+        with self.lock:
+            rejected = (model, effort) in self._rejected_efforts
+        request = {'model': model, 'reasoning': {'effort': FALLBACK_EFFORT if rejected else effort},
+                   'store': False, 'stream': True,
                    'instructions': instructions, 'input': [{'role': 'user', 'content': content}],
                    'text': {'format': {'type': 'json_schema', 'name': output_type.__name__.lower(),
                                        'strict': True, 'schema': strict_schema(output_type)}}}
@@ -378,14 +383,31 @@ class ChatGPTPlan:
                            include=['web_search_call.action.sources'])
         # Repeating an inference cannot submit a merchant form. A brief, bounded
         # retry absorbs a failed stream without leaving the live browser frozen.
-        for attempt in range(2):
+        retried = False
+        while True:
             try:
                 return self._infer_once(access, request, output_type, web_search)
             except PlanError as exc:
-                if attempt or exc.status != 'transient' or exc.retry_after > 2:
+                asked = request['reasoning']['effort']
+                if getattr(exc, 'effort_rejected', False) and asked != FALLBACK_EFFORT:
+                    # The model refused this reasoning level: ask once at the
+                    # default level and never request the refused one again.
+                    with self.lock:
+                        self._rejected_efforts.add((model, asked))
+                    request['reasoning'] = {'effort': FALLBACK_EFFORT}
+                    continue
+                if retried or exc.status != 'transient' or exc.retry_after > 2:
                     raise
+                retried = True
                 time.sleep(0.5)
-        raise AssertionError('Unreachable inference retry state')
+
+    @staticmethod
+    def _rejects_effort(raw: dict) -> bool:
+        """A 400 that names the reasoning level as the unsupported parameter or value."""
+        error = raw.get('error') if isinstance(raw.get('error'), dict) else raw
+        param = str(error.get('param') or '')
+        message = str(error.get('message') or '')
+        return param in {'reasoning.effort', 'reasoning'} or 'reasoning.effort' in message
 
     def _infer_once(self, access, request, output_type, web_search):
         try:
@@ -393,8 +415,11 @@ class ChatGPTPlan:
                                     headers={'Authorization': 'Bearer ' + access}) as response:
                 if not response.is_success:
                     response.read()
-                    raise self._error(self._body(response), response.status_code, access,
-                                      retry_seconds(response.headers.get('retry-after')))
+                    body = self._body(response)
+                    error = self._error(body, response.status_code, access,
+                                        retry_seconds(response.headers.get('retry-after')))
+                    error.effort_rejected = response.status_code == 400 and self._rejects_effort(body)
+                    raise error
                 streamed_items = []
                 for event in decode_event_stream(response.iter_lines()):
                     kind = event.get('type')

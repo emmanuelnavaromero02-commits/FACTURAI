@@ -461,6 +461,20 @@ class Store:
                        (stage, status, message, now(), key, claim))
         return self.get(key)
 
+    def release_read(self, key: str, claim: str):
+        """Free one read stopped at shutdown exactly as recover_after_restart frees it on start."""
+        with self.connect() as db:
+            db.execute(f"UPDATE jobs SET status='review',auto_stage='retry_read',read_after=?,message=?,updated=? "
+                       f"WHERE id=? AND auto_stage=? AND {AUTO_ELIGIBLE} AND auto_stage LIKE 'reading:auto:%' "
+                       "AND read_attempts<=? AND status IN ('new','review')",
+                       (time.time() + READ_DELAYS[0], 'Se interrumpió la lectura. El reintento automático está programado.',
+                        now(), key, claim, len(READ_DELAYS)))
+            db.execute("UPDATE jobs SET status='review',auto_stage='review',message=?,updated=? "
+                       "WHERE id=? AND auto_stage=? AND status IN ('new','review','ready','external','blocked') "
+                       "AND issue_attempted=0 AND human_exposed=0 AND issuance_seen=0 AND uuid IS NULL",
+                       ('La lectura se interrumpió. Revisa los datos o pulsa Leer con mi plan para repetirla.', now(),
+                        key, claim))
+
     def note_review(self, row: dict, message: str, *, keep_ready: bool = False):
         with self.connect() as db:
             db.execute(f"UPDATE jobs SET auto_stage='review',status=?,message=?,updated=? WHERE id=? "

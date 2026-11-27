@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -214,13 +215,39 @@ def reconcile_uncertainties(messages: list[str], *, payment_confirmed: bool,
     return remaining
 
 
-def read_ticket(plan, row, automatic, root, companions=()):
+class _TimedLocalReader:
+    """Local page reads of one ticket, with the time they took (mostly cache hits)."""
+    def __init__(self):
+        self.ms = 0
+
+    def __call__(self, path, *args, **options):
+        started = time.monotonic()
+        try:
+            return read_local_page(path, *args, **options)
+        finally:
+            self.ms += int((time.monotonic() - started) * 1000)
+
+
+def read_ticket(plan, row, automatic, root, companions=(), *, progress=None, timing=None):
+    """Read one ticket; `progress(phase)` reports stages and `timing` receives measurements."""
+    ai = AI(plan, progress)
+    local = _TimedLocalReader()
+    try:
+        return _read_ticket(ai, local, row, automatic, root, companions)
+    finally:
+        if timing is not None:
+            timing.update(ai.timing)
+            timing['ocr_ms'] = ai.timing['ocr_ms'] + local.ms
+
+
+def _read_ticket(ai, read_local_page, row, automatic, root, companions):
+    # read_local_page is the timed reader above; it shadows the module function on purpose.
     path = Path(row['source_path'])
     catalog = {k: v['name'] for k, v in CATALOG.items()}
     if row.get('batch_id', '').startswith('chat-'):
-        result = AI(plan).extract(path, catalog, list(companions), split_ticket=True)
+        result = ai.extract(path, catalog, list(companions), split_ticket=True)
     else:
-        result = AI(plan).extract(path, catalog, list(companions))
+        result = ai.extract(path, catalog, list(companions))
     page = {}
     if not result.is_receipt:
         # A reverse side may contain only the fiscal QR or URL. Keep it readable
@@ -297,7 +324,7 @@ def read_ticket(plan, row, automatic, root, companions=()):
     if not marked and not billing_url and not known and result.merchant.strip():
         tools.append('busqueda_web')
         try:
-            suggested, evidence = AI(plan).discover_portal(result.merchant.strip())
+            suggested, evidence = ai.discover_portal(result.merchant.strip())
             if suggested:
                 receipt.provider, receipt.portal_url = CUSTOM_PORTAL, suggested
                 sources['provider'] = sources['portal_url'] = 'busqueda_web'
@@ -375,6 +402,16 @@ def read_ticket(plan, row, automatic, root, companions=()):
     return receipt, ready, note, {'fields':sources, 'tools':list(dict.fromkeys(tools))}
 
 
+# Tickets read at the same time. Each read mostly waits on the model; local OCR
+# has its own limit in local_reader.
+MAX_PARALLEL_READS = 3
+READ_PHASES = {
+    'preparando': 'Preparando la foto del ticket.',
+    'leyendo': 'Leyendo los datos del ticket.',
+    'buscando_portal': 'Buscando el portal de facturación del comercio.',
+}
+
+
 class TicketAutomation:
     def __init__(self, store, runner, plan, get_profile):
         self.store, self.runner, self.plan, self.get_profile = store, runner, plan, get_profile
@@ -386,6 +423,11 @@ class TicketAutomation:
         self.task = None
         self.stopping = False
         self._state = {}
+        self.reads: dict[str, asyncio.Task] = {}  # Background reads started by the queue.
+        self._jobs: dict[str, dict] = {}  # Stage of every read in progress, for the panel.
+        self._job_claims: dict[str, str] = {}
+        self._jobs_lock = threading.Lock()  # Phases are reported from reader threads.
+        self._classify = threading.Lock()  # Saving a reading and pairing its batch happen together.
         self._reset()
 
     def _set(self, phase, key, message):
@@ -398,7 +440,26 @@ class TicketAutomation:
             self._set('off', None, 'Procesamiento automático desactivado.')
 
     def status(self):
-        return {'enabled': self.enabled, **self._state}
+        with self._jobs_lock:
+            jobs = {key: dict(value) for key, value in self._jobs.items()}
+        return {'enabled': self.enabled, **self._state, 'jobs': jobs}
+
+    def _phase(self, key, claim, phase):
+        with self._jobs_lock:
+            # A reader thread left behind by a cancelled read must not touch a newer one.
+            if self._job_claims.get(key) == claim:
+                self._jobs[key] = {'phase': phase, 'message': READ_PHASES[phase], 'since': time.time()}
+
+    def _track(self, key, claim):
+        with self._jobs_lock:
+            self._job_claims[key] = claim
+        self._phase(key, claim, 'preparando')
+
+    def _untrack(self, key, claim):
+        with self._jobs_lock:
+            if self._job_claims.get(key) == claim:
+                del self._job_claims[key]
+                self._jobs.pop(key, None)
 
     def configure(self, enabled: bool):
         write_private(self.settings, {'enabled': enabled, 'plan_read_after': self.plan_read_after})
@@ -418,22 +479,58 @@ class TicketAutomation:
         self.wake.set()
         if self.task:
             await self.task
+        # Each cancelled read releases its claim (see analyze); its thread result is discarded.
+        reads = list(self.reads.values())
+        for read in reads:
+            read.cancel()
+        if reads:
+            await asyncio.gather(*reads, return_exceptions=True)
 
-    async def read_offline(self, row, claim, *, reason, stage='review', read_after=0):
+    def _launch_read(self, key, *, offline=False, explain=False):
+        """Read one ticket in the background; the caller yields once so it claims the ticket."""
+        task = self.reads[key] = asyncio.create_task(self._background_read(key, offline, explain))
+        return task
+
+    async def _background_read(self, key, offline, explain):
+        try:
+            if not offline and self.plan_read_after > time.time():
+                offline = True  # A read started together with this one hit the service's wait.
+            row = await self.analyze(key, automatic=True, offline=offline)
+            if explain and self.enabled and row['status'] in ('review', 'blocked', 'duplicate'):
+                self._set('review', key, row['message'])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # One failed read never stops the others or the queue.
+            log.exception('Error al leer un ticket de la bandeja')
+            self._set('review', key, 'Revisa el estado del ticket en la bandeja.')
+        finally:
+            if self.reads.get(key) is asyncio.current_task():
+                del self.reads[key]
+            self.wake.set()
+
+    def _read_slots(self):
+        return MAX_PARALLEL_READS - len(self.reads)
+
+    async def read_offline(self, row, claim, *, reason, stage='review', read_after=0, timing=None):
+        started = time.monotonic()
         try:
             receipt, warning, method = await asyncio.to_thread(local_ticket, row)
         except Exception:
             # A broken document must release its read claim so other uploads keep moving.
             receipt, warning, method = Receipt.model_validate(row['receipt']), 'El lector local no encontró texto legible.', 'error'
+        if timing is not None:
+            timing['ocr_ms'] = timing.get('ocr_ms', 0) + int((time.monotonic() - started) * 1000)
         notes = [reason, warning, *review_questions(receipt)]
         note = ' '.join(s.rstrip('.') + '.' for s in notes if s)
-        saved = self.store.save_receipt(row['id'], receipt, claim=claim, note=note,
-                                        read_stage=stage, read_after=read_after)
-        if saved['receipt'] == receipt.model_dump():
-            changed = {field:method for field in ('provider','merchant','amount','date','ticket_number',
-                       'billing_codes','payment_code','portal_url') if getattr(receipt, field) != row['receipt'].get(field)}
-            self.store.event(row['id'], 'fuentes_de_campos', json.dumps({'fields':changed,'tools':[method]}, ensure_ascii=False))
-        self.store.pair_batch_if_unique(row['id'])
+        with self._classify:
+            saved = self.store.save_receipt(row['id'], receipt, claim=claim, note=note,
+                                            read_stage=stage, read_after=read_after)
+            if saved['receipt'] == receipt.model_dump():
+                changed = {field:method for field in ('provider','merchant','amount','date','ticket_number',
+                           'billing_codes','payment_code','portal_url') if getattr(receipt, field) != row['receipt'].get(field)}
+                self.store.event(row['id'], 'fuentes_de_campos', json.dumps({'fields':changed,'tools':[method]}, ensure_ascii=False))
+            self.store.pair_batch_if_unique(row['id'])
         return self.store.get(row['id'])
 
     async def analyze(self, key: str, automatic=False, offline=False):
@@ -443,21 +540,41 @@ class TicketAutomation:
         if not claimed:
             return self.store.get(key)
         row, claim = claimed
+        self._track(key, claim)
+        started, timing = time.monotonic(), {}
+        try:
+            result = await self._read_claimed(key, row, claim, automatic, offline, timing)
+        except asyncio.CancelledError:
+            # Shutdown: free the ticket now instead of waiting for the next start.
+            self.store.release_read(key, claim)
+            raise
+        finally:
+            self._untrack(key, claim)
+        self.store.event(key, 'read_timing', json.dumps({
+            'total_ms': int((time.monotonic() - started) * 1000),
+            'ocr_ms': int(timing.get('ocr_ms', 0)), 'model_ms': int(timing.get('model_ms', 0)),
+            'web_search_ms': int(timing.get('web_search_ms', 0)),
+            'effort': str(timing.get('effort', '')), 'escalated': bool(timing.get('escalated', False))}))
+        return result
+
+    async def _read_claimed(self, key, row, claim, automatic, offline, timing):
         try:
             if offline:
                 return await self.read_offline(row, claim, reason='Lectura local',
-                                               stage='offline' if automatic else 'review')
+                                               stage='offline' if automatic else 'review', timing=timing)
             companions = self.store.companion_paths(key)
             receipt, ready, note, provenance = await asyncio.to_thread(
-                read_ticket, self.plan, row, automatic, self.store.root, companions)
-            if receipt is None:
-                self.store.finish_read(key, claim, 'blocked', note)
+                read_ticket, self.plan, row, automatic, self.store.root, companions,
+                progress=lambda phase: self._phase(key, claim, phase), timing=timing)
+            with self._classify:
+                if receipt is None:
+                    self.store.finish_read(key, claim, 'blocked', note)
+                    self.store.pair_batch_if_unique(key)
+                    return self.store.get(key)
+                saved = self.store.save_receipt(key, receipt, ready, claim=claim, note=note)
+                if saved['receipt'] == receipt.model_dump():
+                    self.store.event(key, 'fuentes_de_campos', json.dumps(provenance, ensure_ascii=False))
                 self.store.pair_batch_if_unique(key)
-                return self.store.get(key)
-            saved = self.store.save_receipt(key, receipt, ready, claim=claim, note=note)
-            if saved['receipt'] == receipt.model_dump():
-                self.store.event(key, 'fuentes_de_campos', json.dumps(provenance, ensure_ascii=False))
-            self.store.pair_batch_if_unique(key)
             return self.store.get(key)
         except Exception as exc:
             note = str(exc) if isinstance(exc, PlanError) else 'No se pudo completar la lectura. Revisa el original o vuelve a leerlo.'
@@ -477,7 +594,7 @@ class TicketAutomation:
                         note += f' Reintento automático de lectura en {delay} segundos.'
                     elif wait is not None:
                         note += ' Se agotaron los reintentos automáticos. Puedes volver a leer el ticket desde la bandeja.'
-            return await self.read_offline(row, claim, reason=note, stage=stage, read_after=due)
+            return await self.read_offline(row, claim, reason=note, stage=stage, read_after=due, timing=timing)
 
     def _plan_ready(self, key):
         state = self.plan.status()
@@ -521,35 +638,50 @@ class TicketAutomation:
         self._set('queued', key, 'En cola para preparar el portal y continuar donde los datos sean comprobables.')
         return True
 
-    async def chat_step(self):
-        """Process chat uploads independently of the legacy inbox toggle."""
-        ready = self.plan.status()['status'] == 'ready' and self.plan_read_after <= time.time()
-        for row in self.store.chat_jobs():
-            key, stage = row['id'], row['auto_stage']
-            if row['status'] == 'new' or (row['status'] == 'review' and stage in {'offline', 'retry_read'}):
-                if stage == 'retry_read' and row['read_after'] > time.time():
-                    continue
-                if not ready and row['status'] == 'review':
-                    continue
-                self._set('reading', key, 'Leyendo las imágenes del ticket.')
-                await self.analyze(key, automatic=True, offline=not ready)
-                return True
-            if row['status'] == 'ready':
-                prepared = self._prepare(row)
-                updated = self.store.get(key)
-                if updated['status'] != 'ready':
-                    self.store.finish_chat_job(key)
-                if prepared:
-                    return True
-                continue
-            if row['status'] == 'review' and stage.startswith('reading:'):
-                continue
-            self.store.finish_chat_job(key)
-            return True
-        return False
+    async def chat_step(self, wait=True):
+        """Process chat uploads independently of the legacy inbox toggle.
 
-    async def step(self):
-        if await self.chat_step():
+        With wait, return after the reads started here finish (one complete round);
+        the worker loop passes wait=False so reads run while it keeps going."""
+        # A model wait requested by the service is honoured here: while it lasts no
+        # new read goes to the model; the originals are read locally instead.
+        ready = self.plan.status()['status'] == 'ready' and self.plan_read_after <= time.time()
+        launched = []
+        try:
+            for row in self.store.chat_jobs():
+                key, stage = row['id'], row['auto_stage']
+                if key in self.reads or stage.startswith('reading:'):
+                    continue  # Its reading is still running.
+                if row['status'] == 'new' or (row['status'] == 'review' and stage in {'offline', 'retry_read'}):
+                    if stage == 'retry_read' and row['read_after'] > time.time():
+                        continue
+                    if not ready and row['status'] == 'review':
+                        continue
+                    if self._read_slots() <= 0:
+                        continue
+                    self._set('reading', key, 'Leyendo las imágenes del ticket.')
+                    launched.append(self._launch_read(key, offline=not ready))
+                    continue
+                if row['status'] == 'ready':
+                    prepared = self._prepare(row)
+                    updated = self.store.get(key)
+                    if updated['status'] != 'ready':
+                        self.store.finish_chat_job(key)
+                    if prepared:
+                        return True
+                    continue
+                self.store.finish_chat_job(key)
+                return True
+            return bool(launched)
+        finally:
+            if launched and wait:
+                await asyncio.gather(*launched)
+            elif launched:
+                await asyncio.sleep(0)  # Let the new reads claim their tickets.
+
+    async def step(self, wait=True):
+        """One round of the queue; `wait` as in chat_step."""
+        if await self.chat_step(wait):
             return True
         if not self.enabled:
             return False
@@ -568,20 +700,24 @@ class TicketAutomation:
         ready = self.store.auto_candidates('ready')
         if ready and self._prepare(ready):
             return True
-        plan_ready = self.plan.status()['status'] == 'ready' and self.plan_read_after <= time.time()
-        incoming = self.store.auto_candidates('review', stage='retry_read', due_only=True) if plan_ready else None
-        incoming = incoming or self.store.auto_candidates('new')
-        if not incoming and plan_ready:
-            incoming = self.store.auto_candidates('review', stage='offline')
-        if incoming:
+        incoming = None
+        if self._read_slots() > 0:
+            plan_ready = self.plan.status()['status'] == 'ready' and self.plan_read_after <= time.time()
+            incoming = self.store.auto_candidates('review', stage='retry_read', due_only=True) if plan_ready else None
+            incoming = incoming or self.store.auto_candidates('new')
+            if not incoming and plan_ready:
+                incoming = self.store.auto_candidates('review', stage='offline')
+        if incoming and incoming['id'] not in self.reads:
             key = incoming['id']
             if not self._plan_ready(key):
-                await self.analyze(key, automatic=True, offline=True)
-                return True
-            self._set('reading', key, 'Leyendo el ticket con tu plan de ChatGPT.')
-            row = await self.analyze(key, automatic=True)
-            if self.enabled and row['status'] in ('review', 'blocked', 'duplicate'):
-                self._set('review', key, row['message'])
+                read = self._launch_read(key, offline=True)
+            else:
+                self._set('reading', key, 'Leyendo el ticket con tu plan de ChatGPT.')
+                read = self._launch_read(key, explain=True)
+            if wait:
+                await read
+            else:
+                await asyncio.sleep(0)  # The read claims its ticket before the next candidate query.
             return True
         if ready:
             return False
@@ -605,6 +741,10 @@ class TicketAutomation:
                 self._set('review', pending['id'], pending['message'])
             elif offline:
                 self._plan_ready(offline['id'])
+            elif self.reads:
+                count = len(self.reads)
+                self._set('reading', next(iter(self.reads)),
+                          'Leyendo un ticket.' if count == 1 else f'Leyendo {count} tickets.')
             else:
                 self._reset()
         return False
@@ -613,7 +753,7 @@ class TicketAutomation:
         while not self.stopping:
             self.wake.clear()
             try:
-                if await self.step():
+                if await self.step(wait=False):
                     await asyncio.sleep(0)
                     continue
             except Exception:

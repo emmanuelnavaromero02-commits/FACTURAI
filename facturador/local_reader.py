@@ -3,6 +3,8 @@
 import io
 import subprocess
 import threading
+import time
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 
@@ -12,7 +14,7 @@ from pypdf import PdfReader
 from apps.api.src.vision.receipt_scan import read_codes, remove_black_letterbox
 
 _pdf_renderer = threading.Lock()
-_ocr_workers = threading.BoundedSemaphore(2)
+_ocr_workers = threading.BoundedSemaphore(3)
 
 
 def prepare_image(image: Image.Image) -> Image.Image:
@@ -78,13 +80,55 @@ def ocr_text(image: Image.Image) -> str:
     return result.stdout.decode('utf-8', errors='replace').strip()[:24_000]
 
 
-def read_local_page(path: Path, number: int = 1, rotation: int = 0, force_ocr: bool = False) -> dict:
+# Originals are stored under their sha256, so (file, size, mtime) identifies a
+# page reading. Each ticket read reuses it instead of running Tesseract again.
+PAGE_CACHE_SIZE = 32
+FAILED_READ_SECONDS = 60  # A failed OCR is retried after this, not on every caller.
+_page_cache: OrderedDict = OrderedDict()
+_page_cache_lock = threading.Lock()
+
+
+def _page_key(path: Path, number: int, rotation: int, force_ocr: bool) -> tuple:
+    resolved = path.resolve()
+    stat = resolved.stat()
+    return str(resolved), stat.st_size, stat.st_mtime_ns, number, rotation, bool(force_ocr)
+
+
+def _cached(key):
+    with _page_cache_lock:
+        entry = _page_cache.get(key)
+        if entry is None:
+            return None
+        expires, value = entry
+        if expires and expires <= time.monotonic():
+            del _page_cache[key]
+            return None
+        _page_cache.move_to_end(key)
+        return value
+
+
+def _remember(key, value) -> None:
+    expires = time.monotonic() + FAILED_READ_SECONDS if isinstance(value, Exception) else 0
+    with _page_cache_lock:
+        _page_cache[key] = (expires, value)
+        _page_cache.move_to_end(key)
+        while len(_page_cache) > PAGE_CACHE_SIZE:
+            _page_cache.popitem(last=False)
+
+
+def clear_page_cache() -> None:
+    with _page_cache_lock:
+        _page_cache.clear()
+
+
+def _copy(page: dict) -> dict:
+    return {**page, 'codes': list(page.get('codes', []))}
+
+
+def _scan(path: Path, number: int, rotation: int, force_ocr: bool):
+    """Read one page. Returns (page or the ValueError that explains it, upright image or None)."""
     pages = 1
     text = ''
-    if path.suffix.lower() == '.txt':
-        if number != 1:
-            raise ValueError('El texto del correo tiene una sola página.')
-        return {'page': 1, 'pages': 1, 'method': 'email', 'text': path.read_text(encoding='utf-8')[:40_000], 'codes': []}
     if path.suffix.lower() == '.pdf':
         reader = PdfReader(path)
         pages = len(reader.pages)
@@ -95,14 +139,15 @@ def read_local_page(path: Path, number: int = 1, rotation: int = 0, force_ocr: b
             image = render_pdf_page(path, number - 1)
         except (ValueError, RuntimeError, OSError):
             if not text:
-                raise ValueError('El PDF requiere una imagen de la página. Sube una foto o captura.')
+                return ValueError('El PDF requiere una imagen de la página. Sube una foto o captura.'), None
             return {'page': number, 'pages': pages, 'method': 'pdf', 'text': text, 'codes': [],
-                    'notice': 'Se conservó el texto digital. La imagen y sus códigos requieren otra copia.'}
+                    'notice': 'Se conservó el texto digital. La imagen y sus códigos requieren otra copia.'}, None
     else:
         if number != 1:
             raise ValueError('La imagen tiene una sola página.')
         with Image.open(path) as original:
             image = prepare_image(original)
+    upright = image
     if rotation:
         image = image.rotate(-rotation, expand=True)
     method = 'pdf'
@@ -114,7 +159,57 @@ def read_local_page(path: Path, number: int = 1, rotation: int = 0, force_ocr: b
             method = 'ocr'
         except ValueError as exc:
             if not codes and not text:
-                raise
+                return exc, upright
             method = 'pdf' if text else 'codes'
             notice = str(exc)
-    return {'page': number, 'pages': pages, 'method': method, 'text': text, 'codes': codes, 'notice': notice}
+    return {'page': number, 'pages': pages, 'method': method, 'text': text, 'codes': codes,
+            'notice': notice}, upright
+
+
+def _page_image(path: Path, number: int):
+    """The prepared page image alone, for a page whose reading is already known."""
+    if path.suffix.lower() != '.pdf':
+        with Image.open(path) as original:
+            return prepare_image(original)
+    try:
+        return render_pdf_page(path, number - 1)
+    except (ValueError, RuntimeError, OSError):
+        return None
+
+
+def _read(path: Path, number: int, rotation: int, force_ocr: bool, with_image: bool):
+    key = _page_key(path, number, rotation, force_ocr)
+    found = _cached(key)
+    if found is None:
+        found, image = _scan(path, number, rotation, force_ocr)
+        _remember(key, found)
+    else:
+        image = _page_image(path, number) if with_image else None
+    return found, image
+
+
+def read_local_page(path: Path, number: int = 1, rotation: int = 0, force_ocr: bool = False) -> dict:
+    path = Path(path)
+    if path.suffix.lower() == '.txt':
+        if number != 1:
+            raise ValueError('El texto del correo tiene una sola página.')
+        return {'page': 1, 'pages': 1, 'method': 'email', 'text': path.read_text(encoding='utf-8')[:40_000], 'codes': []}
+    found, _ = _read(path, number, rotation, force_ocr, False)
+    if isinstance(found, Exception):
+        raise ValueError(str(found))
+    return _copy(found)
+
+
+def page_with_image(path: Path, number: int = 1):
+    """Upright page image plus its cached local reading, for the model's input.
+
+    Returns (page, image): page is None when neither text nor codes could be read,
+    and image is None when only a PDF's digital text is available. Raises
+    ValueError when the page has neither an image nor text."""
+    path = Path(path)
+    found, image = _read(path, number, 0, False, True)
+    if isinstance(found, Exception):
+        if image is None:
+            raise ValueError(str(found))
+        return None, image
+    return _copy(found), image
