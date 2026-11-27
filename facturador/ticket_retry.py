@@ -7,6 +7,7 @@ from playwright.async_api import Error as BrowserError, TimeoutError as BrowserT
 
 from .catalog import allowed_url
 from .cfdi import UUID_RE
+from .complementos import complement_class
 from .gmail import GmailConnection, recover_attachments
 from .models import Receipt
 from .read_http import retry_seconds
@@ -123,13 +124,9 @@ async def recover_ticket(runner, key, profile):
                     notes.append('El portal muestra que el ticket fue facturado.')
         except BrowserError:
             notes.append('La pestaña anterior dejó de responder.')
-    if receipt.provider == 'capufe':
-        from .capufe_recovery import recover_capufe
-        report = await recover_capufe(store, key, receipt, profile)
-        if report:
-            notes.append(report)
-        if await runner.recover(key, profile, notes=notes):
-            return
+    # A merchant with its own read-only lookup of issued invoices tries it before the mailbox.
+    if await complement_class(receipt.provider).recover_documents(runner, key, profile, receipt, notes):
+        return
     query = mail_query(store.get(key), receipt)
     if GmailConnection(store.root).status() == 'connected' and query:
         try:

@@ -331,7 +331,7 @@ class ConcurrentReadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_close_cancels_reads_and_releases_their_claims(self):
         key, _ = self.chat_ticket('red')
-        entered, release = threading.Event(), threading.Event()
+        entered, release, left = threading.Event(), threading.Event(), threading.Event()
         self.addCleanup(release.set)
 
         def stuck(*_args, **_options):
@@ -339,17 +339,27 @@ class ConcurrentReadTests(unittest.IsolatedAsyncioTestCase):
             release.wait(10)
             return extraction()
 
-        with patch('facturador.automation.AI.extract', side_effect=stuck):
+        def tracked(*args, **options):
+            # The reader thread outlives the cancelled read: the test waits for it to leave
+            # before the folder is removed, so its open original never blocks the clean-up.
+            try:
+                return read_ticket(*args, **options)
+            finally:
+                left.set()
+
+        with patch('facturador.automation.AI.extract', side_effect=stuck), \
+                patch('facturador.automation.read_ticket', side_effect=tracked):
             self.worker.start()
             await asyncio.to_thread(entered.wait, 5)
             self.assertIn(key, self.worker.status()['jobs'])
             await asyncio.wait_for(self.worker.close(), 3)
-        row = self.store.get(key)
-        self.assertEqual((row['status'], row['auto_stage']), ('review', 'retry_read'))
-        self.assertIn('Se interrumpió la lectura', row['message'])
-        self.assertEqual(self.worker.reads, {})
-        self.assertEqual(self.worker.status()['jobs'], {})
-        release.set()
+            row = self.store.get(key)
+            self.assertEqual((row['status'], row['auto_stage']), ('review', 'retry_read'))
+            self.assertIn('Se interrumpió la lectura', row['message'])
+            self.assertEqual(self.worker.reads, {})
+            self.assertEqual(self.worker.status()['jobs'], {})
+            release.set()
+            self.assertTrue(await asyncio.to_thread(left.wait, 15))
         self.assertFalse([e for e in self.store.events(key) if e['kind'] == 'read_timing'])
 
 

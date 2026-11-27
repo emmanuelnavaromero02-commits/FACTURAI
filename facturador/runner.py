@@ -15,7 +15,6 @@ import weakref
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-import unicodedata
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 from playwright.async_api import Error as BrowserError
@@ -23,33 +22,22 @@ from playwright.async_api import Error as BrowserError
 from .ai import AI, read_receipt
 from .account_flow import PortalAccountFlow, SECRET_SCREEN
 from .auth import ChatGPTPlan, PlanError
-from .brand_entry import enter_bp_franchise, BP_HOME
-from .bp_recipient import prepare_bp_rfc
-from .bp_reprint import recover_bp_reprint
-from .bp_ticket import BPAlreadyBilled, BPProgress, at_form as bp_at_form, bp_issue_proof, evidence_from_original, prepare_bp_ticket
 from .catalog import (CATALOG, CUSTOM_PORTAL, allowed_url, billing_destination, provider_for_url,
                       public_portal_origin, resolves_publicly)
 from .captcha_transport import WidgetTransport, widget_origin
 from .cfdi import UUID_RE
+from .complementos import FINISH, OBSERVE, View, complement_class, moved
 from .db import Store
 from .documents import job_candidates, reconcile
 from .fiscal_choices import NAMES as FISCAL_FIELDS, fiscal_choices, matches as sat_option
-from .models import SAT_PAYMENT_LABELS, Action, Plan, Profile, Receipt, Target
+from .models import Action, Plan, Profile, Receipt, Target
 from .personal_browser import PersonalBrowser
 from .portal_memory import Attempt, Known, PortalMemory, describe, fold, locate, screen_signature
 from .profile_lock import close_context, launch_chrome
-from .portals import capufe_proof, capufe_recipient, normalize
-from .ticket_lookup import prefill_ticket_lookup, prepare_tesoro_lookup
+from .ticket_lookup import prefill_ticket_lookup
 from .ticket_retry import FINAL, REOBSERVE, RecoveryRequested, may_have_issued, open_ticket_portal, recover_ticket, retry_action, ticket_in_result
-from .tesoro_consulta import existing_invoice_folio, recover_tesoro_consulta
-from .tesoro_recipient import tesoro_recipient
-from .tesoro_result import tesoro_verification_failure
 from .uso_ia import en_ticket
 from .viewer import BrowserView
-from .vianney_consulta import lookup_rejected, rejection_for_current_ticket, recover_vianney_consulta
-from .walmart_issue import (walmart_lookup_continue, walmart_lookup_proof,
-                           walmart_lookup_rejection, walmart_payment_issue,
-                           walmart_payment_options, walmart_select_payment)
 
 ISSUE = re.compile(r'\b(facturar|emitir|timbrar|generar\s+(?:mi\s+)?(?:factura|cfdi)|solicitar\s+factura|enviar\s+(?:mi\s+)?(?:factura|cfdi)|s[ií] estoy seguro|confirmar (?:la )?emisi[oó]n)\b', re.I)
 EMISSION_PATH = re.compile(r'factur|invoice|invoic|cfdi|timbr|emisi|emit|creat|complet|generat|submit', re.I)
@@ -59,7 +47,6 @@ CHALLENGE = re.compile(r'captcha|verificaci[oó]n de seguridad|no soy un robot',
 CHALLENGE_TEXT = re.compile(r'no soy un robot|verifica que eres humano|verify (?:that )?you are human|introdu(?:ce|zca) el captcha|c[oó]digo (?:de )?captcha', re.I)
 ACCESS_DENIED = re.compile(r'access denied|error 16\b|blocked by our security service|acceso denegado|err_cert_', re.I)
 LOAD_FAILURE = re.compile(r'net::ERR_|(?:error|HTTP)\s*[45]\d\d\b|service unavailable|no se (?:puede acceder|pudo cargar)|bad gateway', re.I)
-FISCAL_INPUT = re.compile(r'\b(?:textbox|combobox|spinbutton|radio)\s+"[^"\n]*\b(?:rfc|régimen|regimen|postal|cfdi|forma de pago|folio|ticket|peaje|razón social|razon social)\b', re.I)
 # Failures the agent can retry from a fresh page because nothing was submitted.
 RETRYABLE = re.compile(r'se cerr[oó]|cambi[oó] (?:a un|de) dominio|'
                        r'requiere revisar el resultado del portal|no hay comprobante ni confirmaci[oó]n visible|'
@@ -116,8 +103,6 @@ PAGE_TEXT = r"""(start) => {
 ASK_TIMEOUT = 120
 # Each look-up tool may be used this many times per attempt; the page text comes in every step.
 TOOL_LIMITS = {'view_ticket': 2, 'search_web': 2, 'read_text': 4}
-WALMART_FINAL = re.compile(r'CONTINUAR|ACEPTAR|FACTURAR|GENERAR(?: FACTURA)?|EMITIR(?: FACTURA)?|TIMBRAR|'
-                           r'CONFIRMAR|FINALIZAR|SIGUIENTE')
 CONFIRM_STEP = re.compile(r'CONTINUAR|ACEPTAR|CONFIRMAR|SI|SÍ|FACTURAR|GENERAR(?: FACTURA)?|EMITIR(?: FACTURA)?|'
                           r'TIMBRAR|FINALIZAR')
 MAX_QUESTIONS = 3
@@ -129,8 +114,15 @@ ALREADY_BILLED = re.compile(
     r'^(?:(?:el|este|su) )?(?:ticket|boleto|c[oó]digo|comprobante)(?: ingresado| [A-Z0-9]{18})? '
     r'ya (?:(?:fue|ha sido|est[áa]|se encuentra) )?facturad[oa]\b', re.I)
 RECOVERY_LINK = re.compile(r'\b(?:recuperar|consultar|reencontrar)\b.*\b(?:factura|cfdi|comprobante)\b', re.I)
-TESORO_HOME = re.compile(r'opciones de facturaci[oó]n', re.I)
-TESORO_SINGLE = re.compile(r'generar factura de estaci[oó]n y znak', re.I)
+
+
+def __getattr__(name: str):
+    # Helpers that moved to a merchant's complement are still found here by whoever imports or patches them.
+    return moved(name)
+
+
+def normalize(text: str) -> str:
+    return ' '.join(text.upper().split())
 
 
 def already_billed(snapshot: str) -> bool:
@@ -272,63 +264,6 @@ def action_risk(action: Action) -> str:
 
 def press_without_target(action: Action) -> bool:
     return action.kind == 'press' and (action.target is None or not action.target.name.strip())
-
-
-async def dismiss_walmart_cfdi_notice(page, snapshot: str) -> bool:
-    """Close Walmart's informational CFDI 4.0 notice, never a form confirmation."""
-    parts = urlsplit(page.url)
-    if parts.scheme != 'https' or parts.netloc.lower() != 'facturacion-clientes.walmart.com':
-        return False
-    if not (re.search(r'CFDI\s+VERSION\s+4\.0', snapshot, re.I)
-            and re.search(r'datos fiscales obligatorios[\s\S]{0,130}validados por el SAT', snapshot, re.I)):
-        return False
-    heading = page.get_by_text('CFDI VERSION 4.0', exact=True)
-    try:
-        if await heading.count() != 1 or not await heading.is_visible():
-            return False
-        notice = heading.locator(
-            'xpath=ancestor::*[@role="dialog" or contains(concat(" ", normalize-space(@class), " "), " modal ")][1]')
-        if await notice.count() != 1 or not await notice.is_visible():
-            return False
-        button = notice.get_by_role('button', name='Aceptar', exact=True)
-        if (await notice.locator('input:visible, textarea:visible, select:visible').count()
-                or await button.count() != 1 or not await button.is_visible()
-                or not await button.is_enabled()):
-            return False
-        await button.click(timeout=1500)
-    except BrowserError:
-        return False
-    return True
-
-
-async def dismiss_walmart_address_notice(page, snapshot: str) -> bool:
-    """Acknowledge Walmart's data-entry notice, scoped away from the fiscal form."""
-    parts = urlsplit(page.url)
-    if (parts.scheme != 'https' or parts.netloc.lower() != 'facturacion-clientes.walmart.com'
-            or parts.path.rstrip('/') != '/address'):
-        return False
-    message = re.compile(
-        r'Para proteger sus datos personales[\s\S]{0,230}capturar nuevamente su informaci[oó]n fiscal'
-        r'[\s\S]{0,90}cada solicitud de facturaci[oó]n', re.I)
-    if not message.search(snapshot):
-        return False
-    try:
-        notices = page.locator('[role="dialog"]:visible, .modal:visible')
-        if await notices.count() != 1:
-            return False
-        notice = notices.first
-        notice_text = await notice.inner_text()
-        if (not await notice.is_visible() or not message.search(notice_text)
-                or not re.search(r'\bImportante\s*:', notice_text, re.I)
-                or await notice.locator('input:visible, textarea:visible, select:visible').count()):
-            return False
-        button = notice.get_by_role('button', name='Aceptar', exact=True)
-        if await button.count() != 1 or not await button.is_visible() or not await button.is_enabled():
-            return False
-        await button.click(timeout=1500)
-    except BrowserError:
-        return False
-    return True
 
 
 def private_destination(url: str) -> bool:
@@ -844,7 +779,8 @@ class Runner:
                 or self.plan.status()['status'] != 'ready'):
             return False
         receipt = Receipt.model_validate(row['receipt'])
-        if receipt.provider != 'capufe' or receipt.ready_errors() or not self.store.queue_after_negative_check(key, receipt, profile):
+        if (not complement_class(receipt.provider).prepares_after_negative_check or receipt.ready_errors()
+                or not self.store.queue_after_negative_check(key, receipt, profile)):
             return False
         self.track_job(key, self.run(key, profile, auto_issue=False))
         return True
@@ -1147,55 +1083,6 @@ class Runner:
                 or not allowed_url(href, receipt.provider, receipt.portal_url)):
             return None
         return href
-
-    @staticmethod
-    def portal_entry_home(page, snapshot: str, receipt: Receipt) -> bool:
-        """The Tesoro menu is a navigation page, not the fiscal submission form."""
-        current = urlsplit(page.url)
-        return (receipt.provider == 'tesoro' and current.path in {'', '/'} and
-                not current.query and not current.fragment and
-                bool(TESORO_HOME.search(snapshot)) and bool(TESORO_SINGLE.search(snapshot)) and
-                not FISCAL_INPUT.search(snapshot) and not SUCCESS.search(snapshot) and
-                not already_billed(snapshot))
-
-    async def safe_portal_entry_href(self, page, action: Action, receipt: Receipt, snapshot: str) -> str | None:
-        """Open only the documented single-ticket Tesoro form by a plain same-origin GET."""
-        target = action.target
-        # The live site's Font Awesome icons are part of Playwright's accessible
-        # link name (for example, "Continuar... \uf0a9"). Keep the exact locator
-        # below, but ignore those private-use glyphs when classifying its label.
-        label = ' '.join(''.join(char for char in (target.name if target else '')
-                                 if unicodedata.category(char) != 'Co').split()).casefold()
-        if (not self.portal_entry_home(page, snapshot, receipt) or action.kind != 'click' or
-                not target or target.by != 'role' or target.role != 'link' or not target.exact or
-                label not in {'continuar...', 'generar factura de estación y znak'}):
-            return None
-        try:
-            links = page.get_by_role('link', name=target.name, exact=True)
-            count = await links.count()
-            if not 1 <= count <= 16:
-                return None
-            matches = []
-            for index in range(count):
-                link = links.nth(index)
-                if not await link.is_visible():
-                    continue
-                attributes = await link.evaluate("""a => ({tag: a.tagName, href: a.getAttribute('href'),
-                    download: a.hasAttribute('download'), target: a.hasAttribute('target'),
-                    onclick: a.hasAttribute('onclick'), form: Boolean(a.closest('form'))})""")
-                if (attributes['tag'] != 'A' or not attributes['href'] or attributes['download'] or
-                        attributes['target'] or attributes['onclick'] or attributes['form']):
-                    continue
-                href = urljoin(page.url, attributes['href'])
-                parts = urlsplit(href)
-                if (parts.path != '/GenerarCFDI/Index' or parts.query != 'avanzada=0' or parts.fragment or
-                        public_portal_origin(href) != public_portal_origin(page.url) or
-                        not allowed_url(href, receipt.provider, receipt.portal_url)):
-                    continue
-                matches.append(href)
-            return matches[0] if len(matches) == 1 else None
-        except BrowserError:
-            return None
 
     async def visible_text(self, page, receipt: Receipt) -> str:
         """Rendered text of the portal page and its same-portal frames."""
@@ -1772,9 +1659,11 @@ class Runner:
         errors = receipt.ready_errors()
         if errors or (receipt.provider not in CATALOG and receipt.provider != CUSTOM_PORTAL):
             raise ValueError(' · '.join(errors) or 'Portal sin configurar.')
-        bp_evidence = (await asyncio.to_thread(evidence_from_original, receipt, Path(job['source_path']))
-                       if receipt.provider == 'bp' and job.get('source_path') else None)
-        bp_progress = BPProgress()
+        # What only this merchant's portal needs, with its own state for this attempt. A portal
+        # without a complement gets the plain one: every call to it below lets the engine go on.
+        # FACTURADOR_COMPLEMENTOS=0 gives the plain one to every merchant.
+        complement = complement_class(receipt.provider)(self, key, profile, receipt, auto_issue)
+        await complement.start(job)
         ai = AI(self.plan)
         if receipt.provider == CUSTOM_PORTAL:
             if not await resolves_publicly(receipt.portal_url):
@@ -1836,15 +1725,26 @@ class Runner:
         last_emission_view = None
         answer_note = ''
         before_action = None
-        tesoro_lookup_attempted = False
-        bp_entry_attempted = False
-        bp_lookup_attempted = False
-        walmart_lookup = None
+        view = View(recent)        # what the complement is shown on each call
+
+        def take(signal) -> str:
+            """Keep what a complement left for the engine; returns how this pass goes on."""
+            nonlocal last_error, before_action, answer_note, idle_steps
+            if signal.error is not None:
+                last_error = signal.error
+            if signal.before is not None:
+                before_action = signal.before
+            if signal.note is not None:
+                answer_note = signal.note
+            if signal.active:
+                idle_steps = 0
+            return signal.then
+
         unbound_press_count = 0
         accounts = PortalAccountFlow(self.store.root, provider['url'], profile, key,
                                      progress=lambda message: self.store.running_message(key, message))
         for number in range(MAX_STEPS):
-            bp_auto_ready = False
+            own = None             # the complement's own next action for this pass, when it has one
             page = self.viewer.page
             status = self.store.get(key)['status']
             if status in {'verified', 'duplicate', 'historical'}:
@@ -1854,38 +1754,12 @@ class Runner:
             if page.is_closed() or not allowed_url(page.url, receipt.provider, receipt.portal_url, self._extra()):
                 raise ValueError('El portal se cerró o cambió a un dominio distinto del autorizado.')
             snapshot = await page.locator('body').aria_snapshot()
-            if (receipt.provider == 'walmart' and not committed and not issued
-                    and await dismiss_walmart_cfdi_notice(page, snapshot)):
-                self.store.event(key, 'notice_dismissed', 'Se cerró el aviso informativo CFDI 4.0 de Walmart.')
+            view.read(page, snapshot, not committed and not issued)
+            then = take(await complement.after_reading(view))
+            if then == FINISH:
+                return
+            if then == OBSERVE:
                 continue
-            if (receipt.provider == 'walmart' and not committed and not issued
-                    and await dismiss_walmart_address_notice(page, snapshot)):
-                self.store.event(key, 'notice_dismissed', 'Se cerró el aviso informativo de captura fiscal de Walmart.')
-                continue
-            if (receipt.provider == 'walmart' and walmart_lookup is not None
-                    and urlsplit(page.url).path.rstrip('/') in {'', '/ticket'}):
-                walmart_lookup = None
-            if receipt.provider == 'tesoro' and tesoro_lookup_attempted and not committed and not issued:
-                rejected = await tesoro_verification_failure(page, receipt, profile)
-                if rejected:
-                    self.store.event(key, 'ticket_lookup_rejected', rejected)
-                    if existing_invoice_folio(rejected):
-                        if await recover_tesoro_consulta(self, page, key, profile, receipt, rejected):
-                            return
-                        raise ValueError(rejected + ' La consulta de Tesoro no devolvió un PDF y XML cotejables.')
-                    raise ValueError(rejected)
-            if receipt.provider == 'vianney' and not committed and not issued and lookup_rejected(snapshot):
-                submitted_here = any(item.get('tipo') == 'click' and item.get('control', '').casefold() == 'siguiente'
-                                     for item in recent)
-                prior_submission = any(event['kind'] == 'action' and event['detail'].casefold() == 'click · siguiente'
-                                       for event in self.store.events(key)) if not submitted_here else False
-                rejected = await rejection_for_current_ticket(
-                    page, snapshot, receipt, submitted_here=submitted_here, prior_submission=prior_submission)
-                if rejected:
-                    self.store.event(key, 'ticket_lookup_rejected', rejected)
-                    if await recover_vianney_consulta(self, page, key, profile, receipt):
-                        return
-                    raise ValueError(rejected + ' La consulta de comprobantes no devolvió un PDF y XML cotejables.')
             if before_action is not None and recent:
                 recent[-1]['cambio_visible'] = before_action != (page.url, snapshot)
                 before_action = None
@@ -1934,70 +1808,23 @@ class Runner:
                 continue
             pending_fields = []
             if not committed and not issued:
-                if (receipt.provider == 'bp' and not bp_entry_attempted and
-                        urlsplit(page.url).path.rstrip('/') == BP_HOME):
-                    bp_entry_attempted = True
-                    prior_url = page.url
-                    try:
-                        bp_entered = await enter_bp_franchise(page, receipt, snapshot)
-                    except BrowserError as exc:
-                        raise ValueError('La portada BP no confirmó la selección de la franquicia. Reintenta el ticket.') from exc
-                    if bp_entered:
-                        before_action = prior_url, snapshot
-                        recent.append({'tipo': 'click', 'control': 'Franquicia BP'})
-                        self.store.event(key, 'brand_entry', 'Se abrió el formulario de la franquicia BP verificada.')
-                        continue
-                if receipt.provider == 'bp':
-                    try:
-                        bp_field = await prepare_bp_rfc(
-                            page, receipt, profile, lookup_attempted=bp_lookup_attempted)
-                    except BrowserError as exc:
-                        # Buscar may have reached the portal even if Chrome lost
-                        # its response. Never submit the same lookup twice.
-                        bp_lookup_attempted = True
-                        raise ValueError('BP no confirmó la consulta del RFC. Revisa el portal antes de reintentar.') from exc
-                    if bp_field:
-                        if bp_field == 'Buscar RFC':
-                            bp_lookup_attempted = True
-                        self.store.event(key, 'campo_verificado', 'Consulta fiscal cotejada: ' + bp_field)
-                        continue
-                    if bp_at_form(page, receipt):
-                        try:
-                            bp_field = await prepare_bp_ticket(page, receipt, profile, bp_evidence, bp_progress)
-                        except BPAlreadyBilled as exc:
-                            self.store.event(key, 'ticket_already_billed', 'BP confirmó que la venta ya tiene factura; se buscaron los comprobantes existentes.')
-                            if await recover_bp_reprint(self, page, key, profile, receipt, bp_evidence):
-                                return
-                            raise ValueError(str(exc)) from exc
-                        if bp_field:
-                            self.store.event(key, 'campo_verificado', 'Ticket BP cotejado: ' + bp_field)
-                            continue
-                        bp_auto_ready = bool(auto_issue and await bp_issue_proof(page, receipt, profile, bp_evidence))
-                tesoro_pending = []
-                if receipt.provider == 'tesoro':
-                    try:
-                        tesoro_changed, tesoro_pending = await tesoro_recipient(page, profile, apply=True)
-                    except BrowserError:
-                        tesoro_changed, tesoro_pending = None, ['ficha fiscal del receptor']
-                    if tesoro_changed:
-                        self.store.event(key, 'campo_verificado', 'Campo fiscal cotejado: ' + tesoro_changed)
-                        continue
-                if (receipt.provider == 'capufe' and
-                        urlsplit(page.url).path.rstrip('/').lower() == '/capufe/facturacionrapida'):
-                    try:
-                        field = await capufe_recipient(page, profile)
-                    except BrowserError:
-                        field = None
-                    if field:
-                        self.store.event(key, 'campo_verificado', 'Campo cotejado: ' + field)
-                        continue
+                # The merchant's own form comes first, then the engine's rules for any portal.
+                signal = await complement.before_fiscal_choices(view)
+                then = take(signal)
+                if then == FINISH:
+                    return
+                if then == OBSERVE:
+                    continue
+                own = signal.action
                 changed, pending_fields = await fiscal_choices(page, profile, receipt, apply=True, extra=self._extra())
-                pending_fields = tesoro_pending + pending_fields
+                pending_fields = [*signal.pending, *pending_fields]
                 if changed:
                     self.store.event(key, 'campo_verificado', 'Selección cotejada: ' + FISCAL_FIELDS[changed])
                     continue
-                if receipt.provider == 'walmart' and await walmart_select_payment(page, receipt):
-                    self.store.event(key, 'campo_verificado', 'Forma de pago del ticket elegida en Walmart.')
+                then = take(await complement.after_fiscal_choices(view))
+                if then == FINISH:
+                    return
+                if then == OBSERVE:
                     continue
                 try:
                     lookup_field = await prefill_ticket_lookup(page, receipt.ticket_number)
@@ -2006,68 +1833,11 @@ class Runner:
                 if lookup_field:
                     self.store.event(key, 'campo_verificado', 'Dato del ticket cotejado: ' + lookup_field)
                     continue
-                try:
-                    tesoro_field = await prepare_tesoro_lookup(
-                        page, receipt, verify_attempted=tesoro_lookup_attempted)
-                except BrowserError:
-                    # A validation POST may have reached the portal before Chrome
-                    # reported a navigation error. Never repeat it automatically.
-                    tesoro_lookup_attempted = True
+                then = take(await complement.after_ticket_lookup(view))
+                if then == FINISH:
+                    return
+                if then == OBSERVE:
                     continue
-                if tesoro_field:
-                    if tesoro_field.startswith('Verificación'):
-                        tesoro_lookup_attempted = True
-                        rejected = await tesoro_verification_failure(page, receipt, profile)
-                        if rejected:
-                            self.store.event(key, 'ticket_lookup_rejected', rejected)
-                            if existing_invoice_folio(rejected):
-                                if await recover_tesoro_consulta(self, page, key, profile, receipt, rejected):
-                                    return
-                                raise ValueError(rejected + ' La consulta de Tesoro no devolvió un PDF y XML cotejables.')
-                            raise ValueError(rejected)
-                    self.store.event(key, 'campo_verificado', 'Dato del ticket cotejado: ' + tesoro_field)
-                    continue
-                if receipt.provider == 'walmart' and walmart_lookup is None:
-                    lookup_step = await walmart_lookup_continue(page, profile, receipt)
-                    if lookup_step is not None:
-                        proof, control = lookup_step
-                        bound = await control.element_handle()
-                        if bound is None:
-                            raise ValueError('El botón Continuar de Walmart cambió antes de consultar el ticket.')
-                        try:
-                            await bound.click(trial=True, timeout=1500)
-                        except BrowserError as exc:
-                            raise ValueError('El botón Continuar de Walmart no está disponible para consultar el ticket.') from exc
-                        checked = await walmart_lookup_continue(page, profile, receipt)
-                        if (checked is None or checked[0] != proof or
-                                await page.locator('body').aria_snapshot() != snapshot):
-                            continue
-                        before_action = page.url, snapshot
-                        try:
-                            await bound.click(timeout=5000)
-                        except BrowserError as exc:
-                            # Chrome may lose the response after the portal receives the lookup.
-                            # Never repeat a possibly submitted lookup in the same attempt.
-                            rejected = await walmart_lookup_rejection(page, snapshot)
-                            if rejected:
-                                self.store.event(key, 'ticket_lookup_rejected', rejected)
-                                raise ValueError('Walmart respondió: ' + rejected) from exc
-                            raise ValueError('Walmart no confirmó el clic de consulta. Revisa el resultado antes de reintentar.') from exc
-                        recent.append({'tipo': 'click', 'control': 'Continuar'})
-                        self.store.event(key, 'action', 'click · Continuar')
-                        try:
-                            await page.wait_for_url(re.compile(
-                                r'^https://facturacion-clientes\.walmart\.com/address(?:[/?#].*)?$'), timeout=8000)
-                        except BrowserError as exc:
-                            rejected = await walmart_lookup_rejection(page, snapshot)
-                            if rejected:
-                                self.store.event(key, 'ticket_lookup_rejected', rejected)
-                                raise ValueError('Walmart respondió: ' + rejected) from exc
-                            raise ValueError('Walmart no confirmó la consulta del ticket. Revisa el mensaje del portal antes de reintentar.') from exc
-                        walmart_lookup = proof
-                        self.store.event(key, 'ticket_lookup_verified',
-                                         'TC, TR, RFC y código postal coincidieron al continuar.')
-                        continue
             try:
                 state = await self.page_state(page, receipt)
             except BrowserError:
@@ -2104,7 +1874,7 @@ class Runner:
             context = (page.url, self.pauses.get(key, 0), self.told.get(key, 0), committed, issued)
             if course.steps:
                 head = course.steps[0]
-                reason = 'el ejecutor emite por sus propias reglas' if bp_auto_ready else course.broken(
+                reason = 'el ejecutor emite por sus propias reglas' if own is not None else course.broken(
                     last_error, context, items)
                 if reason:
                     if head.source == 'memoria' and last_error and learner.replay_failed(head.screen):
@@ -2116,7 +1886,7 @@ class Runner:
                     # valid here are kept; whatever else it had belonged to the screen before.
                     learner.replay_done(head.screen)
                     course.carry(items, screen)
-            if (not course.steps and not bp_auto_ready and not accounts.credential_values and remembering
+            if (not course.steps and own is None and not accounts.credential_values and remembering
                     and not (last_error or tool_result or ticket_view or answer_note or self.live_notes.get(key))):
                 # Nothing planned: a screen already solved is repeated from memory before asking the model.
                 # Not after an error, nor once the person wrote or answered something: the model must read it.
@@ -2174,13 +1944,12 @@ class Runner:
                                       'estado_visible': model_snapshot[:26_000]}, ensure_ascii=False)
             entry = None
             try:
-                if bp_auto_ready:
+                if own is not None:
                     latest = await page.locator('body').aria_snapshot()
                     if (latest != snapshot or await visible_challenge(page, latest) or self.viewer.page is not page or
                             not allowed_url(page.url, receipt.provider, receipt.portal_url, self._extra())):
                         continue
-                    action = Action(kind='click', target=Target(by='role', role='link', name='Facturar', exact=True),
-                                    value=None, reason='Emitir el único ticket BP cotejado con el perfil.', risk='issue')
+                    action = own
                 elif not course.steps:
                     if meter.ai_calls >= MAX_AI_CALLS:
                         raise self.out_of_budget(key, 'consultas', committed or issued)
@@ -2255,7 +2024,7 @@ class Runner:
                 if decision == 'manual':
                     return await self.manual_job(key, page, profile)
                 continue
-            if not bp_auto_ready:
+            if own is None:
                 # One action per pass. Whatever its origin, it goes through everything below.
                 entry = course.steps.popleft()
                 action = entry.action
@@ -2347,21 +2116,11 @@ class Runner:
             tool_streak = 0
             risk = action_risk(action)
             name = action.target.name if action.target else ''
-            walmart_path = urlsplit(page.url).path.rstrip('/') if receipt.provider == 'walmart' else ''
-            walmart_payment = False
-            if (receipt.provider == 'walmart' and not committed and not issued and action.kind == 'click'
-                    and walmart_path not in {'', '/ticket', '/address'}
-                    and WALMART_FINAL.fullmatch(normalize(name))):
-                # After the fiscal form and its «¿Están correctos?» check, Walmart asks the payment
-                # form on its own page; that page's submit button is the emission.
-                risk = 'issue'
-                walmart_payment = True
-            elif (receipt.provider == 'walmart' and walmart_path == '/address' and risk in {'confirm', 'issue'}
-                    and normalize(name) in {'ACEPTAR', 'CONTINUAR'}):
-                # Aceptar and the confirmation dialog's Continuar only lead to the payment page.
-                risk = 'normal'
+            view.act(action, name, not committed and not issued)
+            # The portal's own meaning of this control may raise the risk or lower it.
+            risk = complement.adjust_risk(view, risk)
             if (entry is not None and entry.source == 'ia' and entry.index
-                    and (action_risk(action) != 'normal' or walmart_payment)):
+                    and (action_risk(action) != 'normal' or risk != 'normal')):
                 # Lock: an action that emits, confirms or belongs to the person runs only as the
                 # first step of a plan just asked for with a fresh observation. Found further
                 # back, it and the rest are discarded and the screen is observed and planned again.
@@ -2381,17 +2140,11 @@ class Runner:
                     risk = 'normal'
                     if not committed and not issued:
                         self.soft_submitted.add(key)
-            walmart_issue_control = None
-            walmart_lookup_candidate = None
-            walmart_issue_element = None
-            walmart_issue_url = page.url if walmart_payment else None
-            walmart_auto = False
-            if (receipt.provider == 'walmart' and not committed and not issued and walmart_lookup is None
-                    and walmart_path in {'', '/ticket'} and action.kind == 'click' and normalize(name) == 'CONTINUAR'):
-                walmart_lookup_candidate = await walmart_lookup_proof(page, profile, receipt)
-                if walmart_lookup_candidate is None:
-                    last_error = 'Antes de continuar, coteja RFC, código postal, TC y TR con el ticket.'
-                    continue
+            then = take(await complement.check_action(view))
+            if then == FINISH:
+                return
+            if then == OBSERVE:
+                continue
             if risk == 'forbidden':
                 raise ValueError('La acción no corresponde a solicitar el CFDI de esta compra.')
             if action.kind == 'done':
@@ -2437,29 +2190,13 @@ class Runner:
                 if decision == 'reobserve':
                     last_error = 'Lee otra vez los controles actuales. Sólo se permite preparar datos comprobados hasta la aprobación de emisión.'
                 continue
-            if (receipt.provider == 'tesoro' and action.kind == 'click' and
-                    normalize(''.join(char for char in name if unicodedata.category(char) != 'Co'))
-                    == 'GUARDAR Y CONTINUAR' and
-                    urlsplit(page.url).path.rstrip('/') == '/GenerarCFDI'):
-                _, unresolved = await tesoro_recipient(page, profile)
-                if unresolved:
-                    last_error = 'Antes de guardar el receptor faltan: ' + ', '.join(unresolved) + '.'
-                    if recent and recent[-1].get('bloqueo') == last_error:
-                        raise ValueError(last_error)
-                    recent.append({'bloqueo': last_error})
-                    continue
-            if not committed and not issued and self.portal_entry_home(page, snapshot, receipt) and action.kind == 'click' and action.target and action.target.by == 'role' and action.target.role == 'link':
-                href = await self.safe_portal_entry_href(page, action, receipt, snapshot)
-                if href:
-                    before_action = page.url, snapshot
-                    await page.goto(href, wait_until='domcontentloaded', timeout=18000)
-                    recent.append({'tipo': 'goto', 'control': name[:120]})
-                    self.store.event(key, 'portal_entry', 'Se abrió el formulario de un ticket del mismo comercio.')
-                    continue
-                raise ValueError('El enlace del menú no corresponde al formulario de un ticket verificado. Revisa el destino en el visor.')
-            preparing_capufe = (receipt.provider == 'capufe' and normalize(name) == 'FACTURAR CONCEPTOS' and
-                                action.kind == 'click' and not committed and not issued and
-                                urlsplit(page.url).path.rstrip('/').lower() == '/capufe/facturacionrapida')
+            then = take(await complement.before_acting(view))
+            if then == FINISH:
+                return
+            if then == OBSERVE:
+                continue
+            # An action that reads like an emission but only opens the portal's own confirmation.
+            preparing = complement.prepares_issue(view)
             if key in self.captcha_returned and risk == 'normal' and not committed and not issued:
                 href = await self.safe_continue_href(page, action, receipt)
                 if href:
@@ -2470,19 +2207,18 @@ class Runner:
                     self.store.event(key, 'captcha_followed_link', 'Se abrió el enlace simple de continuación del mismo comercio.')
                     continue
             if key in self.explicit_approval or self.store.checked_preparation(key):
-                if (not committed and not issued and risk != 'issue' and not preparing_capufe
+                if (not committed and not issued and risk != 'issue' and not preparing
                         and action.kind not in {'fill', 'select', 'wait', 'scroll'}
-                        and not (receipt.provider == 'capufe' and action.kind == 'click' and
-                                 re.fullmatch(r'agregar (?:c[oó]digo|ticket|concepto)(?: de peaje)?', name.strip(), re.I))):
+                        and not complement.known_preparation(view)):
                     await self.human(key, page, 'blocked', 'El siguiente control no se reconoce como preparación del ticket. Revisa este paso en el visor.')
                     continue
-            if preparing_capufe and not await capufe_proof(page, profile, receipt, preparation=True):
-                last_error = 'CAPUFE aún no refleja los datos fiscales, agrupación, códigos, fecha o total del expediente.'
-                if recent and recent[-1].get('bloqueo') == last_error:
-                    await self.human(key, page, 'blocked', last_error)
-                recent.append({'bloqueo': last_error})
-                continue
-            if risk == 'issue' and not preparing_capufe:
+            if preparing:
+                then = take(await complement.prove_preparation(view))
+                if then == FINISH:
+                    return
+                if then == OBSERVE:
+                    continue
+            if risk == 'issue' and not preparing:
                 if (committed or issued) and entry is not None and entry.source == 'memoria':
                     # A remembered emission step never runs again after an emission: the model decides.
                     course.drop()
@@ -2493,65 +2229,34 @@ class Runner:
                 if action.kind != 'click' or not action.target.exact:
                     last_error = 'Para emitir, elige el botón o enlace exacto de la confirmación.'
                     continue
-                if receipt.provider == 'tesoro':
-                    mismatch = await tesoro_verification_failure(page, receipt, profile, issue_gate=True)
-                    if mismatch:
-                        raise ValueError(mismatch)
-                if receipt.provider == 'bp' and not await bp_issue_proof(page, receipt, profile, bp_evidence):
-                    raise ValueError('BP no mostró una única compra cotejada con el ticket y el perfil fiscal.')
-                if (walmart_payment and key not in self.explicit_approval
-                        and not await walmart_payment_issue(page, receipt, walmart_lookup)):
-                    # Walmart does not show the ticket's payment form chosen: ask once, live, with its options.
-                    # The question goes through the run's register like any other: it is never sent twice,
-                    # and if it is still needed without an answer the ticket waits for the person once.
-                    options = await walmart_payment_options(page)
-                    question = ('En la página de pago de Walmart no puedo elegir la forma de pago '
-                                'del ticket (clave SAT ' + receipt.payment_code + ' ' +
-                                SAT_PAYMENT_LABELS.get(receipt.payment_code, '') + '). Opciones que muestra: ' +
-                                (', '.join(options) or 'no veo la lista') + '. ¿Cuál elijo?')
-                    if self.can_ask(key, question):
-                        idle_steps = 0
-                        answer, decision = await self.ask_once(key, page, question)
-                        if decision == 'manual':
-                            return await self.manual_job(key, page, profile)
-                        answer_note = answer or 'Sin respuesta: elige la opción equivalente a la clave del expediente.'
-                        last_error = ('Elige en la página de pago la forma de pago del expediente o la que indicó el titular '
-                                      'y vuelve a pulsar el botón.')
-                        continue
+                # The merchant's own proofs come before the engine's; they can only stop the emission.
+                then = take(await complement.before_issue(view))
+                if then == FINISH:
+                    return
+                if then == OBSERVE:
+                    continue
                 _, pending_fields = await fiscal_choices(page, profile, receipt, extra=self._extra())
                 if pending_fields:
                     last_error = 'Antes de emitir, el portal debe reflejar ' + ', '.join(pending_fields) + '.'
                     await self.human(key, page, 'blocked', last_error)
                     continue
                 try:
-                    issue_button = (walmart_issue_control if walmart_issue_control is not None
-                                    else await self.action_control(page, located, receipt))
-                    if walmart_issue_control is not None:
-                        walmart_issue_element = await issue_button.element_handle()
-                        if walmart_issue_element is None:
-                            raise ValueError('El botón de Walmart cambió antes de la emisión.')
-                        await walmart_issue_element.click(trial=True, timeout=1500)
-                    else:
-                        await issue_button.click(trial=True, timeout=1500)
+                    issue_button = await self.action_control(page, located, receipt)
+                    await issue_button.click(trial=True, timeout=1500)
                 except (ValueError, BrowserError):
                     detail = 'El botón de emisión está deshabilitado, cubierto o ya cambió. Revisa los campos obligatorios y los avisos del portal.'
                     if last_error == detail:
                         await self.human(key, page, 'blocked', detail)
                     last_error = detail
                     continue
-                capufe_auto = (receipt.provider == 'capufe' and
-                               normalize(name) in {'SI ESTOY SEGURO', 'SÍ ESTOY SEGURO'} and
-                               await capufe_proof(page, profile, receipt))
-                bp_auto = (receipt.provider == 'bp' and normalize(name) == 'FACTURAR' and
-                           await bp_issue_proof(page, receipt, profile, bp_evidence))
-                walmart_auto = (walmart_payment and
-                                await walmart_payment_issue(page, receipt, walmart_lookup))
-                # Any other portal emits on its own when the page itself shows this
-                # ticket's folio or code, its amount and the recipient RFC.
-                generic_auto = (receipt.provider not in {'capufe', 'bp', 'walmart'} and
-                                await self.generic_issue_proof(page, profile, receipt))
+                # A complement with a proof of its own decides by it alone. Any other portal emits
+                # on its own when the page itself shows this ticket's folio or code, its amount and
+                # the recipient RFC.
+                proven = await complement.issue_proof(view)
+                if proven is None:
+                    proven = await self.generic_issue_proof(page, profile, receipt)
                 valid = (auto_issue and key not in self.explicit_approval and not self.store.get(key)['human_exposed']
-                         and (capufe_auto or bp_auto or walmart_auto or generic_auto))
+                         and proven)
                 if not valid:
                     approved_at = (page.url, snapshot)
                     await self.human(key, page, 'issue', 'Revisa ticket, importe, forma de pago y datos fiscales en el portal para aprobar esta emisión.')
@@ -2562,9 +2267,10 @@ class Runner:
                     if pending_fields:
                         last_error = 'La selección fiscal cambió durante la revisión.'
                         continue
-                if (walmart_auto and (page.url != walmart_issue_url
-                        or await page.locator('body').aria_snapshot() != snapshot)):
-                    last_error = 'El formulario Walmart cambió antes de enviar. Se vuelve a cotejar.'
+                then = take(await complement.before_recording(view))
+                if then == FINISH:
+                    return
+                if then == OBSERVE:
                     continue
                 self.store.begin_emission(key, name)
                 committed = True
@@ -2596,25 +2302,16 @@ class Runner:
             worked = False
             try:
                 before_action = page.url, snapshot
-                if walmart_auto and walmart_issue_element is not None:
-                    await walmart_issue_element.click(timeout=5000)
-                else:
-                    if entry is not None and entry.field is not None:
-                        # Lock: never write by an old number. The page is read again right before
-                        # acting and the field is found by what it is, or the step does not run.
-                        position = locate((await self.page_state(page, receipt))['items'], entry.field, entry.anchor)
-                        if position is None:
-                            raise ValueError('El campo planeado ya no está en la pantalla. Lee de nuevo el formulario.')
-                        located = located.model_copy(update={
-                            'target': Target(by='field', name=str(position), role=None, exact=True)})
-                    await self.execute(page, located, receipt)
-                if (walmart_lookup_candidate is not None and
-                        urlsplit(page.url).path.rstrip('/') != '/address'):
-                    try:
-                        await page.wait_for_url(re.compile(
-                            r'^https://facturacion-clientes\.walmart\.com/address(?:[/?#].*)?$'), timeout=5000)
-                    except BrowserError:
-                        pass
+                if entry is not None and entry.field is not None:
+                    # Lock: never write by an old number. The page is read again right before
+                    # acting and the field is found by what it is, or the step does not run.
+                    position = locate((await self.page_state(page, receipt))['items'], entry.field, entry.anchor)
+                    if position is None:
+                        raise ValueError('El campo planeado ya no está en la pantalla. Lee de nuevo el formulario.')
+                    located = located.model_copy(update={
+                        'target': Target(by='field', name=str(position), role=None, exact=True)})
+                await self.execute(page, located, receipt)
+                await complement.after_acting(view)
                 last_error = ''
                 idle_steps = 0
                 worked = True
@@ -2658,10 +2355,7 @@ class Runner:
             by_number = entry is not None and entry.field and action.target.by == 'field'
             shown_name = entry.field['label'] if by_number and not known.reveals(entry.field['label']) else name
             self.store.event(key, 'action', action.kind + ' · ' + shown_name[:120])
-            if (walmart_lookup_candidate is not None and
-                    urlsplit(page.url).path.rstrip('/') == '/address'):
-                walmart_lookup = walmart_lookup_candidate
-                self.store.event(key, 'ticket_lookup_verified', 'TC, TR, RFC y código postal coincidieron al continuar.')
+            complement.after_logging(view)
             if len(recent) >= 4 and all(event.get('tipo') == action.kind and event.get('control') == name[:120]
                                         and event.get('cambio_visible') is False for event in recent[-4:-1]):
                 if stalled_hints < 2:
