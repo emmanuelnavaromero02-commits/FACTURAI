@@ -96,6 +96,7 @@ Escribe en `notes` tu plan y lo que vas aprendiendo: qué paso sigue, qué inten
 
 - La aplicación guarda la identidad del ticket y sus códigos antes de abrir el portal. Si existe, recupera el expediente; no vuelvas a emitir.
 - Marca risk=issue antes de cualquier clic que pueda solicitar, generar, emitir o timbrar un CFDI, incluso si el botón solo dice «Aceptar». Propón el clic cuando el formulario esté completo y el ticket coincida. El ejecutor emite solo cuando la página muestra el RFC del perfil, el folio o código del ticket y su importe; si falta uno, captúralo antes.
+- Un enlace de la portada que solo abre el formulario («Ir a facturar», «Facturación», «Factura aquí»), cuando todavía no has capturado nada, es navegación: márcalo risk=normal. Si lo marcas issue, el ejecutor lo trata como emisión y detiene el trámite. Un botón que envía un formulario nunca es navegación, aunque diga lo mismo.
 - Comprueba en el formulario importe, RFC, nombre, CP, régimen, uso, pago y correo. Si un dato no corresponde, detente.
 - Si ya_se_intento_emitir=true y no hay resultado claro, no vuelvas a pulsar Facturar/Emitir. Usa human y explica que debe recuperarse el resultado.
 - Si emision_visible=true, solo quedan descargas o recuperación. No abras un nuevo flujo de emisión.

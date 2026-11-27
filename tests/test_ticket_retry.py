@@ -233,7 +233,8 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.store.mark_human_exposed(self.key)
         self.store.recover_after_restart()
         checked = []
-        async def lookup(store, key, ticket, profile):
+        async def lookup(store, key, ticket, profile, runner=None):
+            self.assertIs(runner, self.runner)  # The lookup is handed the engine, to use its browser.
             checked.append(key)
             if len(checked) == 1:
                 return 'CAPUFE no confirmó que el código siga sin facturar.'

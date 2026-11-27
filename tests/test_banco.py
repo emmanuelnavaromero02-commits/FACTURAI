@@ -1,7 +1,9 @@
 """The bank of invented portals: the real runner against portals it has never seen, without network.
 
 The bank runs once for the whole class (two passes, scripted AI) and each test reads what it needs.
-Portals the engine cannot solve yet stay in the bank; their tests pin the exact way they stop.
+A portal the engine cannot solve yet may stay in the bank, marked as such, with a test that pins the
+exact way it stops. None is marked today: the three that were (a link named like an emission, the
+photo of the ticket, options that load late) now have tests that demand the invoice.
 """
 import asyncio
 import contextlib
@@ -125,6 +127,18 @@ class BancoSinNavegadorTests(unittest.TestCase):
             self.assertEqual(banco.main(['--portales', 'una_pagina,no_existe']), 2)
         self.assertIn('no_existe', error.getvalue())
 
+    def test_ningun_portal_del_banco_esta_marcado_y_el_resumen_nombra_al_que_lo_este(self):
+        self.assertEqual([portal.slug for portal in banco.portales() if portal.limitacion or portal.limitacion_memoria], [])
+        # The mark still works for a portal added later that the engine cannot solve yet.
+        figures = banco.cifras([])
+        described = {'marca': '', 'forma': '', 'esperado': 'verificada', 'dominios': []}
+        result = {'ia': 'guionizada', 'segundos_totales': 0, 'tickets': [], 'peticiones_fuera_del_banco': [],
+                  'pasadas': {'1': figures, '2': figures},
+                  'portales': [{**described, 'portal': 'nuevo', 'limitacion': 'No sabe abrirlo.', 'limitacion_memoria': ''},
+                               {**described, 'portal': 'otro', 'limitacion': '', 'limitacion_memoria': 'No lo repite.'},
+                               {**described, 'portal': 'resuelto', 'limitacion': '', 'limitacion_memoria': ''}]}
+        self.assertIn('El motor todavía no puede: nuevo (primera pasada), otro (con memoria).', banco.resumen(result))
+
 
 @unittest.skipUnless(os.path.isfile(CHROME), 'Requiere Google Chrome oficial')
 class BancoCompletoTests(unittest.TestCase):
@@ -219,48 +233,70 @@ class BancoCompletoTests(unittest.TestCase):
         self.assertTrue(self.espia.textos)
         self.assertFalse(any(password in text for text in self.espia.textos))
 
-    # -- what the engine cannot do yet: the exact failure, so a fix shows up here
+    # -- what the engine could not do when the bank was built: now each one has to end in its invoice
 
-    def test_falla_documentada_enlace_ir_a_facturar_se_trata_como_emision(self):
+    def test_enlace_ir_a_facturar_se_sigue_como_navegacion_hasta_el_proveedor(self):
         portal = self.por_slug['redireccion_proveedor']
-        self.assertTrue(portal.limitacion)
+        self.assertFalse(portal.limitacion or portal.limitacion_memoria)
         for pasada in (1, 2):
             item = self.ticket('redireccion_proveedor', pasada)
-            self.assertEqual(item['persona']['tipo'], 'issue')
-            self.assertEqual(item['consultas'], 1)
-            self.assertEqual(item['acciones'], 0)
-        self.assertFalse(any(url.startswith(portal.otros_origenes[0]) for _, url in portal.peticiones))
-        # The same provider shape is solved when the merchant page forwards by itself.
-        self.assertTrue(self.ticket('redireccion_automatica', 1)['acierto'])
-        self.assertGreaterEqual(self.ticket('redireccion_automatica', 1)['redirecciones'], 1)
+            self.assertEqual(item['obtenido'], 'verificada', item['ultimos_eventos'])
+            self.assertIsNone(item['persona'])
+            # The link of the cover page was plain navigation: the only emission attempt is the provider's button.
+            self.assertEqual(item['intentos_de_emision'], 1)
+            self.assertGreaterEqual(item['redirecciones'], 1)
+            self.assertEqual(item['navegacion_bloqueada'], 0)
+        # Following the link asked for the provider's page and sent nothing: one GET per ticket.
+        landing = portal.otros_origenes[0] + portal.BASE
+        self.assertEqual([method for method, url in portal.peticiones if url == landing], ['GET', 'GET'])
+        self.assertEqual(len(portal.emisiones), 2)
+        # With memory the link is repeated without asking the model, and still as navigation.
+        self.assertEqual(self.ticket('redireccion_proveedor', 2)['consultas_preparatorias'], 0)
 
-    def test_falla_documentada_foto_del_ticket_nunca_llega_a_la_ia(self):
+    def test_foto_del_ticket_la_adjunta_el_motor_con_la_pista_y_luego_de_memoria(self):
         portal = self.por_slug['foto_ticket']
-        self.assertTrue(portal.limitacion)
-        for pasada in (1, 2):
-            item = self.ticket('foto_ticket', pasada)
-            self.assertEqual(item['persona']['tipo'], 'attachment')
-            self.assertEqual(item['consultas'], 0)
-        self.assertFalse(any(method == 'POST' for method, _ in portal.peticiones))
+        self.assertFalse(portal.limitacion or portal.limitacion_memoria)
+        first, second = self.ticket('foto_ticket', 1), self.ticket('foto_ticket', 2)
+        for item in (first, second):
+            self.assertEqual(item['obtenido'], 'verificada', item['ultimos_eventos'])
+            self.assertIsNone(item['persona'])
+        # Each ticket attached its own photo, once.
+        self.assertEqual(portal.fotos, ['foto_ticket-1.png', 'foto_ticket-2.png'])
+        # The first time the model was told how to attach it, together with the page that asks for the file.
+        hinted = [text for text in self.espia.textos
+                  if 'El portal exige un archivo' in text and portal.origen in text]
+        self.assertEqual(len(hinted), 1)
+        self.assertIn('Foto del ticket', hinted[0])
+        # The second time the photo was attached from memory, without a consultation before emitting.
+        self.assertEqual(second['consultas_preparatorias'], 0)
+        self.assertGreater(second['acciones_repetidas'], 0)
 
-    def test_falla_documentada_memoria_no_espera_a_las_opciones_tardias(self):
+    def test_memoria_espera_a_las_opciones_tardias_antes_de_emitir(self):
         portal = self.por_slug['opciones_tardias']
-        self.assertTrue(portal.limitacion_memoria)
-        self.assertTrue(self.ticket('opciones_tardias', 1)['acierto'])
-        item = self.ticket('opciones_tardias', 2)
-        self.assertEqual(item['persona']['tipo'], 'blocked')
-        self.assertTrue(item['persona']['mensaje'].startswith('Antes de emitir, el portal debe reflejar'))
-        self.assertEqual(item['consultas'], 0)
-        self.assertGreater(item['acciones_repetidas'], 0)
-        self.assertEqual(len(portal.emisiones), 1)
+        self.assertFalse(portal.limitacion or portal.limitacion_memoria)
+        first, second = self.ticket('opciones_tardias', 1), self.ticket('opciones_tardias', 2)
+        for item in (first, second):
+            self.assertEqual(item['obtenido'], 'verificada', item['ultimos_eventos'])
+            self.assertIsNone(item['persona'])
+            self.assertEqual(item['intentos_de_emision'], 1)
+        # Repeated from memory, the steps reach «Facturar» before the lists load: the engine waits for them.
+        self.assertEqual(second['consultas_preparatorias'], 0)
+        self.assertGreater(second['acciones_repetidas'], 0)
+        # Both invoices went out with the régimen and the uso of the profile, chosen once they were there.
+        self.assertEqual([(sent['regimen'], sent['uso'], sent['pago']) for sent in portal.capturas],
+                         [(banco.PERFIL.regime, banco.PERFIL.cfdi_use, banco.ticket_para(portal, pasada).payment_code)
+                          for pasada in (1, 2)])
 
     def test_resumen_y_json(self):
         text = banco.resumen(self.resultado)
-        first = self.resultado['pasadas']['1']
+        first, second = self.resultado['pasadas']['1'], self.resultado['pasadas']['2']
         self.assertIn(f"{first['salieron_solos']} de {first['pueden_salir_solos']} portales nuevos salieron solos", text)
         self.assertIn(f"Mediana: {first['mediana_segundos']} s y {first['mediana_consultas']} consultas", text)
         self.assertIn('Segunda pasada (con memoria)', text)
-        self.assertIn('El motor todavía no puede: ', text)
+        # Every portal that can end by itself does, new and with memory: nothing is marked as pending.
+        for data in (first, second):
+            self.assertEqual((data['salieron_solos'], data['distintos_de_lo_esperado']), (data['pueden_salir_solos'], []))
+        self.assertNotIn('El motor todavía no puede', text)
         self.assertIn('Peticiones fuera del banco: ninguna.', text)
         data = json.loads(json.dumps(self.resultado, ensure_ascii=False))
         self.assertEqual(len(data['tickets']), 2 * len(self.portales))

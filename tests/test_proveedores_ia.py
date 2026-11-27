@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from facturador import uso_ia
 from facturador.auth import ChatGPTPlan, PlanError
 from facturador.ia_ajustes import AjustesIA, ia_router
-from facturador.models import Action, Extraction, PortalSearch
+from facturador.models import Action, Extraction, Plan, PortalSearch, RegistrationPlan
 from facturador.proveedores_ia import (ANTHROPIC_API, ANTHROPIC_DEFAULT_MODEL, ANTHROPIC_VERSION, OPENAI_API,
                                        AnthropicKeyProvider, OpenAIKeyProvider, SelectorIA, anthropic_content,
                                        anthropic_schema)
@@ -417,6 +417,9 @@ class ContextAndCostTests(Base):
             with uso_ia.en_tarea('whatsapp'):
                 self.assertEqual(uso_ia.tarea_actual(Action), ('whatsapp', 'k-9'))
         self.assertEqual(uso_ia.tarea_actual(Action), ('paso_portal', ''))
+        # A whole-screen plan and the plan of a registration screen are steps of the portal too.
+        self.assertEqual(uso_ia.tarea_actual(Plan), ('paso_portal', ''))
+        self.assertEqual(uso_ia.tarea_actual(RegistrationPlan), ('paso_portal', ''))
         with uso_ia.en_ticket('../../no válido'):
             self.assertEqual(uso_ia.tarea_actual(Action)[1], '')
         registro.record(task='paso_portal', ticket='k', provider='anthropic', model='claude-opus-5-5', effort='high',

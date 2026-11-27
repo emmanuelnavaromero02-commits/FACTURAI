@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -591,6 +592,19 @@ class PortalMemoryRunTests(PortalCase):
         return self.store.list()[0]['id']
 
 
+class PersonClock:
+    """Stands in for ``time`` inside the runner: the real clock, plus what the test adds for a person's wait."""
+
+    def __init__(self):
+        self.ahead = 0.0
+
+    def monotonic(self):
+        return time.monotonic() + self.ahead
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
 class LimitTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         folder = tempfile.TemporaryDirectory()
@@ -612,7 +626,7 @@ class LimitTests(unittest.IsolatedAsyncioTestCase):
                       value=None, reason='paso', risk=risk)
 
     async def pending(self, kind):
-        async with asyncio.timeout(5):
+        async with asyncio.timeout(30):  # Ample: on a busy machine a ticket may take seconds to get here.
             while self.runner.pending.get(self.key, {}).get('kind') != kind:
                 await asyncio.sleep(.01)
 
@@ -651,18 +665,23 @@ class LimitTests(unittest.IsolatedAsyncioTestCase):
         help_me = Action(kind='human', target=None, value=None, reason='Revisión', risk='unknown')
         finished = Action(kind='done', target=None, value=None, reason='Fin', risk='normal')
         model = Mock(next_action=Mock(side_effect=[help_me, self.click(risk='issue'), finished]))
-        task = await self.run_with(model, MAX_ACTIVE_SECONDS=0.6, SELF_HELP_LIMIT=0, MAX_QUESTIONS=0)
+        # The runner's clock is moved by hand while the person «thinks»: the two pauses take far
+        # longer than the whole attempt may work, whatever the machine is busy with meanwhile.
+        clock = PersonClock()
+        budget = 30
+        task = await self.run_with(model, time=clock, MAX_ACTIVE_SECONDS=budget, SELF_HELP_LIMIT=0, MAX_QUESTIONS=0)
         await self.pending('unknown')
-        await asyncio.sleep(0.9)
+        clock.ahead += 3 * budget
         await self.runner.retry_job(self.key)
         await self.pending('issue')
-        await asyncio.sleep(0.4)
+        clock.ahead += 2 * budget
         self.runner.decide(self.key, 'approve')
-        await asyncio.wait_for(task, 5)
+        await asyncio.wait_for(task, 30)
         self.assertEqual(self.store.get(self.key)['status'], 'issued_waiting_files')
         self.assertNotIn('limit_reached', kinds(self.store, self.key))
         spent = metrics(self.store, self.key)[0]
-        self.assertLess(spent['seconds'], 0.6)
+        # Five times the budget went by on that clock; only the work itself was charged.
+        self.assertLess(spent['seconds'], budget)
         self.assertEqual((spent['ai_calls'], spent['actions'], spent['outcome']), (3, 1, 'issued'))
 
     async def test_limit_after_an_emission_attempt_keeps_the_recovery_path(self):

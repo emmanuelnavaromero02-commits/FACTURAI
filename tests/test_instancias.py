@@ -5,12 +5,15 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
 from acceso_dobles import ORIGIN, FakeClock, use_master_key
+from facturador import capufe_recovery
 from facturador.app import create_app
+from facturador.capufe_recovery import _lookup_browser
 from facturador.catalog import CUSTOM_PORTAL
 from facturador.instancias import BUSY, CLOSING, TURN, WAITING, YIELDED, BrowserPool, Instances, Unavailable
 from facturador.models import Profile, Receipt
@@ -32,6 +35,10 @@ class InstancesCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
+        # A watcher hands its look at the database to a thread, and that thread may outlive the task
+        # that asked for it. The folder is removed only once every such thread is done: Windows
+        # refuses to delete a database that is still open. (Cleanups run last one first.)
+        self.addAsyncCleanup(asyncio.get_running_loop().shutdown_default_executor)
         self.root = Path(folder.name)
         use_master_key(self)
         self.clock = FakeClock(1000.0)
@@ -472,6 +479,40 @@ class OneBrowserTests(BrowserCase):
         self.assertIsNone(beto.runner.context)
         self.leave[first].set()
         await self.until(lambda: not ana.runner.has_active_jobs())
+
+    async def test_toll_lookup_takes_its_turn_instead_of_opening_a_browser_of_its_own(self):
+        ana, beto = await self.use(ANA), await self.use(BETO)
+        first = self.start_ticket(ana)
+        await asyncio.wait_for(self.inside[first].wait(), 5)  # Ana's ticket holds the only place.
+        private = SimpleNamespace(new_context=AsyncMock(return_value=SimpleNamespace(close=AsyncMock())))
+        hosted, release = [], asyncio.Event()
+
+        async def recovery():
+            # What the recovery of a toll ticket does, from the ticket's own task: ask for a browser to look in.
+            async with _lookup_browser(beto.runner) as browser:
+                hosted.append(browser)
+                await release.wait()
+
+        def another_browser():
+            raise AssertionError('La consulta no debe lanzar un navegador fuera del tope.')
+
+        with patch.object(FakeContext, 'browser', private, create=True), \
+                patch.object(capufe_recovery, 'async_playwright', another_browser):
+            beto.runner.track_job('consulta', recovery())
+            await self.until(lambda: self.pool.queue == [beto])
+            await asyncio.sleep(.05)
+            # It waits in line like any ticket: no browser of Beto's is open, in the limit or outside it.
+            self.assertEqual((hosted, self.launches, beto.runner.context), ([], [ana.runner], None))
+            self.leave[first].set()
+            await self.until(lambda: not ana.runner.has_active_jobs())
+            self.clock.advance(61)
+            await self.until(lambda: hosted == [private])
+            # Its turn came: it looks inside its own engine's browser, the one the limit counts.
+            self.assertEqual((list(self.pool.holders), self.launches), ([beto], [ana.runner, beto.runner]))
+            self.assertIsNone(ana.runner.context)
+            release.set()
+            await self.until(lambda: not beto.runner.has_active_jobs())
+        self.assertEqual(self.most_open, 1)
 
     async def test_idle_browser_gives_its_place_only_when_nobody_is_using_it(self):
         ana, beto = await self.use(ANA, '/api/browser/personal'), await self.use(BETO)

@@ -107,6 +107,9 @@ class Pedido:
     archivos: dict
     cookies: dict
     url: str
+    # Name of each attached file. The browser never hands the bytes of a file to an intercepted
+    # request, so ``archivos`` arrives empty here: a page that needs them reads them itself.
+    nombres: dict = field(default_factory=dict)
 
     def valor(self, nombre: str, defecto: str = '') -> str:
         return (self.datos.get(nombre) or self.consulta.get(nombre) or defecto).strip()
@@ -125,19 +128,20 @@ def descarga(nombre: str, contenido: bytes) -> Respuesta:
     return Respuesta(contenido, tipo=kind, cabeceras={'Content-Disposition': f'attachment; filename="{nombre}"'})
 
 
-def _multipart(headers: dict, body: bytes) -> tuple[dict, dict]:
+def _multipart(headers: dict, body: bytes) -> tuple[dict, dict, dict]:
     kind = headers.get('content-type', '')
     message = BytesParser(policy=email_policy).parsebytes(b'Content-Type: ' + kind.encode() + b'\r\n\r\n' + body)
-    datos, archivos = {}, {}
+    datos, archivos, nombres = {}, {}, {}
     for part in message.iter_parts():
         name = part.get_param('name', header='content-disposition')
         if not name:
             continue
         if part.get_filename() is not None:
             archivos[name] = part.get_payload(decode=True) or b''
+            nombres[name] = part.get_filename()
         else:
             datos[name] = part.get_content().strip() if part.get_content_type() == 'text/plain' else ''
-    return datos, archivos
+    return datos, archivos, nombres
 
 
 async def pedido(route) -> Pedido:
@@ -145,11 +149,11 @@ async def pedido(route) -> Pedido:
     parts = urlsplit(request.url)
     headers = await request.all_headers()
     consulta = {name: values[0] for name, values in parse_qs(parts.query, keep_blank_values=True).items()}
-    datos, archivos = {}, {}
+    datos, archivos, nombres = {}, {}, {}
     if request.method == 'POST':
         kind = headers.get('content-type', '')
         if kind.startswith('multipart/form-data'):
-            datos, archivos = _multipart(headers, request.post_data_buffer or b'')
+            datos, archivos, nombres = _multipart(headers, request.post_data_buffer or b'')
         elif kind.startswith('application/json'):
             loaded = json.loads(request.post_data or '{}')
             datos = {key: str(value) for key, value in loaded.items()} if isinstance(loaded, dict) else {}
@@ -160,7 +164,7 @@ async def pedido(route) -> Pedido:
         name, _, value = piece.strip().partition('=')
         if name:
             cookies[name] = value
-    return Pedido(request.method, parts.path or '/', consulta, datos, archivos, cookies, request.url)
+    return Pedido(request.method, parts.path or '/', consulta, datos, archivos, cookies, request.url, nombres)
 
 
 # ------------------------------------------------------------------ test CFDI

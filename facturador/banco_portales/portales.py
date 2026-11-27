@@ -457,9 +457,6 @@ class Redireccion(PortalComun):
     origen = 'https://www.hojasuelta.example'
     otros_origenes = ('https://portal.timbrado-nube.example',)
     folio_formato = 'HS{n}'
-    limitacion = ('El enlace de la portada «Ir a facturar» lleva la palabra «facturar»: el motor lo trata como el botón '
-                  'de emisión y, como la portada no muestra RFC, folio ni importe, se detiene a pedir aprobación '
-                  'a la persona antes de llegar al proveedor.')
     BASE = '/emisor/hojasuelta'
     PROVEEDOR = 'Timbrado Nube'
 
@@ -518,7 +515,6 @@ class RedireccionAutomatica(Redireccion):
     origen = 'https://www.cafeteriaorbita.example'
     otros_origenes = ('https://cfdi.emisores-sur.example',)
     folio_formato = 'CO{n}'
-    limitacion = ''
     BASE = '/e/cafeteriaorbita'
     PROVEEDOR = 'Emisores del Sur'
 
@@ -736,9 +732,19 @@ class FotoTicket(PortalComun):
     forma = 'pide subir la foto del ticket'
     origen = 'https://facturas.papeleriatrazo.example'
     folio_formato = 'PT{n}'
-    limitacion = ('El campo de archivo obligatorio y vacío hace que el motor descarte cada observación antes de '
-                  'consultar a la IA: la pista «usa upload con value="ticket"» nunca llega al modelo y, al tercer '
-                  'intento, pide a la persona que adjunte la foto.')
+    # The page reads the first bytes of the chosen file: a simulated portal never receives the
+    # bytes of an attachment, only its name, so the «server» checks what the page read.
+    SCRIPT = r"""<script>
+document.getElementById('foto').addEventListener('change', async ev => {
+  const archivo = ev.target.files[0];
+  const inicio = archivo ? new Uint8Array(await archivo.slice(0, 4).arrayBuffer()) : [];
+  document.getElementById('foto_inicio').value = [...inicio].map(b => b.toString(16).padStart(2, '0')).join('');
+});
+</script>"""
+
+    def __init__(self):
+        super().__init__()
+        self.fotos: list[str] = []  # Name of each photo the portal accepted.
 
     def consulta(self, error=''):
         return self.pagina('<h1>Factura tu compra</h1><p>Sube la foto de tu ticket para validarlo.</p>' + aviso(error) +
@@ -746,15 +752,17 @@ class FotoTicket(PortalComun):
                            campo('folio', 'Folio del ticket', r'[A-Za-z0-9-]{4,20}') +
                            campo('total', 'Total pagado', IMPORTE, 'Escribe el total con punto decimal') +
                            '<label for="foto">Foto del ticket</label><input id="foto" name="foto" type="file" accept="image/*" required>'
-                           '<button>Continuar</button></form>')
+                           '<input type="hidden" name="foto_inicio" id="foto_inicio"><button>Continuar</button></form>',
+                           self.SCRIPT)
 
     def responder(self, p):
         if p.ruta == '/':
             return self.consulta()
         if p.ruta == '/datos' and p.metodo == 'POST':
-            foto = p.archivos.get('foto', b'')
-            if not foto.startswith((b'\x89PNG', b'\xff\xd8')):
+            # PNG or JPEG by its first bytes, under a file name: a real photo was chosen.
+            if not p.nombres.get('foto') or not p.valor('foto_inicio').startswith(('89504e47', 'ffd8')):
                 return self.consulta('Sube una foto del ticket (JPG o PNG).')
+            self.fotos.append(p.nombres['foto'])
             ticket = self.buscar(p.valor('folio'), '', p.valor('total'))
             if not ticket:
                 return self.consulta('No encontramos ese ticket.')
@@ -810,9 +818,6 @@ document.getElementById('regimen').addEventListener('change', ev => {
 </script>"""
     # Milliseconds the portal takes to bring each list after the RFC or the régimen changes.
     demora_ms = 1500
-    limitacion_memoria = ('Al repetir la pantalla de memoria, los pasos llegan a «Facturar» antes de que carguen '
-                          'régimen y uso; en vez de esperar a las listas, el motor se detiene y pide a la persona '
-                          '(«Antes de emitir, el portal debe reflejar …»).')
 
     def fiscal(self, ticket, error=''):
         return self.pagina(f'<h1>Datos fiscales</h1><p>Ticket {ticket.ticket_number} por ${ticket.amount}</p>' + aviso(error) +

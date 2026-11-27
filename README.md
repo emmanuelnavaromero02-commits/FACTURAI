@@ -162,7 +162,7 @@ En **Ajustes → Datos para registros** dejas, si quieres, nombre, apellidos, te
 3. **Varios pasos.** Admite registros de hasta 6 pantallas. Cada pantalla se anota antes de enviarse y nunca se envía dos veces. Reconoce más botones de registro, botones que no son `<button>` y el acceso en dos pasos. Nunca usa «Entrar con Google, Facebook o Apple» ni botones de pago, compra o emisión.
 4. **Términos.** La casilla de términos solo se marca con el permiso **Aceptar los términos del registro**. Sin él, el ticket espera y dice qué hacer.
 5. **Correo de alta.** El correo de confirmación del portal se espera hasta 10 minutos, diciendo cuánto lleva, y se lee de cualquier buzón conectado (ver [Correo](#correo)).
-6. **Código al teléfono.** El código que un portal manda por SMS o WhatsApp lo escribe la persona en el sitio y pulsa **Continuar**. El flujo de registro puede pedirlo por el chat, pero el motor todavía no lo tiene conectado.
+6. **Código al teléfono.** Si el portal manda un código por SMS o WhatsApp mientras el ticket abre o usa su cuenta, FACTURAI te lo pide en el chat y espera hasta 5 minutos. Lo escribe en el portal y no lo guarda: en el historial queda «Código enviado.» y la IA nunca lo ve. Si no contestas a tiempo, o el código llega cuando la pregunta ya cerró, lo escribes tú en el sitio y pulsas **Continuar**.
 
 Siempre queda para la persona: resolver el «no soy un robot», cualquier dato que no dejó (no se inventa: la pausa dice cuál agregar), los códigos de segundo factor o recuperación, y los registros con más pasos de los permitidos o que cambian mientras se llenan.
 
@@ -282,7 +282,7 @@ Cómo activarlo (los mismos pasos están comentados en `compose.yaml`, apagados 
 
 - **No resuelve el «no soy un robot».** Siempre lo completa una persona en la vista en vivo. FACTURAI no lo automatiza ni lo rodea.
 - **No inventa datos.** Si un portal pide algo que no dejaste (por ejemplo la fecha de nacimiento), el ticket espera y dice qué agregar.
-- **Los códigos que no puede contestar se quedan contigo:** el que un portal manda al teléfono, los de segundo factor o recuperación y los códigos de seguridad que pide un robot de WhatsApp.
+- **Los códigos que no puede contestar se quedan contigo:** los de segundo factor o recuperación y los códigos de seguridad que pide un robot de WhatsApp. El código que un portal manda al teléfono durante el alta o el acceso sí te lo pide por el chat, sin guardarlo (ver [Registro en portales](#registro-en-portales)).
 - **Outlook y Hotmail por OAuth no existen.** Esos buzones, como cualquier otro que no sea Gmail, se conectan por IMAP con contraseña de aplicación.
 - **No hay «Gmail con un clic».** Conectar Gmail exige crear en Google Cloud un cliente OAuth de escritorio e importar su JSON.
 - **Nunca emite si la página no muestra** el RFC del perfil, el folio o código del ticket y su importe, y la factura recibida siempre se coteja contra el perfil y el ticket.

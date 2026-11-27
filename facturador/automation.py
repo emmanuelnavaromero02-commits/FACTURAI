@@ -42,6 +42,11 @@ OWN_PHOTOS = 'leer_mis_fotos_de_whatsapp'
 # Refusals raised while the channel is busy, before anything was reserved: try again later.
 CHANNEL_BUSY = ('Hay una operación de WhatsApp en curso.', 'Espera a que termine el trámite del navegador.',
                 'El navegador está ocupado.', 'Hay un envío de correo en curso.')
+# After a restart nothing has opened WhatsApp and its link reads «sin_abrir» although it may still
+# be linked; a look that found it loading or without connection did not find out either. The queue
+# looks at it for real at most this often (seconds), and only when it needs to.
+LINK_UNKNOWN = {'sin_abrir', 'cargando', 'sin_conexion'}
+LINK_CHECK_EVERY = 600
 
 
 def _epoch(value) -> float:
@@ -516,6 +521,8 @@ class TicketAutomation:
         self._direct: dict[str, dict] = {}  # Direct requests this run may still send.
         self._direct_checked: dict[str, str] = {}  # Last reading examined for a direct channel.
         self._adopted: set[str] = set()  # Own WhatsApp photos already sent down the chat path.
+        self._link_check: asyncio.Task | None = None  # The look at the WhatsApp link under way, if any.
+        self._link_checked = float('-inf')  # When the queue last asked for one (monotonic clock).
         self.settings = store.root / 'automation.json'
         settings = read_json(self.settings, {})
         self.enabled = settings.get('enabled') is True
@@ -582,6 +589,8 @@ class TicketAutomation:
             await self.task
         # Each cancelled read releases its claim (see analyze); its thread result is discarded.
         reads = list(self.reads.values())
+        if self._link_check and not self._link_check.done():
+            reads.append(self._link_check)
         for read in reads:
             read.cancel()
         if reads:
@@ -823,6 +832,41 @@ class TicketAutomation:
         return bool(self.runner.has_active_jobs() or self.runner.lock.locked() or viewer.channel
                     or viewer.dialog or viewer.file_request)
 
+    def _unknown_link(self, routes) -> str:
+        """What to tell the person while nobody knows whether WhatsApp is linked; '' to say «vincula» as before.
+
+        After a restart the state says nothing: the session may be as linked as it was. The queue
+        asks for the same look «Comprobar vínculo» takes, in the background, only with the browser
+        free, at most once every ten minutes, and never for someone who does not use WhatsApp.
+        """
+        if self._link_check is not None and not self._link_check.done():
+            return 'Comprobando si WhatsApp sigue vinculado.'
+        try:
+            if not routes.in_use():
+                return ''  # Nothing is opened for someone who does not use WhatsApp.
+        except Exception:
+            return ''
+        if time.monotonic() - self._link_checked < LINK_CHECK_EVERY:
+            return 'No se pudo comprobar WhatsApp. Se intentará de nuevo en unos minutos.'
+        if self._browser_busy():
+            return 'Se pedirá por WhatsApp cuando se libere el navegador.'
+        self._link_checked = time.monotonic()
+        self._link_check = asyncio.create_task(self._look_at_link(routes))
+        return 'Comprobando si WhatsApp sigue vinculado.'
+
+    async def _look_at_link(self, routes):
+        try:
+            await routes.check_link()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if isinstance(exc, ValueError) and str(exc) in CHANNEL_BUSY:
+                self._link_checked = float('-inf')  # It never got to look: the next round may ask again.
+            elif not isinstance(exc, ValueError):
+                log.warning('No se pudo comprobar el vínculo de WhatsApp (%s).', type(exc).__name__)
+        finally:
+            self.wake.set()
+
     async def _channel_state(self, row, channel, info):
         """('send' | 'wait' | 'manual', message for the person) for one channel of the ticket."""
         if channel in info['failed']:
@@ -844,6 +888,10 @@ class TicketAutomation:
             except Exception:
                 link = {}  # An unreadable WhatsApp page counts as not linked.
             if not link.get('ready'):
+                if link.get('state') in LINK_UNKNOWN:
+                    unknown = self._unknown_link(routes)
+                    if unknown:
+                        return 'wait', unknown
                 return 'wait', 'Vincula WhatsApp para pedirla sola.'
             if self._browser_busy():
                 return 'wait', 'Se pedirá por WhatsApp cuando se libere el navegador.'

@@ -288,6 +288,123 @@ class DirectChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get(key)['status'], 'new')
         self.assertEqual(self.sender.prepared, [])
 
+    # After a restart nothing has opened WhatsApp: its link reads «sin_abrir», whatever it really is.
+
+    def unopened(self, *answers):
+        """WhatsApp was not opened since the start; each look the queue asks for gives the next answer."""
+        self.link = {'ready': False, 'state': 'sin_abrir'}
+        looks = []
+
+        async def check_link():
+            looks.append(len(looks))
+            answer = answers[min(len(looks), len(answers)) - 1]
+            if isinstance(answer, Exception):
+                raise answer
+            self.link = {'ready': answer == 'listo', 'state': answer}
+            return dict(self.link)
+        self.routes.check_link = check_link
+        return looks
+
+    async def look(self):
+        """Let the look the queue asked for end, as the queue's own loop does between rounds."""
+        self.assertIsNotNone(self.worker._link_check)
+        await self.worker._link_check
+
+    async def test_after_a_restart_the_queue_looks_at_the_link_and_then_asks(self):
+        self.allow('pedir_por_whatsapp')
+        looks = self.unopened('listo')
+        key = self.ticket()
+        await self.settle(extracted(merchant_whatsapp=PHONE))
+        # It no longer says «Vincula WhatsApp» without knowing: it looks first, in the background.
+        self.assertIn('Comprobando si WhatsApp sigue vinculado.', self.store.get(key)['message'])
+        self.assertNotIn('Vincula WhatsApp', self.store.get(key)['message'])
+        self.assertEqual((looks, self.sends), ([], []))
+        await self.look()
+        await self.settle(extracted(merchant_whatsapp=PHONE), rounds=3)
+        self.assertEqual((len(looks), self.sends), (1, ['525555550188']))
+        self.assertEqual(self.requests('whatsapp_requests', key)[0]['state'], 'sent')
+
+    async def test_link_that_stays_unknown_is_looked_at_once_every_ten_minutes(self):
+        self.allow('pedir_por_whatsapp')
+        looks = self.unopened('cargando', 'sin_conexion', 'listo')  # WhatsApp did not finish loading in time.
+        key = self.ticket()
+        await self.settle(extracted(merchant_whatsapp=PHONE))
+        await self.look()
+        await self.settle(extracted(merchant_whatsapp=PHONE), rounds=6)
+        self.assertEqual(len(looks), 1)
+        # Still unknown: it does not claim that WhatsApp is not linked, and it does not look again yet.
+        message = self.store.get(key)['message']
+        self.assertIn('No se pudo comprobar WhatsApp. Se intentará de nuevo en unos minutos.', message)
+        self.assertNotIn('Vincula WhatsApp', message)
+        self.assertEqual(self.sends, [])
+        for expected in (2, 3):
+            with patch('facturador.automation.LINK_CHECK_EVERY', 0):  # Ten minutes later.
+                await self.settle(extracted(merchant_whatsapp=PHONE), rounds=2)
+                await self.look()
+            self.assertEqual(len(looks), expected)
+        await self.settle(extracted(merchant_whatsapp=PHONE), rounds=3)
+        self.assertEqual(self.sends, ['525555550188'])  # The third look found it linked.
+
+    async def test_session_that_really_is_not_linked_says_so_and_is_not_looked_at_again(self):
+        self.allow('pedir_por_whatsapp')
+        looks = self.unopened('qr')
+        key = self.ticket()
+        await self.settle(extracted(merchant_whatsapp=PHONE))
+        await self.look()
+        with patch('facturador.automation.LINK_CHECK_EVERY', 0):
+            await self.settle(extracted(merchant_whatsapp=PHONE), rounds=6)
+        self.assertEqual(len(looks), 1)
+        self.assertIn('Vincula WhatsApp para pedirla sola.', self.store.get(key)['message'])
+        self.assertEqual(self.sends, [])
+
+    async def test_link_is_looked_at_only_with_the_browser_free(self):
+        self.allow('pedir_por_whatsapp')
+        looks = self.unopened(ValueError('Hay una operación de WhatsApp en curso.'), 'listo')
+        self.runner.viewer.channel = 'otra-ventana-del-panel'  # Somebody is using the browser.
+        key = self.ticket()
+        await self.settle(extracted(merchant_whatsapp=PHONE))
+        self.assertIsNone(self.worker._link_check)
+        self.assertIn('Se pedirá por WhatsApp cuando se libere el navegador.', self.store.get(key)['message'])
+        self.assertEqual(looks, [])
+        self.runner.viewer.channel = ''
+        await self.settle(extracted(merchant_whatsapp=PHONE), rounds=2)
+        await self.look()                   # WhatsApp was busy with something else: it never got to look,
+        self.assertEqual(len(looks), 1)
+        await self.settle(extracted(merchant_whatsapp=PHONE), rounds=2)
+        await self.look()                   # so the next round asks again without waiting ten minutes.
+        await self.settle(extracted(merchant_whatsapp=PHONE), rounds=3)
+        self.assertEqual((len(looks), self.sends), (2, ['525555550188']))
+
+    async def test_nothing_is_opened_for_someone_who_does_not_use_whatsapp(self):
+        looks = self.unopened('listo')
+        key = self.ticket()
+        await self.settle(extracted(merchant_whatsapp=PHONE))
+        # Without the permission the queue does not even ask for the link.
+        self.routes.link_state.assert_not_awaited()
+        self.assertEqual((looks, self.worker._link_check), ([], None))
+        self.assertIn('Pídela desde el ticket, o activa el permiso en Ajustes', self.store.get(key)['message'])
+        # «Uses WhatsApp» means a standing permission of WhatsApp, or a request that still waits.
+        routes = self.routes
+        self.assertFalse(routes.in_use())
+        self.allow('pedir_por_correo')
+        self.assertFalse(routes.in_use())
+        for name in ('pedir_por_whatsapp', 'leer_mis_fotos_de_whatsapp'):
+            permisos.guardar(self.root, name, True)
+            self.assertTrue(routes.in_use())
+            permisos.guardar(self.root, name, False)
+        with self.store.connect() as db:
+            db.execute("INSERT INTO whatsapp_requests VALUES(?,?,?,?,?,?,?,?)",
+                       (key, '525555550188', 'FACTURAI-0000000000000001', 'external', '', 'sent', '', ''))
+        self.assertTrue(routes.in_use())
+        with self.store.connect() as db:
+            db.execute("UPDATE jobs SET status='verified' WHERE id=?", (key,))
+        self.assertFalse(routes.in_use())
+        # And the queue never starts a look by itself when that answer is no.
+        nobody = SimpleNamespace(in_use=lambda: False, check_link=AsyncMock())
+        self.assertEqual(self.worker._unknown_link(nobody), '')
+        self.assertIsNone(self.worker._link_check)
+        nobody.check_link.assert_not_awaited()
+
     async def test_chat_upload_is_requested_without_the_inbox_toggle(self):
         self.connect_mail()
         self.allow('pedir_por_correo')

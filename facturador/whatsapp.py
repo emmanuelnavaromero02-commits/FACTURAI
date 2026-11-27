@@ -683,7 +683,25 @@ def whatsapp_router(store, runner, profile, plan=None):
             web.note_link(await sel.estado_vinculo(page))
         return dict(web.link)
 
+    async def check_link():
+        """Look at the link for real, opening WhatsApp for a moment when nothing has it open."""
+        if operations.locked():
+            raise ValueError('Hay una operación de WhatsApp en curso.')
+        async with operations:
+            return await web.check_link()
+
+    def in_use():
+        """The person uses WhatsApp here: a standing permission is on, or a request still waits for its invoice."""
+        if any(permitido(store.root, name) for name in ('pedir_por_whatsapp', 'leer_mis_fotos_de_whatsapp')):
+            return True
+        with store.connect() as db:
+            return bool(db.execute("""SELECT 1 FROM whatsapp_requests w JOIN jobs j ON j.id=w.job_id
+                WHERE w.state IN ('preparing','sending','sent','uncertain') AND j.status<>'verified' LIMIT 1""").fetchone())
+
     routes.link_state = link_state
+    # For the queue: after a restart the state reads «sin_abrir» until something opens WhatsApp.
+    routes.check_link = check_link
+    routes.in_use = in_use
     routes.attention = talks.atencion
 
     @routes.get('/api/whatsapp/link')
@@ -692,10 +710,7 @@ def whatsapp_router(store, runner, profile, plan=None):
 
     @routes.post('/api/whatsapp/link/check')
     async def link_check():
-        if operations.locked():
-            raise ValueError('Hay una operación de WhatsApp en curso.')
-        async with operations:
-            return await web.check_link()
+        return await check_link()
 
     @routes.get('/api/whatsapp/attention')
     async def attention():

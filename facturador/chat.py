@@ -75,6 +75,24 @@ def payment_correction(value: str) -> tuple[bool, str]:
     return False, ''
 
 
+# A code only the person has (one sent to their phone) is never written down: the history keeps
+# this text in its place, whether the code was handed to the ticket that asked or arrived too late.
+SECRET_KEPT = 'Código enviado.'
+SECRET_THANKS = 'Gracias. Lo escribo en el portal y no lo guardo.'
+SECRET_LATE = ('Ese código ya no lo puedo usar desde aquí, y no lo guardé. '
+               'Escríbelo tú directamente en el portal y pulsa Continuar.')
+CODE_FILLER = {'el', 'la', 'mi', 'es', 'fue', 'era', 'son', 'codigo', 'clave', 'pin', 'aqui', 'va', 'esta', 'este',
+               'ya', 'ok', 'listo', 'llego', 'me', 'sms', 'de', 'del', 'por', 'whatsapp', 'gracias'}
+
+
+def only_code(value: str) -> bool:
+    """The message is nothing but one code: digits, or letters with a digit, and at most a few filler words."""
+    words = re.findall(r'[a-z0-9]+', plain(value))
+    code = ''.join(word for word in words if any(char.isdigit() for char in word))
+    rest = [word for word in words if not any(char.isdigit() for char in word)]
+    return 4 <= len(code) <= 10 and all(word in CODE_FILLER for word in rest)
+
+
 def _recent_context(store) -> str:
     messages = store.chat_messages(10)
     lines = [f"{m['role']}: {m['text'][:350]}" for m in messages if m['text'].strip()]
@@ -250,6 +268,21 @@ def chat_router(store, plan, automation, runner, get_profile) -> APIRouter:
             if previous:
                 return turn(previous)
             waiting = runner.open_question() if not prepared and text.strip() else None
+            if waiting and runner.secret_open(waiting):
+                # The ticket asked for a code only the person has. It is handed over to whoever
+                # waits for it and nothing of it is stored: not in the history, not for the model.
+                runner.answer_question(waiting, text.strip())
+                messages = store.save_chat_turn(request_id, SECRET_KEPT, [], [waiting], 'answer', SECRET_THANKS)
+                return {'messages': messages, 'job_ids': [waiting], 'intent': 'answer'}
+            asked = runner.secret_recent() if text.strip() and only_code(text) else None
+            if asked and prepared:
+                # Typed beside photos, it is not kept either; the photos follow their own way.
+                text = SECRET_KEPT
+            elif asked:
+                # A code that arrives after its question closed goes nowhere: not to the ticket in
+                # progress, not to another question, not to the model. The person types it in the portal.
+                messages = store.save_chat_turn(request_id, SECRET_KEPT, [], [asked], 'answer', SECRET_LATE)
+                return {'messages': messages, 'job_ids': [asked], 'intent': 'answer'}
             if waiting:
                 # The agent asked something about the ticket in progress: this is the answer.
                 runner.answer_question(waiting, text.strip())

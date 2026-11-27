@@ -53,7 +53,8 @@ class CapufeComplement(Complement):
     @staticmethod
     async def recover_documents(runner, key, profile, receipt, notes):
         from .capufe_recovery import recover_capufe
-        report = await recover_capufe(runner.store, key, receipt, profile)
+        # The lookup runs in the engine's own browser, so it counts as one with it.
+        report = await recover_capufe(runner.store, key, receipt, profile, runner=runner)
         if report:
             notes.append(report)
         return await runner.recover(key, profile, notes=notes)

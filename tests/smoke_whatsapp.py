@@ -181,6 +181,7 @@ async def smoke():
                                                            chromium_sandbox=True)
             try:
                 context = await browser.new_context(accept_downloads=True, service_workers='block')
+                await context.add_init_script(ALWAYS_ONLINE)
                 await context.route('**/*', intercept)
                 await context.expose_binding('record', lambda _, message: outbound.append(message))
                 runner = Runner(Store(Path(folder)))
@@ -384,6 +385,11 @@ def png_bytes(color):
     return stream.getvalue()
 
 
+# The simulated WhatsApp says by itself when it has no connection. The machine that runs these
+# scenarios may have no network at all (a test container), and its browser would report every page offline.
+ALWAYS_ONLINE = "Object.defineProperty(Navigator.prototype, 'onLine', {get: () => true, configurable: true})"
+
+
 async def launch_browser(playwright):
     if os.getenv('FACTURADOR_SMOKE_FIREFOX') == '1':
         return await playwright.firefox.launch()
@@ -422,6 +428,7 @@ async def harness():
             browser = await launch_browser(playwright)
             try:
                 context = await browser.new_context(accept_downloads=True, service_workers='block')
+                await context.add_init_script(ALWAYS_ONLINE)
                 await context.route('**/*', sim.intercept)
                 await context.expose_binding('record', lambda _, message: sim.outbound.append(message))
                 runner = Runner(Store(Path(folder)))

@@ -5,6 +5,7 @@ import hashlib
 import html
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -16,12 +17,12 @@ from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 from playwright.async_api import Error as BrowserError
 
 from .ai import AI, read_receipt
 from .account_flow import PortalAccountFlow, SECRET_SCREEN
-from .auth import ChatGPTPlan, PlanError
+from .auth import ChatGPTPlan, PlanError, read_json
 from .catalog import (CATALOG, CUSTOM_PORTAL, allowed_url, billing_destination, provider_for_url,
                       public_portal_origin, resolves_publicly)
 from .captcha_transport import WidgetTransport, widget_origin
@@ -32,6 +33,7 @@ from .documents import job_candidates, reconcile
 from .fiscal_choices import NAMES as FISCAL_FIELDS, fiscal_choices, matches as sat_option
 from .models import Action, Plan, Profile, Receipt, Target
 from .personal_browser import PersonalBrowser
+from .portal_accounts import credential_file
 from .portal_memory import Attempt, Known, PortalMemory, describe, fold, locate, screen_signature
 from .profile_lock import close_context, launch_chrome
 from .ticket_lookup import prefill_ticket_lookup
@@ -100,7 +102,30 @@ PAGE_TEXT = r"""(start) => {
   return {text: document.body ? document.body.innerText : '', fields: fields, count: items.length,
           items: described, buttons: buttons};
 }"""
+# The address a click target leads to when it is a plain link of the page itself: an <a href>
+# outside any form, with no handler of its own, that opens another document. Anything that
+# could run code or send data answers null.
+PLAIN_LINK = r"""e => {
+  const a = e.closest('a[href]');
+  if (!a || window !== window.top) return null;
+  const role = a.getAttribute('role');
+  if ((role && role !== 'link') || a.closest('form, button, [role="button"]') ||
+      a.querySelector('button, input, select, textarea')) return null;
+  const handlers = ['onclick', 'onmousedown', 'onmouseup', 'onpointerdown', 'onpointerup', 'ontouchstart',
+                    'ontouchend', 'onkeydown', 'onkeyup', 'onfocus'];
+  for (let node = e; node; node = node === a ? null : node.parentElement)
+    if (handlers.some(name => node.hasAttribute(name))) return null;
+  if (a.hasAttribute('download') || a.hasAttribute('ping')) return null;
+  const target = (a.getAttribute('target') || '').toLowerCase();
+  if (!['', '_self', '_blank', '_top', '_parent'].includes(target)) return null;
+  if (a.origin + a.pathname + a.search === location.origin + location.pathname + location.search) return null;
+  return {href: a.href};
+}"""
 ASK_TIMEOUT = 120
+# A code sent to the person's phone is waited for longer. While that question is open, and for
+# this long after it closes, the chat treats what arrives as the secret it is.
+SECRET_ASK_TIMEOUT = 300
+SECRET_GRACE = 900
 # Each look-up tool may be used this many times per attempt; the page text comes in every step.
 TOOL_LIMITS = {'view_ticket': 2, 'search_web': 2, 'read_text': 4}
 CONFIRM_STEP = re.compile(r'CONTINUAR|ACEPTAR|CONFIRMAR|SI|SÍ|FACTURAR|GENERAR(?: FACTURA)?|EMITIR(?: FACTURA)?|'
@@ -146,6 +171,13 @@ LIMIT_MESSAGE = ('No pude terminar este portal en el tiempo previsto. No se envi
                  'puedes reintentar o tomar el control.')
 # These actions travel alone in a plan: their result changes what comes next.
 SOLO = TOOLS | {'ask', 'human', 'done'}
+# Consultations in which the model is told that the portal wants a file, before the person is asked.
+ATTACHMENT_HINTS = 2
+# Fiscal lists that load late (often after the RFC is typed) get this long before an emission, looked at this often.
+FISCAL_WAIT = 8.0
+FISCAL_POLL = 0.5
+# Times one attempt may wait for those lists at the emission gate.
+FISCAL_WAITS = 3
 # A repeated screen gets this long to move on before it counts as not having advanced.
 SETTLE_TRIES = 12
 SETTLE_PAUSE = 0.5
@@ -336,8 +368,16 @@ class Runner:
         self.session_hints: dict[str, str] = {}
         # Tickets where a generic «Aceptar»/«Enviar» may have submitted something.
         self.soft_submitted: set[str] = set()
+        # Tickets whose portal already got something in this run: a value typed, chosen or attached,
+        # or an account or a person stepping in. Until then a link that only leads to another page
+        # is plain navigation, whatever it is called.
+        self.captured: set[str] = set()
         # Questions the agent asked in the chat, answered by the person's next message.
         self.questions: dict[str, asyncio.Future] = {}
+        # Tickets that asked in the chat for a secret (a code sent to the phone) and until when a
+        # message is still taken for it: without end while the question is open, then a few minutes
+        # more. The chat hands such an answer over without storing it or showing it to the model.
+        self.secret_questions: dict[str, float] = {}
         # Chat messages the person sent while their ticket was being processed.
         self.live_notes: dict[str, list[str]] = {}
         self.manual_download_error = ''
@@ -1234,29 +1274,55 @@ class Runner:
         if future and not future.done():
             future.set_result(text[:1000])
 
-    async def ask_chat(self, key: str, question: str) -> str:
-        """Ask the person in the live chat and wait a few minutes; an empty answer means «assume»."""
+    def secret_open(self, key: str) -> bool:
+        """The question that ticket has open in the chat asks for a secret."""
+        return self.secret_questions.get(key) == math.inf and key in self.questions
+
+    def secret_recent(self) -> str | None:
+        """The ticket that asked for a secret in the chat, while its question is open or shortly after."""
+        now = time.monotonic()
+        for key, until in list(self.secret_questions.items()):
+            if until < now:
+                del self.secret_questions[key]
+        return next(iter(self.secret_questions), None)
+
+    async def ask_chat(self, key: str, question: str, *, secreto: bool = False) -> str:
+        """Ask the person in the live chat and wait a few minutes; an empty answer means «assume».
+
+        ``secreto`` is for a code only the person has, such as one sent to their phone. The wait
+        is longer and nothing is assumed when nobody answers. The question is marked as secret
+        while it is open and for a while after, so the chat hands the answer over here without
+        storing it, and a code that arrives late goes nowhere. It is not a question of the model:
+        it does not count among them nor enter the record of the ones already asked.
+        """
         future = asyncio.get_running_loop().create_future()
         self.questions[key] = future
         question = ' '.join(question.split())[:600]
-        self.store.add_assistant_message('Sobre tu ticket en proceso: ' + question +
-                                         ' Respóndeme aquí; si no me contestas en unos minutos, sigo con lo más probable.',
-                                         [key])
+        if secreto:
+            self.secret_questions[key] = math.inf
+            closing = (' No guardo el código: solo lo escribo en el portal. Si no lo tienes en unos minutos, '
+                       'podrás escribirlo tú en el sitio.')
+        else:
+            closing = ' Respóndeme aquí; si no me contestas en unos minutos, sigo con lo más probable.'
+        self.store.add_assistant_message('Sobre tu ticket en proceso: ' + question + closing, [key])
         self.store.running_message(key, 'Te pregunté en el chat: ' + question[:200])
         self.store.event(key, 'question', question[:200])
         waiting_since = time.monotonic()
         try:
-            answer = await asyncio.wait_for(asyncio.shield(future), ASK_TIMEOUT)
+            answer = await asyncio.wait_for(asyncio.shield(future), SECRET_ASK_TIMEOUT if secreto else ASK_TIMEOUT)
         except asyncio.TimeoutError:
             answer = ''
         finally:
             self.questions.pop(key, None)
             if not future.done():
                 future.cancel()
+            if secreto:
+                self.secret_questions[key] = time.monotonic() + SECRET_GRACE
             meter = self.meters.get(key)
             if meter:
                 meter.waited += time.monotonic() - waiting_since
-        self.store.event(key, 'answer', 'Respuesta recibida en el chat.' if answer else 'Sin respuesta; el agente asume y sigue.')
+        self.store.event(key, 'answer', 'Respuesta recibida en el chat.' if answer else
+                         'Sin respuesta en el chat.' if secreto else 'Sin respuesta; el agente asume y sigue.')
         return answer
 
     def can_ask(self, key: str, question: str) -> bool:
@@ -1339,6 +1405,104 @@ class Runner:
         shown = {Decimal(raw.replace(',', '')) for raw in re.findall(r'\d{1,3}(?:,\d{3})*(?:\.\d{1,2})|\d+(?:\.\d{1,2})?', text)
                  if raw.replace(',', '').replace('.', '').isdigit()}
         return amount in shown
+
+    @staticmethod
+    def identifies(text: str, profile: Profile, receipt: Receipt) -> bool:
+        """The text carries the recipient's RFC or e-mail, or the folio or a code of the ticket."""
+        upper = text.upper()
+        compact = re.sub(r'\s+', '', upper)
+        if any(value and re.sub(r'\s+', '', value).upper() in compact for value in (profile.rfc, profile.email)):
+            return True
+        for value in (receipt.ticket_number, *receipt.billing_codes):
+            reference = re.sub(r'\s+', '', value or '').upper()
+            if len(reference) >= 4 and reference in compact:
+                return True
+            # A short folio counts only as a word of its own: «12» is part of any page.
+            if 0 < len(reference) < 4 and re.search(r'(?<![0-9A-ZÑ])' + re.escape(reference) + r'(?![0-9A-ZÑ])', upper):
+                return True
+        return False
+
+    @classmethod
+    def shows_ticket_or_recipient(cls, text: str, profile: Profile, receipt: Receipt) -> bool:
+        """The page shows something of the recipient (RFC, e-mail, name) or of the ticket (folio, code, amount)."""
+        if cls.identifies(text, profile, receipt):
+            return True
+        spaced = ' '.join(text.upper().split())
+        name = ' '.join((profile.name or '').upper().split())
+        if name and re.search(r'(?<![0-9A-ZÑ])' + re.escape(name) + r'(?![0-9A-ZÑ])', spaced):
+            return True
+        try:
+            amount = Decimal(receipt.amount)
+        except (InvalidOperation, TypeError):
+            return True
+        shown = {Decimal(raw.replace(',', '')) for raw in re.findall(r'\d{1,3}(?:,\d{3})*(?:\.\d{1,2})|\d+(?:\.\d{1,2})?', text)
+                 if raw.replace(',', '').replace('.', '').isdigit()}
+        return amount in shown
+
+    async def navigation_link(self, key: str, page, action: Action, profile: Profile, receipt: Receipt,
+                              accounts=None) -> bool:
+        """A click on a link that only leads to another page, while there is nothing to invoice yet.
+
+        Portals often open with «Ir a facturar» as a link to their form. Such a click is navigation
+        and not an emission only when all of this holds; in doubt it stays an emission and goes
+        through the gate:
+        - the model did not call it an emission and its target is a plain <a href> (PLAIN_LINK) to
+          another page of the portal or of an invoicing operator, with nothing of the ticket or of
+          the recipient in its address;
+        - the page holds no captured field and shows no RFC, e-mail or name of the recipient, nor
+          the folio, a code or the amount of the ticket;
+        - this run typed, chosen or attached nothing yet, no person stepped in, no emission was
+          tried and the program keeps no account of this person on the portal.
+        The request it causes still goes through the guard of every navigation.
+        """
+        if (action.kind != 'click' or action.target is None or action.risk != 'normal' or key in self.captured
+                or self.pauses.get(key) or key in self.explicit_approval
+                or (accounts is not None and accounts.credential_values)):
+            return False
+        try:
+            row = self.store.get(key)
+            if (row['issue_attempted'] or row['human_exposed'] or row['issuance_seen'] or row['uuid']
+                    or self.store.checked_preparation(key)):
+                return False
+            link = await (await self.action_control(page, action, receipt)).evaluate(PLAIN_LINK)
+            href = link.get('href') if isinstance(link, dict) else None
+            if not isinstance(href, str) or not public_portal_origin(href):
+                return False
+            if not (allowed_url(href, receipt.provider, receipt.portal_url, self._extra()) or billing_destination(href)):
+                return False
+            # A portal where this person already has an account may know what to invoice without being told.
+            origins = {public_portal_origin(page.url), getattr(accounts, 'origin', None)} - {None}
+            if any(read_json(credential_file(self.store.root, origin, profile.email), None) for origin in origins):
+                return False
+            state = await self.page_state(page, receipt)
+        except (KeyError, ValueError, OSError, BrowserError, AttributeError, TypeError):
+            return False
+        if not isinstance(state.get('text'), str) or any(item.get('filled') for item in state['items']):
+            return False
+        return not (self.identifies(unquote(href), profile, receipt)
+                    or self.shows_ticket_or_recipient(state['text'], profile, receipt))
+
+    async def late_fiscal_choices(self, key: str, page, profile: Profile, receipt: Receipt) -> list[str]:
+        """Give fiscal lists that load late a few seconds, choosing each one as it arrives.
+
+        Nothing else on the page is touched. Returns what the portal still does not reflect
+        when the time is up; an empty list when régimen, uso and forma de pago all match.
+        """
+        self.store.running_message(key, 'Esperando a que el portal cargue sus listas fiscales.')
+        deadline = time.monotonic() + FISCAL_WAIT
+        while True:
+            await asyncio.sleep(FISCAL_POLL)
+            changed, pending = await fiscal_choices(page, profile, receipt, apply=True, extra=self._extra())
+            if changed:
+                # Choosing one list may bring or change another: it is looked at again.
+                self.captured.add(key)
+                self.store.event(key, 'campo_verificado', 'Selección cotejada: ' + FISCAL_FIELDS[changed])
+            elif not pending:
+                return []
+            if time.monotonic() >= deadline:
+                if changed:
+                    _, pending = await fiscal_choices(page, profile, receipt, extra=self._extra())
+                return pending
 
     async def use_tool(self, key: str, page, action: Action, receipt: Receipt, ai: AI, after_issue: bool):
         """Run one of the agent's own tools. Returns (result for the model, ticket images, error)."""
@@ -1608,6 +1772,7 @@ class Runner:
                 self.job_origins.pop(key, None)
                 self.session_hints.pop(key, None)
                 self.soft_submitted.discard(key)
+                self.captured.discard(key)
                 self.live_notes.pop(key, None)
                 for record in (self.pauses, self.handled, self.told, self.asked, self.insisted, self.meters):
                     record.pop(key, None)
@@ -1701,6 +1866,7 @@ class Runner:
         plan_failures = 0
         done_refusals = 0
         attachment_tries = 0
+        fiscal_waits = 0
         stalled_hints = 0
         failures: dict[str, int] = {}
         idle_steps = 0
@@ -1738,12 +1904,17 @@ class Runner:
                 answer_note = signal.note
             if signal.active:
                 idle_steps = 0
+            if signal.then == OBSERVE or signal.action is not None:
+                self.captured.add(key)  # The complement did something of its own on the portal.
             return signal.then
 
         unbound_press_count = 0
+        # A code the portal sends to the person's phone is asked for in the chat as a secret: it
+        # is typed in the portal and kept nowhere (see ask_chat and the chat's side of it).
         accounts = PortalAccountFlow(self.store.root, provider['url'], profile, key,
                                      progress=lambda message: self.store.running_message(key, message),
-                                     ai=ai, medidor=meter, ticket=receipt)
+                                     ai=ai, medidor=meter, ticket=receipt,
+                                     pedir_codigo=lambda texto: self.ask_chat(key, texto, secreto=True))
         for number in range(MAX_STEPS):
             own = None             # the complement's own next action for this pass, when it has one
             page = self.viewer.page
@@ -1787,16 +1958,20 @@ class Runner:
                 account_step = await accounts.step(page, snapshot, challenge)
                 if account_step:
                     kind, message = account_step
+                    self.captured.add(key)
                     course.drop()
                     if kind == 'advanced':
                         self.store.event(key, 'portal_account', message)
                     else:
                         await self.human(key, page, kind, message)
                     continue
-            if challenge == 'attachment' and attachment_tries < 2 and not committed and not issued:
-                attachment_tries += 1
-                last_error = ('El portal exige un archivo. Si pide la foto o el PDF del ticket, usa upload con '
-                              'value="ticket" sobre el campo o botón del archivo. Si pide otro documento, usa human.')
+            attachment_hint = ''
+            if challenge == 'attachment' and attachment_tries < ATTACHMENT_HINTS and not committed and not issued:
+                # The portal wants a file and the agent may still attach the ticket by itself: a
+                # remembered recipe does it without asking, and the model is told how each time it is
+                # consulted. A try is spent only when the hint really travels to the model.
+                attachment_hint = ('El portal exige un archivo. Si pide la foto o el PDF del ticket, usa upload con '
+                                   'value="ticket" sobre el campo o botón del archivo. Si pide otro documento, usa human.')
                 challenge = None
             if challenge:
                 message = {'captcha': 'Completa la verificación en este navegador.',
@@ -1820,6 +1995,7 @@ class Runner:
                 changed, pending_fields = await fiscal_choices(page, profile, receipt, apply=True, extra=self._extra())
                 pending_fields = [*signal.pending, *pending_fields]
                 if changed:
+                    self.captured.add(key)
                     self.store.event(key, 'campo_verificado', 'Selección cotejada: ' + FISCAL_FIELDS[changed])
                     continue
                 then = take(await complement.after_fiscal_choices(view))
@@ -1832,6 +2008,7 @@ class Runner:
                 except BrowserError:
                     lookup_field = None
                 if lookup_field:
+                    self.captured.add(key)
                     self.store.event(key, 'campo_verificado', 'Dato del ticket cotejado: ' + lookup_field)
                     continue
                 then = take(await complement.after_ticket_lookup(view))
@@ -1936,7 +2113,8 @@ class Runner:
                                       'consultas': meter.ai_calls, 'consultas_maximas': MAX_AI_CALLS,
                                       'emision_intentada': committed, 'emision_visible': issued,
                                       'tus_notas': agent_notes, 'acciones_recientes': recent[-15:],
-                                      'ultimo_error': last_error, 'resultado_herramienta': tool_result,
+                                      'ultimo_error': ' '.join(filter(None, (last_error, attachment_hint))),
+                                      'resultado_herramienta': tool_result,
                                       'campos_fiscales_pendientes': pending_fields,
                                       'campos': fields[:120], 'respuesta_del_titular': answer_note,
                                       'mensajes_del_titular': self.live_notes.get(key, []),
@@ -1949,6 +2127,8 @@ class Runner:
                     latest = await page.locator('body').aria_snapshot()
                     if (latest != snapshot or await visible_challenge(page, latest) or self.viewer.page is not page or
                             not allowed_url(page.url, receipt.provider, receipt.portal_url, self._extra())):
+                        if attachment_hint:
+                            attachment_tries += 1  # Nobody here can attach it: the pause comes as it always did.
                         continue
                     action = own
                 elif not course.steps:
@@ -1967,11 +2147,17 @@ class Runner:
                     # A portal may render a verification challenge while producing its frame.
                     # Discard both observations and reclassify the current page before sharing.
                     latest = await page.locator('body').aria_snapshot()
-                    if (latest != snapshot or accounts.private_observation(latest) or await visible_challenge(page, latest) or
+                    gate = await visible_challenge(page, latest)
+                    # The file the portal still asks for is no reason to hide the page while the agent
+                    # may attach the ticket: the hint has to reach the model with this observation.
+                    if (latest != snapshot or accounts.private_observation(latest)
+                            or (gate and not (gate == 'attachment' and attachment_hint)) or
                             self.viewer.page is not page or not allowed_url(page.url, receipt.provider, receipt.portal_url, self._extra())):
                         continue
+                    if attachment_hint:
+                        attachment_tries += 1
                     # Ordinary steps think briefly; a step after an error or without progress thinks harder.
-                    effort = 'high' if (last_error or idle_steps >= 3 or ticket_view) else 'medium'
+                    effort = 'high' if (last_error or attachment_hint or idle_steps >= 3 or ticket_view) else 'medium'
                     meter.ai_calls += 1
                     # One consultation decides the whole screen: every safe action it can settle now.
                     plan = await asyncio.to_thread(PLAN_SCREEN, ai, instructions, observation, image, ticket_view,
@@ -2100,9 +2286,12 @@ class Runner:
                     meter.actions += 1
                     acted_on = screen
                     if action.kind == 'upload':
+                        self.captured.add(key)
                         learner.step(screen, action, entry.field if entry else None, 'normal', entry.source if entry else 'ia')
                         if entry is not None and entry.source == 'memoria':
                             meter.replayed += 1
+                            # Nobody asked the model for this: its result must not hold the memory back later.
+                            tool_result = ''
                             if entry.last:
                                 learner.replay_done(entry.screen)
                     else:
@@ -2111,12 +2300,18 @@ class Runner:
                     learner.replay_failed(entry.screen)
                     course.drop()
                 label = action.value or (action.target.name if action.target else '')
-                recent.append({'tipo': action.kind, 'control': label[:120]})
+                recent.append({'tipo': action.kind, 'control': label[:120],
+                               **({'origen': 'memoria'} if entry is not None and entry.source == 'memoria' else {})})
                 self.store.event(key, 'tool', action.kind + ' · ' + (action.reason or '')[:120])
                 continue
             tool_streak = 0
             risk = action_risk(action)
             name = action.target.name if action.target else ''
+            if (risk == 'issue' and not committed and not issued
+                    and not (entry is not None and entry.source == 'ia' and entry.index)
+                    and await self.navigation_link(key, page, located, profile, receipt, accounts)):
+                # A link of the portal's first pages that only leads to its form: followed like any other.
+                risk = 'normal'
             view.act(action, name, not committed and not issued)
             # The portal's own meaning of this control may raise the risk or lower it.
             risk = complement.adjust_risk(view, risk)
@@ -2237,6 +2432,17 @@ class Runner:
                 if then == OBSERVE:
                     continue
                 _, pending_fields = await fiscal_choices(page, profile, receipt, extra=self._extra())
+                if pending_fields and fiscal_waits < FISCAL_WAITS:
+                    # The lists may still be loading, whoever decided this step. They get a few
+                    # seconds and are chosen as they arrive, before anybody is asked.
+                    fiscal_waits += 1
+                    pending_fields = await self.late_fiscal_choices(key, page, profile, receipt)
+                    if not pending_fields:
+                        # The form is not the one this step was decided for: it runs again, whole,
+                        # from a fresh reading of the page.
+                        if entry is not None:
+                            course.steps.appendleft(entry)
+                        continue
                 if pending_fields:
                     last_error = 'Antes de emitir, el portal debe reflejar ' + ', '.join(pending_fields) + '.'
                     await self.human(key, page, 'blocked', last_error)
@@ -2311,6 +2517,8 @@ class Runner:
                         raise ValueError('El campo planeado ya no está en la pantalla. Lee de nuevo el formulario.')
                     located = located.model_copy(update={
                         'target': Target(by='field', name=str(position), role=None, exact=True)})
+                if action.kind in {'fill', 'select', 'goto'}:
+                    self.captured.add(key)  # From here on the portal may hold something of this ticket.
                 await self.execute(page, located, receipt)
                 await complement.after_acting(view)
                 last_error = ''

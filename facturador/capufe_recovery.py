@@ -7,6 +7,7 @@ import os
 import re
 import time
 import unicodedata
+from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlsplit
 
 from playwright.async_api import Error as BrowserError, TimeoutError as BrowserTimeout, async_playwright
@@ -145,7 +146,51 @@ async def _lookup(page, code):
     return files if response.ok else {}, bool(response.ok and negative), note
 
 
-async def recover_capufe(store, key, receipt, profile):
+# Each code is looked up in a context of its own, with nothing of the engine's profile in it.
+CONTEXT = {'service_workers': 'block', 'accept_downloads': False}
+ENGINES = {'Chromium', 'Google Chrome'}
+
+
+async def _engine_browser(runner):
+    """The engine's own browser when it can open private contexts beside its profile; else None."""
+    if runner is None:
+        return None
+    try:
+        await runner.start_browser()
+        browser = getattr(runner.context, 'browser', None) if runner.engine in ENGINES else None
+        if browser is not None:
+            # Proves it before any code is typed: a browser that refuses is simply not used.
+            await (await browser.new_context(**CONTEXT)).close()
+        return browser
+    except (BrowserError, ValueError, OSError):
+        return None
+
+
+@asynccontextmanager
+async def _lookup_browser(runner=None):
+    """The browser the lookup opens its contexts in.
+
+    With the engine at hand it is the engine's own browser: the place it holds among the open
+    browsers is already counted, and no second browser is started beside it. Without the engine,
+    or when its browser cannot give a private context, one is launched for the lookup alone and
+    closed with it, as it always was.
+    """
+    browser = await _engine_browser(runner)
+    if browser is not None:
+        yield browser
+        return
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            executable_path=os.getenv('FACTURADOR_CHROMIUM_PATH') or None,
+            headless=os.getenv('FACTURADOR_CHROME_HEADED') != '1', chromium_sandbox=True)
+        try:
+            yield browser
+        finally:
+            await browser.close()
+
+
+async def recover_capufe(store, key, receipt, profile, runner=None):
+    """``runner`` is the engine that asks; its browser hosts the lookup when it can (see ``_lookup_browser``)."""
     codes = list(dict.fromkeys(re.sub(r'\s+', '', c).upper() for c in receipt.billing_codes))
     if receipt.provider != 'capufe' or not 1 <= len(codes) <= 20 or not all(re.fullmatch('[0-9A-Z]{18}', c) for c in codes):
         return 'La consulta de CAPUFE necesita el código impreso de 18 caracteres de cada peaje.'
@@ -160,25 +205,19 @@ async def recover_capufe(store, key, receipt, profile):
     received = set()
     last_note = ''
     try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                executable_path=os.getenv('FACTURADOR_CHROMIUM_PATH') or None,
-                headless=os.getenv('FACTURADOR_CHROME_HEADED') != '1', chromium_sandbox=True)
-            try:
-                for code in codes:
-                    context = await browser.new_context(service_workers='block', accept_downloads=False)
-                    try:
-                        files, not_billed, last_note = await _lookup(await context.new_page(), code)
-                        if last_note:
-                            store.event(key, 'capufe_lookup', last_note)
-                        for kind, data in files.items():
-                            await asyncio.to_thread(save_candidate, store, key, 'capufe.' + kind, data)
-                            received.add(kind.upper())
-                        absent += int(not_billed)
-                    finally:
-                        await context.close()
-            finally:
-                await browser.close()
+        async with _lookup_browser(runner) as browser:
+            for code in codes:
+                context = await browser.new_context(**CONTEXT)
+                try:
+                    files, not_billed, last_note = await _lookup(await context.new_page(), code)
+                    if last_note:
+                        store.event(key, 'capufe_lookup', last_note)
+                    for kind, data in files.items():
+                        await asyncio.to_thread(save_candidate, store, key, 'capufe.' + kind, data)
+                        received.add(kind.upper())
+                    absent += int(not_billed)
+                finally:
+                    await context.close()
     except ServiceWait as exc:
         until = int(time.time()) + exc.seconds + 1
         write_private(cooldown, {'until': until})

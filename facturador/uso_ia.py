@@ -25,6 +25,7 @@ TAREAS = {'leer_ticket', 'buscar_portal', 'paso_portal', 'investigar', 'constanc
           'otra'}
 # Output types already used by the program, so the task is known without touching any caller.
 TAREA_POR_TIPO = {'Extraction': 'leer_ticket', 'PortalSearch': 'buscar_portal', 'Action': 'paso_portal',
+                  'Plan': 'paso_portal', 'RegistrationPlan': 'paso_portal',
                   'WebAnswer': 'investigar', 'TaxProfileExtraction': 'constancia', 'ChatDecision': 'chat',
                   'ChatAnswer': 'chat', 'BotTurn': 'whatsapp'}
 TICKET = re.compile(r'[\w-]{1,160}')

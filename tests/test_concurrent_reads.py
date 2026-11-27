@@ -177,21 +177,28 @@ class ConcurrentReadTests(unittest.IsolatedAsyncioTestCase):
     async def test_three_slow_reads_overlap_and_one_failure_does_not_stop_the_others(self):
         tickets = [self.chat_ticket(color) for color in ('red', 'green', 'blue')]
         failing = tickets[1][1]
+        # Each read stays inside the model until the three of them are there at the same time. That
+        # they overlap is proved by all of them getting out, not by how long the whole thing took:
+        # read one after another, the first would wait for company that never comes.
+        together = threading.Barrier(3)
+        overlapped = []
 
         def slow(path, _catalog, _companions, **_):
-            time.sleep(0.5)
+            try:
+                together.wait(20)
+                overlapped.append(path)
+            except threading.BrokenBarrierError:
+                pass
             if path == failing:
                 raise RuntimeError('lectura rota')
             return extraction(ticket_number='FOLIO-' + path.stem[:8])
 
         with patch('facturador.automation.AI.extract', side_effect=slow) as extract, \
              patch('facturador.automation.local_ticket', side_effect=unread_locally):
-            started = time.monotonic()
             self.worker.start()
-            await self.until(lambda: self.finished([key for key, _ in tickets]))
-            elapsed = time.monotonic() - started
+            await self.until(lambda: self.finished([key for key, _ in tickets]), 60)
         self.assertEqual(extract.call_count, 3)
-        self.assertLess(elapsed, 1.2)
+        self.assertEqual(sorted(overlapped), sorted(path for _, path in tickets))
         statuses = {key: self.store.get(key)['status'] for key, _ in tickets}
         self.assertEqual(statuses[tickets[1][0]], 'review')
         self.assertIn('No se pudo completar la lectura', self.store.get(tickets[1][0])['message'])
@@ -201,19 +208,31 @@ class ConcurrentReadTests(unittest.IsolatedAsyncioTestCase):
     async def test_queue_never_reads_more_than_the_limit_at_once(self):
         tickets = [self.chat_ticket(color) for color in ('red', 'green', 'blue', 'yellow', 'black')]
         active, peak, lock = [0], [0], threading.Lock()
+        # The readings stay inside the model until the test lets them out, so how many overlap
+        # does not depend on how fast this machine starts each one.
+        full, leave = threading.Event(), threading.Event()
+        self.addCleanup(leave.set)
 
         def slow(path, _catalog, _companions, **_):
             with lock:
                 active[0] += 1
                 peak[0] = max(peak[0], active[0])
-            time.sleep(0.2)
+                if active[0] >= MAX_PARALLEL_READS:
+                    full.set()
+            leave.wait(30)
             with lock:
                 active[0] -= 1
             return extraction(ticket_number='FOLIO-' + path.stem[:8])
 
         with patch('facturador.automation.AI.extract', side_effect=slow) as extract:
             self.worker.start()
-            await self.until(lambda: self.finished([key for key, _ in tickets]))
+            # The queue takes every place it has...
+            self.assertTrue(await asyncio.to_thread(full.wait, 30))
+            # ...and with all of them taken it starts nothing else, however long those readings last.
+            await asyncio.sleep(0.5)
+            self.assertEqual((active[0], extract.call_count), (MAX_PARALLEL_READS, MAX_PARALLEL_READS))
+            leave.set()
+            await self.until(lambda: self.finished([key for key, _ in tickets]), 60)
         self.assertEqual(extract.call_count, 5)
         self.assertEqual(peak[0], MAX_PARALLEL_READS)
 
@@ -278,6 +297,7 @@ class ConcurrentReadTests(unittest.IsolatedAsyncioTestCase):
             if web_search:
                 searching.set()
                 release.wait(5)
+                time.sleep(.02)  # A search this fast would round down to 0 ms on a quick machine.
                 return PortalSearch(billing_url=None, evidence_url=None), []
             return extraction(provider='unknown', merchant='Cafetería de prueba')
 
@@ -366,7 +386,12 @@ class ConcurrentReadTests(unittest.IsolatedAsyncioTestCase):
 class ParallelPairingTests(unittest.IsolatedAsyncioTestCase):
     """Front and back of one upload, read in parallel, pair exactly as when read one by one."""
 
-    async def scenario(self, delays):
+    async def scenario(self, order):
+        """Read the three images of one upload at once and let their readings end in ``order``.
+
+        Each group of ``order`` ends together and before the next one starts ending. Events decide
+        the order, not sleeps, so a busy machine cannot change which reading ends first.
+        """
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         store = Store(Path(folder.name))
@@ -379,14 +404,20 @@ class ParallelPairingTests(unittest.IsolatedAsyncioTestCase):
                 for name, color in (('frente', 'red'), ('reverso', 'blue'), ('otro', 'green'))}
         paths = {Path(store.get(key)['source_path']): name for name, key in keys.items()}
         seen, active, peak, lock = [], [0], [0], threading.Lock()
+        entered = {name: threading.Event() for name in keys}
+        leave = {name: threading.Event() for name in keys}
+        self.addCleanup(lambda: [event.set() for event in leave.values()])
 
         def read(path, _catalog, companions, **_):
             name = paths[path]
             with lock:
                 seen.append((name, [paths[extra] for extra in companions]))
+                first = not entered[name].is_set()  # The front is read once more, later, with its back.
                 active[0] += 1
                 peak[0] = max(peak[0], active[0])
-            time.sleep(delays[name])
+            if first:
+                entered[name].set()
+                leave[name].wait(30)
             with lock:
                 active[0] -= 1
             fields = dict(provider='vianney', merchant='Vianney Textil Hogar', ticket_number='TEST-101',
@@ -402,7 +433,16 @@ class ParallelPairingTests(unittest.IsolatedAsyncioTestCase):
              patch('facturador.automation.read_local_page', return_value={'text': 'Vianney facturación'}), \
              patch('facturador.automation.portal_evidence', return_value=([], [])):
             worker.start()
-            deadline = time.monotonic() + 8
+            # The three readings are inside the model at the same time before any of them may end.
+            for name in keys:
+                self.assertTrue(await asyncio.to_thread(entered[name].wait, 30), (name, seen))
+            first_reads = {name: worker.reads[key] for name, key in keys.items()}
+            for group in order:
+                for name in group:
+                    leave[name].set()
+                # Its result is saved and paired before the next reading is allowed to end.
+                await asyncio.wait_for(asyncio.gather(*(first_reads[name] for name in group)), 30)
+            deadline = time.monotonic() + 30
             while not (('frente', ['reverso']) in seen and not worker.reads):
                 self.assertLess(time.monotonic(), deadline, seen)
                 await asyncio.sleep(0.01)
@@ -411,11 +451,11 @@ class ParallelPairingTests(unittest.IsolatedAsyncioTestCase):
         return store, keys, seen, peak[0]
 
     async def test_back_joins_front_whatever_finishes_first(self):
-        for delays in ({'frente': 0.3, 'reverso': 0.05, 'otro': 0.15},
-                       {'frente': 0.05, 'reverso': 0.3, 'otro': 0.15},
-                       {'frente': 0.15, 'reverso': 0.15, 'otro': 0.15}):
-            with self.subTest(delays=delays):
-                store, keys, seen, peak = await self.scenario(delays)
+        for order in ([['reverso'], ['otro'], ['frente']],
+                      [['frente'], ['otro'], ['reverso']],
+                      [['frente', 'reverso', 'otro']]):
+            with self.subTest(order=order):
+                store, keys, seen, peak = await self.scenario(order)
                 self.assertGreaterEqual(peak, 2)  # They really were read at the same time.
                 self.assertEqual(store.get(keys['reverso'])['status'], 'attached')
                 self.assertEqual(store.get(keys['reverso'])['companion_of'], keys['frente'])

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from correo_dobles import FakeImap, trusted_context
 from facturador import buzon
-from facturador.portal_mail import authenticated_by, gmail_authenticated, registration_email
+from facturador.portal_mail import authenticated_by, gmail_authenticated, mail_domain, registration_email
 
 ORIGIN = 'https://factura.comercio.example.com'
 HOST = 'factura.comercio.example.com'
@@ -109,7 +109,8 @@ class GmailRegistrationTests(unittest.TestCase):
                 value = registration_email(root, ORIGIN, USER, started, 'activate', search=search,
                                            read=lambda _, key: msg)
                 self.assertEqual(value, expected)
-                self.assertEqual(queries, [f'to:{USER} from:({HOST}) after:{int(started)} -in:spam -in:trash'])
+                # The sender is narrowed to the registrable domain where the suffix list is installed, else to the host.
+                self.assertEqual(queries, [f'to:{USER} from:({mail_domain(HOST)}) after:{int(started)} -in:spam -in:trash'])
 
     def test_no_mailbox_keeps_the_former_error(self):
         with tempfile.TemporaryDirectory() as folder, self.assertRaises(ValueError) as caught:
