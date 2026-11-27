@@ -7,6 +7,12 @@
   <title>FACTURAI</title>
   <link rel="stylesheet" href="/style.css">
   <script type="module" src="/app.js"></script>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icono-180.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <link rel="stylesheet" href="/avisos.css">
+  <script type="module" src="/avisos.js"></script>
 </head>
 <body>
   <aside class="sidebar" aria-label="Menú principal">
@@ -30,7 +36,7 @@
     </section>
 
     <section class="screen chat-screen" id="screen-chat" aria-labelledby="chat-title">
-      <header class="chat-header"><h1 id="chat-title">FACTURAI</h1><a href="#ajustes" class="chat-settings" aria-label="Ajustes">Ajustes</a></header>
+      <header class="chat-header"><h1 id="chat-title">FACTURAI</h1><span class="avisos-cabecera"><span id="avisos-lugar"></span><a href="#ajustes" class="chat-settings" aria-label="Ajustes">Ajustes</a></span></header>
       <div class="chat-content">
         <div id="chat-thread" class="chat-thread" role="log" aria-live="polite" aria-label="Conversación"></div>
         <section id="chat-progress" class="chat-progress" aria-label="Actividad del trámite" hidden>

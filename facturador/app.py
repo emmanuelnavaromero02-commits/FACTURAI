@@ -49,6 +49,11 @@ from .portal_discovery import review_links
 from .portal_mail import portal_mail_router
 from .viewer import ViewerBatch, ViewerInput
 from .whatsapp import whatsapp_router
+from .avisos import Avisos
+from .avisos_rutas import avisos_router, piezas_router
+from .avisos_vigilante import VigilanteAvisos
+from .permisos_rutas import permisos_router
+from .registro_datos import registro_router
 
 BASE = Path(__file__).resolve().parent.parent
 STATIC_FILES = ('app.js', 'chat.js', 'style.css', 'visor.js', 'navegacion.js', 'cuentas-portal.js', 'correo-portal.js',
@@ -185,8 +190,10 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
             wa_routes.watcher.start()
             automation.start()
             mail_recovery.start()
+            avisos_watcher.start()
             yield
         finally:
+            await avisos_watcher.close()
             await mail_recovery.close()
             await automation.close()
             await wa_routes.watcher.close()
@@ -247,6 +254,14 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     app.include_router(correo_router(root, store, profile))
     app.include_router(ia_router(root, plan))
     app.include_router(medicion_router(store))
+    # Notices to the owner (browser push, own mail, bell) and the watcher that raises them once per change.
+    avisos = Avisos(store, panel_url=f'http://127.0.0.1:{port}')
+    avisos_watcher = VigilanteAvisos(store, avisos, whatsapp=lambda: app.state.whatsapp)
+    app.state.avisos = avisos
+    app.include_router(avisos_router(store, avisos))
+    app.include_router(permisos_router(store))
+    app.include_router(registro_router(root))
+    app.include_router(piezas_router(BASE / 'web'))
 
     @app.exception_handler(ValueError)
     async def invalid(request, exc):

@@ -1,0 +1,31 @@
+/* Notices: bell, list and the settings cards. Loaded by avisos.js. */
+.avisos-cabecera { display: inline-flex; align-items: center; gap: 6px; }
+.avisos-campana { position: relative; display: inline-grid; place-items: center; width: 38px; height: 38px; padding: 0;
+  border: 0; border-radius: 10px; background: transparent; color: var(--muted, #5d6c65); cursor: pointer; }
+.avisos-campana:hover, .avisos-campana:focus-visible { color: var(--green, #116044); background: #eaf2ec; }
+.avisos-campana svg { width: 21px; height: 21px; }
+.avisos-campana.flotante { position: fixed; top: 10px; right: 12px; z-index: 30; background: #fff;
+  border: 1px solid var(--line, #dce5de); box-shadow: 0 4px 14px rgba(20, 42, 35, .08); }
+.avisos-contador { position: absolute; top: 3px; right: 2px; min-width: 17px; height: 17px; padding: 0 4px;
+  border-radius: 999px; background: var(--danger, #964034); color: #fff; font-size: 10px; font-weight: 700;
+  line-height: 17px; text-align: center; }
+.avisos-lista { display: grid; gap: 8px; max-height: min(62vh, 520px); overflow: auto; margin: 0; padding: 0; list-style: none; }
+.avisos-lista li { display: grid; gap: 2px; padding: 11px 13px; border: 1px solid var(--line, #dce5de); border-radius: 10px; background: #fff; }
+.avisos-lista li.sin-leer { border-left: 3px solid var(--green, #116044); background: #f3f8f4; }
+.avisos-lista a { color: var(--ink, #182b26); text-decoration: none; display: grid; gap: 2px; }
+.avisos-lista a:hover strong, .avisos-lista a:focus-visible strong { color: var(--green, #116044); text-decoration: underline; }
+.avisos-lista small { color: var(--muted, #5d6c65); font-size: 11px; }
+.avisos-vacio { color: var(--muted, #5d6c65); font-size: 14px; padding: 18px 4px; text-align: center; }
+.avisos-ayuda { padding: 10px 12px; border-left: 3px solid #c2a261; background: var(--sand, #fbefd4); border-radius: 4px; font-size: 13px; line-height: 1.5; }
+.avisos-ayuda[hidden] { display: none; }
+.avisos-grupo { display: grid; gap: 8px; margin: 14px 0 0; padding: 0; border: 0; min-width: 0; }
+.avisos-grupo legend { margin-bottom: 6px; font-size: 13px; font-weight: 700; }
+.avisos-dispositivos { display: grid; gap: 6px; margin: 8px 0 0; padding: 0; list-style: none; font-size: 13px; }
+.avisos-dispositivos li { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.avisos-grupo .check-row small { display: block; color: var(--muted, #5d6c65); font-size: 11px; font-weight: 400; }
+/* Without a slot in the page the bell floats; the headers leave room for it. */
+.avisos-campana.flotante ~ main .chat-header, .avisos-campana.flotante ~ main .screen-header { padding-right: 52px; }
+tr.aviso-destacado, tr.aviso-destacado td { background: #fff6dc !important; transition: background .4s; }
+@media (max-width: 710px) {
+  .avisos-campana.flotante { top: 6px; right: 8px; }
+}

@@ -12,3 +12,4 @@ pillow-heif>=1.1,<2
 pypdf>=6.7,<7
 pypdfium2>=5.3,<6
 zxing-cpp>=3.0,<4
+pywebpush>=2.0,<3
