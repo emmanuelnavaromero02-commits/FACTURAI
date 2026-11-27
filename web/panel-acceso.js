@@ -10,7 +10,8 @@ if (settings) settings.append(link);
 else document.querySelector('.chat-header')?.append(link);
 
 // Behind the entrance these two personal connections are not offered: the product's own AI
-// and a mailbox by IMAP take their place, so their cards stay out of sight.
+// and a mailbox by IMAP take their place, so their cards stay out of sight. The Gmail one comes
+// back (app.js shows it) only when the installation has its own Google client.
 for (const id of ['pod-connect', 'gmail-configure']) {
   const card = document.getElementById(id)?.closest('section.settings-card');
   if (card) card.hidden = true;

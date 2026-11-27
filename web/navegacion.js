@@ -92,7 +92,11 @@ export function installGoogleAccount({api, perform}) {
     }
   }
   account.onclick = () => {
-    if (byId('gmail-connect').disabled) {
+    if (byId('gmail-connect').disabled && byId('gmail-configure').hidden) {
+      // The installation brings its own Google client and it cannot be used: the card says why.
+      location.hash = 'ajustes';
+      message(byId('gmail-help').textContent, true);
+    } else if (byId('gmail-connect').disabled) {
       settings(byId('gmail-configure'));
       message('Para que FACTURAI lea códigos y facturas, importa el cliente OAuth de escritorio y pulsa Conectar Gmail.');
     } else if (!byId('gmail-disconnect').hidden) {

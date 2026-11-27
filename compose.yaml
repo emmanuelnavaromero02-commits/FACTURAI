@@ -41,8 +41,15 @@ services:
     #u   # Opcional: identificador de la aplicación registrada en Microsoft, para que cada persona
     #u   # conecte su Outlook o Hotmail con solo pulsar «Conectar Outlook» (ver README).
     #u   # FACTURADOR_OUTLOOK_APLICACION: 00000000-0000-0000-0000-000000000000
+    #u   # Opcional: cliente OAuth de Google («Aplicación web») de toda la instalación, para que cada
+    #u   # persona conecte su Gmail con solo pulsar «Conectar Gmail» (ver README). El JSON lleva el
+    #u   # secreto del cliente: guárdalo junto a la llave maestra, fuera del volumen de datos, con
+    #u   # los mismos permisos (chown 10001, chmod 400), y quita también el «# » de las tres
+    #u   # líneas del secreto «cliente_google» de más abajo.
+    #u   # FACTURADOR_GMAIL_CLIENTE: /run/secrets/cliente_google
     #u secrets:
     #u   - llave_maestra
+    #u   # - cliente_google
 
   # Proxy con TLS: el único servicio que abre puertos hacia fuera (80 y 443).
   #u proxy:
@@ -61,6 +68,8 @@ services:
 #u secrets:
 #u   llave_maestra:
 #u     file: ../facturai-llave/llave-maestra.key
+#u   # cliente_google:
+#u   #   file: ../facturai-llave/cliente-google.json
 
 volumes:
   expedientes:

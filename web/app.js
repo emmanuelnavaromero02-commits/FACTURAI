@@ -949,6 +949,11 @@ function renderBrowser() {
   target.append(actions);
 }
 
+const gmailCard = $('gmail-configure').closest('section.settings-card');
+const gmailImport = $('gmail-help').textContent;
+const gmailShared = 'Pulsa Conectar Gmail. Google te pedirá en otra pestaña que autorices a FACTURAI a leer el buzón. ' +
+  'Mantén abierto FACTURAI hasta regresar.';
+
 function renderSettings() {
   $('read-csf').disabled = state.plan.status !== 'ready';
   $('restart-browser').disabled = Boolean(state.active_job);
@@ -979,7 +984,14 @@ function renderSettings() {
   $('plan-card-description').textContent = plan.status === 'ready' ? 'La lectura y la navegación usan tu conexión de IA.' :
     planMessage || 'Conecta la IA para leer tickets y preparar los portales.';
   $('plan-card-link').textContent = plan.status === 'ready' ? 'Administrar conexión →' : 'Conectar →';
-  $('gmail-status').textContent = state.gmail === 'connected' ? 'Conectado' : state.gmail === 'configured' ? 'Listo para vincular' : 'Por configurar';
+  // How Gmail is offered: with a client the person imports, with the one of the installation, or not at all.
+  const setup = state.gmail_setup || {mode: 'import', notice: ''};
+  // Behind the entrance the add-on hides this card; a Google client of the installation brings it back.
+  if (state.gmail_setup) gmailCard.hidden = setup.mode === 'none';
+  $('gmail-configure').hidden = setup.mode === 'shared' || setup.mode === 'broken';
+  $('gmail-help').textContent = setup.mode === 'shared' ? gmailShared : setup.mode === 'broken' ? setup.notice : gmailImport;
+  $('gmail-status').textContent = state.gmail === 'connected' ? 'Conectado' : state.gmail === 'configured' ? 'Listo para vincular' :
+    setup.mode === 'broken' ? 'No disponible' : 'Por configurar';
   $('gmail-connect').disabled = state.gmail === 'disconnected';
   $('gmail-connect').textContent = state.gmail === 'connected' ? 'Vincular otra cuenta' : 'Conectar Gmail';
   $('gmail-disconnect').hidden = state.gmail !== 'connected';
@@ -1393,25 +1405,54 @@ window.addEventListener('hashchange', () => {
   }
   openScreen();
 });
+
+// Behind the entrance for several customers Google's answer arrives after «#», brought by the return page.
+// Anything else there is the name of a screen.
+function googleAnswer() {
+  const values = new URLSearchParams(location.hash.slice(1));
+  const sent = values.get('state') || '';
+  if (!sent.startsWith('gmail-') || !(values.has('code') || values.has('error'))) return null;
+  return {estado: sent, codigo: values.get('code') || '', error: values.get('error') || ''};
+}
+
+// How connecting Gmail went, said in the tab that came back from Google. ``hosted``: the person cannot
+// look at the Google client, because it belongs to whoever runs the service.
+function gmailOutcome(outcome, reason, hosted = false) {
+  viewer.gmail.notifyReturn(outcome);
+  const problems = {
+    caducado: 'El enlace de Google caducó. Pulsa Conectar Gmail para obtener uno nuevo.',
+    consentimiento: 'La autorización se canceló. Puedes volver a conectar Gmail cuando estés listo.',
+    intercambio: hosted ? 'Google no completó la conexión. Vuelve a conectar Gmail; si se repite, avisa a quien administra FACTURAI.' :
+      'Google no completó la conexión. Comprueba que el cliente OAuth de escritorio sea correcto y vuelve a conectar Gmail.',
+    permiso: 'Faltó el permiso de lectura. Vuelve a conectar Gmail y autoriza la lectura del buzón.',
+    'sin-renovacion': 'Google no concedió acceso continuo. Vuelve a conectar Gmail y confirma el permiso.',
+    buzon: 'FACTURAI no pudo comprobar el buzón. Revisa que Gmail esté habilitado para esa cuenta y vuelve a conectar.'
+  };
+  if (outcome === 'gmail-ok') notify('Gmail vinculado. Puedes cerrar esta pestaña y volver a la pestaña original de FACTURAI.');
+  else notify(problems[reason] || 'La conexión con Gmail no se completó. Vuelve a la pestaña original de FACTURAI e inténtalo de nuevo.', true);
+}
+
+// Read before anything else looks at the address, and taken out of it at once.
+// «history» alone is this module's list of older tickets, so the browser's own is named in full.
+const googleReturn = googleAnswer();
+if (googleReturn) window.history.replaceState(null, '', location.pathname + location.search + '#ajustes');
 openScreen();
 const connectionParams = new URLSearchParams(location.search);
 const outcome = connectionParams.get('conexion');
 if (outcome) {
-  history.replaceState(null, '', '/#ajustes');
-  if (outcome === 'gmail-ok' || outcome === 'gmail-error') {
-    viewer.gmail.notifyReturn(outcome);
-    const problems = {
-      caducado: 'El enlace de Google caducó. Pulsa Conectar Gmail para obtener uno nuevo.',
-      consentimiento: 'La autorización se canceló. Puedes volver a conectar Gmail cuando estés listo.',
-      intercambio: 'Google no completó la conexión. Comprueba que el cliente OAuth de escritorio sea correcto y vuelve a conectar Gmail.',
-      permiso: 'Faltó el permiso de lectura. Vuelve a conectar Gmail y autoriza la lectura del buzón.',
-      'sin-renovacion': 'Google no concedió acceso continuo. Vuelve a conectar Gmail y confirma el permiso.',
-      buzon: 'FACTURAI no pudo comprobar el buzón. Revisa que Gmail esté habilitado para esa cuenta y vuelve a conectar.'
-    };
-    if (outcome === 'gmail-ok') notify('Gmail vinculado. Puedes cerrar esta pestaña y volver a la pestaña original de FACTURAI.');
-    else notify(problems[connectionParams.get('motivo')] || 'La conexión con Gmail no se completó. Vuelve a la pestaña original de FACTURAI e inténtalo de nuevo.', true);
-  } else if (outcome === 'chatgpt-error') notify('La conexión no se completó. Puedes volver a iniciarla.', true);
+  window.history.replaceState(null, '', '/#ajustes');
+  if (outcome === 'gmail-ok' || outcome === 'gmail-error') gmailOutcome(outcome, connectionParams.get('motivo'));
+  else if (outcome === 'chatgpt-error') notify('La conexión no se completó. Puedes volver a iniciarla.', true);
   else if (outcome.startsWith('chatgpt')) notify('Conexión guardada. Revisa su estado en Ajustes.');
+}
+if (googleReturn) {
+  // This tab is the one Google returned to: hand its answer over and say how it went.
+  notify('Terminando la conexión con Gmail…');
+  api('/api/gmail/terminar', 'POST', googleReturn)
+    .then(result => gmailOutcome(result.motivo ? 'gmail-error' : 'gmail-ok', result.motivo, true),
+      error => notify(error.message, true))
+    .then(() => { mail.refresh(); return refresh(); })
+    .catch(() => {});
 }
 startStageClock();
 if (activeScreen !== 'ajustes') mail.refresh();

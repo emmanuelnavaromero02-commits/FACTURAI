@@ -91,7 +91,10 @@ class PanelCase(unittest.IsolatedAsyncioTestCase):
             await asyncio.to_thread(thread.join, 15)
         self.addAsyncCleanup(stop)
         origin = f'http://127.0.0.1:{self.port}'
-        self.api = httpx.AsyncClient(base_url=origin, headers={'X-App-Token': self.app.state.csrf_token, 'Origin': origin})
+        # A connection of its own for every request. The server closes an idle one after five seconds, which
+        # is also how often the resting panel reads its state: a reused one could break right then.
+        self.api = httpx.AsyncClient(base_url=origin, headers={'X-App-Token': self.app.state.csrf_token, 'Origin': origin},
+                                     limits=httpx.Limits(max_keepalive_connections=0))
         self.addAsyncCleanup(self.api.aclose)
         self.playwright = await async_playwright().start()
         self.addAsyncCleanup(self.playwright.stop)

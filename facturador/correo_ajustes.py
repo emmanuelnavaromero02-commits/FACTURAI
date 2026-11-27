@@ -77,11 +77,11 @@ async def _account_body(request: Request) -> tuple[dict, str]:
     return settings, password
 
 
-async def _short_texts(request: Request, names: tuple[str, ...]) -> dict:
+async def short_texts(request: Request, names: tuple[str, ...]) -> dict:
     """A few short texts, read by hand so that a refused body (it may carry a code) is never echoed back."""
     raw = await request.body()
     try:
-        # Microsoft's codes are opaque and can be long; this is room to spare, not a format.
+        # The codes of Microsoft and Google are opaque and can be long; this is room to spare, not a format.
         if len(raw) > 32768:
             raise ValueError
         body = json.loads(raw)
@@ -170,7 +170,7 @@ def outlook_router(root, *, port: int = 8765, public_origin: str | None = None):
 
     @router.post('/api/correo/outlook/aplicacion')
     async def application(request: Request):
-        values = await _short_texts(request, ('identificador',))
+        values = await short_texts(request, ('identificador',))
         microsoft.configure(values['identificador'])
         return microsoft.status()
 
@@ -188,7 +188,7 @@ def outlook_router(root, *, port: int = 8765, public_origin: str | None = None):
 
     @router.post('/api/correo/outlook/terminar')
     async def finish(request: Request):
-        values = await _short_texts(request, ('estado', 'codigo', 'error'))
+        values = await short_texts(request, ('estado', 'codigo', 'error'))
         if connecting.locked():
             raise ValueError('Ya se está conectando una cuenta de correo.')
         async with connecting:

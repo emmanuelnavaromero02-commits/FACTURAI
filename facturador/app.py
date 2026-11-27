@@ -31,7 +31,7 @@ from .auth import CALLBACK, ChatGPTPlan, PlanError, read_json, write_private
 from .automation import TicketAutomation
 from .catalog import CATALOG, CUSTOM_PORTAL, portal_suggestions
 from .chat import chat_router
-from .correo_ajustes import correo_router, outlook_router
+from .correo_ajustes import correo_router, outlook_router, short_texts
 from .db import Store
 from .diagnostics import check_tools
 from .invoice_mail import InvoiceMailRecovery
@@ -179,7 +179,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
     store = Store(root)
     # The selector behaves exactly like the ChatGPT plan until the owner configures a pay-per-use key.
     plan = SelectorIA(root, port)
-    gmail_connection = GmailConnection(root, port)
+    gmail_connection = GmailConnection(root, port, public_origin)
     runner = Runner(store, plan)
     # The main engine and, when FACTURADOR_TICKETS_A_LA_VEZ asks for more than one ticket at a time,
     # its helpers. Behind the entrance for several customers each account keeps a single engine.
@@ -413,6 +413,17 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
             return RedirectResponse(f'/?conexion=gmail-error&motivo={exc.reason}#ajustes', 303)
         return RedirectResponse('/?conexion=gmail-ok#ajustes', 303)
 
+    @app.post('/api/gmail/terminar')
+    async def gmail_finish(request: Request):
+        # Behind the entrance for several customers Google's answer comes back in the browser, and the
+        # panel hands it over with its own token. The body is read by hand: a refused one is never echoed.
+        values = await short_texts(request, ('estado', 'codigo', 'error'))
+        try:
+            await asyncio.to_thread(gmail_connection.finish, values['estado'], values['codigo'], values['error'])
+        except GmailAuthorizationError as exc:
+            return {'gmail': gmail_connection.status(), 'motivo': exc.reason}
+        return {'gmail': gmail_connection.status(), 'motivo': ''}
+
     @app.post('/api/gmail/disconnect')
     def gmail_disconnect():
         gmail_connection.disconnect()
@@ -638,8 +649,8 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
             "token": token, "profile": read_json(path), "jobs": [panel_row(row) for row in jobs],
             "jobs_summary": store.job_summary(), "history_cursor": encode_cursor(cursor),
             "supports_ticket_retry": True, "supports_captcha_control": True, 'catalog_url': '/api/catalog',
-            'plan': plan.status(), 'gmail': gmail_connection.status(), 'automation': status,
-            'browser': engines.browser_state(), 'active_job': engines.active_id, **several})
+            'plan': plan.status(), 'gmail': gmail_connection.status(), 'gmail_setup': gmail_connection.setup(),
+            'automation': status, 'browser': engines.browser_state(), 'active_job': engines.active_id, **several})
 
     @app.get('/api/catalog')
     def catalog(request: Request):

@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 
-from . import compartido, secretos
+from . import compartido, gmail, secretos
 from .instancias import Instances, Unavailable
 from .usuarios import (INVITATION_HOURS, LIFETIME_SECONDS, AccessError, Accounts, BadCredentials, Forbidden,
                        InvalidInvitation, Throttled)
@@ -42,9 +42,12 @@ BODY_LIMIT = 4096
 WAITING_LOGINS = 16
 WORKER_THREADS = 32
 PAGES = {'/entrar': 'entrar.html', '/invitacion': 'entrar.html', '/cuenta': 'cuenta.html'}
+# Where Google returns after its sign-in. It is public because the session cookie does not travel on the way back.
+RETURN_PAGE = 'regreso.html'
 FILES = {'/acceso/entrar.css': ('entrar.css', 'text/css; charset=utf-8'),
          '/acceso/entrar.js': ('entrar.js', 'application/javascript; charset=utf-8'),
          '/acceso/cuenta.js': ('cuenta.js', 'application/javascript; charset=utf-8'),
+         '/acceso/regreso.js': ('regreso.js', 'application/javascript; charset=utf-8'),
          # Not used yet: the panel shows it once index.html includes this script.
          '/acceso/panel.js': ('panel-acceso.js', 'application/javascript; charset=utf-8')}
 
@@ -57,10 +60,16 @@ BUSY = 'El servicio está ocupado. Intenta de nuevo en un momento.'
 CHATGPT = 'Esta conexión no se ofrece en este servicio. La lectura de tickets usa la IA del producto.'
 GMAIL = ('Esta conexión no se ofrece en este servicio. Conecta tu correo en Ajustes con tu dirección y una '
          'contraseña de aplicación.')
+GMAIL_RETURN = ('GET', gmail.CALLBACK)
 # Both authorizations return to http://127.0.0.1 and cannot work for someone who enters from elsewhere.
 NOT_OFFERED = {('POST', '/api/chatgpt/connect'): CHATGPT, ('GET', '/auth/chatgpt/callback'): '/?conexion=chatgpt-error#ajustes',
                ('POST', '/api/gmail/client'): GMAIL, ('POST', '/api/gmail/connect'): GMAIL,
-               ('GET', '/auth/gmail/callback'): '/?conexion=gmail-error&motivo=no-disponible#ajustes'}
+               ('POST', '/api/gmail/terminar'): GMAIL,
+               GMAIL_RETURN: '/?conexion=gmail-error&motivo=no-disponible#ajustes'}
+# With a Google client of the whole installation (FACTURADOR_GMAIL_CLIENTE, of the «web» kind) Google
+# returns to the public address: these two are offered and the return address shows a page of the
+# entrance itself. Importing a client of one's own never is.
+WITH_GOOGLE_CLIENT = {('POST', '/api/gmail/connect'), ('POST', '/api/gmail/terminar')}
 
 
 class ConfigError(ValueError):
@@ -176,7 +185,7 @@ class Entrance:
         self._upkeep: asyncio.Task | None = None
         self._stopping = asyncio.Event()
         self._files = {}
-        for name in {*PAGES.values(), *(name for name, _ in FILES.values())}:
+        for name in {*PAGES.values(), RETURN_PAGE, *(name for name, _ in FILES.values())}:
             body = (BASE / 'web' / name).read_bytes()
             self._files[name] = (body, '"' + hashlib.sha256(body).hexdigest()[:16] + '"')
         # (method, path) -> (who may call it, handler)
@@ -277,12 +286,23 @@ class Entrance:
         if path in PAGES or path == '/acceso' or path.startswith('/acceso/'):
             # This part of the address space belongs to the entrance and never reaches an instance.
             return await self._own(PlainTextResponse('No disponible', 404))(scope, receive, send)
+        if (method, path) == GMAIL_RETURN and self._gmail_offered():
+            # Google sends the browser back from its own site, so the session cookie does not come along.
+            # This page reads nothing and keeps nothing: it moves the answer after «#» and goes on to the
+            # panel, where the session travels again and the panel hands the answer over with its token.
+            return await self._page(RETURN_PAGE)(scope, receive, send)
         if session is None:
             return await self._signed_out(request, token)(scope, receive, send)
         await self._forward(scope, receive, send, session)
 
+    def _gmail_offered(self) -> bool:
+        return gmail.offered_behind_entrance(data=self.settings.data_root)
+
     async def _forward(self, scope, receive, send, session):
-        blocked = NOT_OFFERED.get((scope['method'], scope['path']))
+        route = (scope['method'], scope['path'])
+        blocked = NOT_OFFERED.get(route)
+        if blocked and route in WITH_GOOGLE_CLIENT and self._gmail_offered():
+            blocked = None
         if blocked:
             reply = RedirectResponse(blocked, 303) if blocked.startswith('/') else PlainTextResponse(blocked, 422)
             return await self._own(reply)(scope, receive, send)
