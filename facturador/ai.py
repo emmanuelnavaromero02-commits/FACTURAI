@@ -113,6 +113,11 @@ class AI:
             'En billing_url transcribe la liga HTTPS de facturación impresa o decodificada del QR. '
             'Devuelve null si falta, es ilegible o no corresponde a facturación. Nunca inventes la dirección. '
             'Si el folio o importe es ambiguo, deja el campo en null y explica la duda. '
+            'En issuer_rfc transcribe el RFC del comercio emisor impreso en el ticket, nunca el del cliente. '
+            'En merchant_whatsapp devuelve solo el número de WhatsApp que el ticket indique expresamente para pedir '
+            'la factura, y en merchant_email solo el correo que el ticket indique expresamente para pedir la factura. '
+            'No uses el teléfono general de la tienda, el de atención a clientes ni un correo que no hable de '
+            'facturación. Si alguno no está impreso con claridad devuelve null; nunca lo inventes. '
             'Un estado de cuenta, una constancia fiscal y un CFDI ya emitido no son tickets. '
             'provider debe ser una clave del catálogo o unknown. Catálogo: ' + json.dumps(catalog, ensure_ascii=False)
         )

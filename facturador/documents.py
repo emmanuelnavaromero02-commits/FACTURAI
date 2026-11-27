@@ -12,6 +12,7 @@ from .cfdi import MissingPair, collect_documents, find_valid_pair
 from .db import Store, now
 from .ingest import write_original
 from .models import Profile, Receipt
+from .portal_directory import learn_from_invoice
 
 _finalize = threading.Lock()
 
@@ -161,6 +162,7 @@ def _record_pair(store: Store, db, key: str, receipt: Receipt, result: dict, xml
                else 'PDF/XML coinciden con el perfil, importe, forma de pago y UUID')
     db.execute("""UPDATE jobs SET status='verified',uuid=?,issuance_seen=1,xml=?,pdf=?,message=?,updated=? WHERE id=?""",
                (fiscal_uuid if not owner or owner['id'] == key else None, str(dest/'factura.xml'), str(dest/'factura.pdf'), message, now(), key))
+    learn_from_invoice(store.root, receipt, dest / 'factura.xml')  # Best effort; never raises.
     db.execute('DELETE FROM observed_shared_invoices WHERE job_id=?', (key,))
     db.execute('INSERT INTO events(job_id,at,kind,detail) VALUES(?,?,?,?)',
                (key, now(), 'verified', json.dumps({**public, 'xml_sha256': xml_hash}, ensure_ascii=False)[:5000]))

@@ -25,9 +25,8 @@ CHROME = os.getenv('FACTURADOR_CHROMIUM_PATH',
                    else '/usr/bin/google-chrome-stable')
 
 
-class ReceiptWithPhone(Receipt):
-    # Stand-in for the field another package adds to the ticket model.
-    merchant_whatsapp: str = ''
+# The ticket model carries the merchant's WhatsApp number read from the ticket.
+ReceiptWithPhone = Receipt
 
 
 class WhatsAppJobs(unittest.TestCase):
@@ -215,7 +214,7 @@ class PermittedRequests(WhatsAppJobs):
     """The merchant number comes from the case; the queue may send without a per-ticket click."""
 
     def with_phone(self, number='+1 202 555 0188'):
-        receipt = ReceiptWithPhone(**RECEIPT.model_dump(), merchant_whatsapp=number)
+        receipt = ReceiptWithPhone(**{**RECEIPT.model_dump(), 'merchant_whatsapp': number})
         self.store.save_receipt(self.key, receipt, ready=True)
         return patch.object(whatsapp_module, 'Receipt', ReceiptWithPhone)
 

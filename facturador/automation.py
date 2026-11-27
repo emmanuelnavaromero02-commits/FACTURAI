@@ -19,6 +19,7 @@ from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, portal_suggestions, pu
 from .db import READ_DELAYS
 from .local_reader import read_local_page
 from .models import Receipt
+from .portal_directory import SOURCE as DIRECTORY, invoice_confirmed, lookup_safely, record_safely, ticket_values
 from .portal_discovery import (merchant_matches_source, public_page_links_to, save_search_proof,
                                trusted_search_proof)
 from .read_http import ServiceWait, retry_seconds
@@ -68,8 +69,12 @@ def printed_portal_confirmed(store, row, receipt: Receipt) -> bool:
 
 
 def portal_confirmed(store, row, receipt: Receipt) -> bool:
+    # The directory only confirms the exact portal that already issued a verified
+    # invoice of the RFC printed on this ticket; the browser stays on that origin.
     return printed_portal_confirmed(store, row, receipt) or (
-        receipt.provider == CUSTOM_PORTAL and trusted_search_proof(store.root, row, receipt.portal_url))
+        receipt.provider == CUSTOM_PORTAL and (trusted_search_proof(store.root, row, receipt.portal_url)
+                                               or invoice_confirmed(store.root, receipt.issuer_rfc,
+                                                                    receipt.portal_url)))
 
 
 def plain_words(value: str) -> str:
@@ -288,9 +293,13 @@ def _read_ticket(ai, read_local_page, row, automatic, root, companions):
     receipt = Receipt(provider=result.provider, merchant=result.merchant.strip(), amount=(result.amount or '').strip(),
                       date=date, ticket_number=(result.ticket_number or '').strip(),
                       billing_codes=[code.strip() for code in result.billing_codes if code.strip()],
-                      payment_code=payment, details=details, source=row['receipt']['source'])
+                      payment_code=payment, details=details, source=row['receipt']['source'],
+                      issuer_rfc=getattr(result, 'issuer_rfc', None) or '',
+                      merchant_whatsapp=getattr(result, 'merchant_whatsapp', None) or '',
+                      merchant_email=getattr(result, 'merchant_email', None) or '')
     sources = {field:'vision_modelo' for field in ('provider','merchant','amount','date','ticket_number',
-               'billing_codes','details') if getattr(receipt, field)}
+               'billing_codes','details','issuer_rfc','merchant_whatsapp','merchant_email')
+               if getattr(receipt, field)}
     tools = ['vision_modelo']
     if row.get('confirmed_payment'):
         sources['payment_code'] = 'correccion_usuario'
@@ -320,8 +329,40 @@ def _read_ticket(ai, read_local_page, row, automatic, root, companions):
         receipt.provider, receipt.portal_url = CUSTOM_PORTAL, billing_url
         sources['provider'] = sources['portal_url'] = 'texto_o_codigo_del_original'
         known = False
-    searched_and_verified = False
-    if not marked and not billing_url and not known and result.merchant.strip():
+    searched_and_verified = directory_confirmed = False
+    directory_notice = ''
+    private = [*ticket_values(receipt), row.get('id', '')]
+    if billing_url and marked == [billing_url]:
+        # A single fiscal link printed on the original teaches this merchant's portal.
+        record_safely(root, 'impreso', billing_url, rfc=receipt.issuer_rfc, merchant=receipt.merchant,
+                      private=private)
+    if receipt.provider == CUSTOM_PORTAL and billing_url:
+        # The printed link always wins; only note a different known portal.
+        entry = lookup_safely(root, rfc=receipt.issuer_rfc, merchant=receipt.merchant)
+        if entry and public_portal_origin(entry['url']) != public_portal_origin(billing_url):
+            tools.append(DIRECTORY)
+            directory_notice = ('El ticket imprime un portal distinto al que ya se conocía para este comercio ('
+                                + public_portal_origin(entry['url']) + '). Se usa el impreso.')
+    entry = None
+    if not marked and not billing_url and not known and (result.merchant.strip() or receipt.issuer_rfc):
+        entry = lookup_safely(root, rfc=receipt.issuer_rfc, merchant=receipt.merchant)
+    if entry:
+        tools.append(DIRECTORY)
+        receipt.provider, receipt.portal_url = CUSTOM_PORTAL, entry['url']
+        sources['provider'] = sources['portal_url'] = DIRECTORY
+        # Only an invoice verified with this ticket's issuer RFC skips the domain question.
+        directory_confirmed = entry['level'] == 'factura' and entry['matched_by'] == 'rfc'
+        if entry['level'] == 'busqueda' and entry['evidence_url'] and result.merchant.strip():
+            # Re-check the public page that links to it for this ticket; no new web search.
+            try:
+                searched_and_verified = (merchant_matches_source(result.merchant.strip(), entry['evidence_url'])
+                                         and asyncio.run(public_page_links_to(entry['evidence_url'], entry['url'])))
+                if searched_and_verified:
+                    tools.append('enlace_publico_comprobado')
+                    save_search_proof(root, row, entry['url'], entry['evidence_url'])
+            except (httpx.HTTPError, OSError, ValueError, asyncio.TimeoutError):
+                pass
+    elif not marked and not billing_url and not known and result.merchant.strip():
         tools.append('busqueda_web')
         try:
             suggested, evidence = ai.discover_portal(result.merchant.strip())
@@ -333,11 +374,14 @@ def _read_ticket(ai, read_local_page, row, automatic, root, companions):
                 if searched_and_verified:
                     tools.append('enlace_publico_comprobado')
                     save_search_proof(root, row, suggested, evidence)
+                    record_safely(root, 'busqueda', suggested, rfc=receipt.issuer_rfc, merchant=receipt.merchant,
+                                  evidence_url=evidence, private=private)
         except (PlanError, httpx.HTTPError, OSError, ValueError, asyncio.TimeoutError):
             pass  # Keep the extracted ticket; a failed public search must not lose it.
     if row.get('auto_stage') in {'offline', 'retry_read'}:
         old = Receipt.model_validate(row['receipt'])
-        for field in ('amount', 'date', 'merchant', 'billing_codes', 'ticket_number', 'payment_code'):
+        for field in ('amount', 'date', 'merchant', 'billing_codes', 'ticket_number', 'payment_code',
+                      'issuer_rfc', 'merchant_whatsapp', 'merchant_email'):
             if not getattr(receipt, field):
                 setattr(receipt, field, getattr(old, field))
                 if getattr(old, field):
@@ -380,10 +424,11 @@ def _read_ticket(ai, read_local_page, row, automatic, root, companions):
     uncertainties = list(result.uncertainties)
     if len(choices) > 1:
         uncertainties.append('Se encontraron varios enlaces fiscales impresos. Revisa los destinos en Leer texto, QR y barras.')
-    elif not billing_url and not known and not searched_and_verified and (other or reported):
+    elif not billing_url and not known and not searched_and_verified and not directory_confirmed and (other or reported):
         uncertainties.append('Comprueba el sitio del comercio en el original. El destino para facturar sigue sin confirmar.')
-    confirmed_portal = searched_and_verified or (receipt.provider == CUSTOM_PORTAL and
-                                                  marked == [receipt.portal_url])
+    confirmed_portal = searched_and_verified or (receipt.provider == CUSTOM_PORTAL and (
+        marked == [receipt.portal_url] or
+        directory_confirmed and invoice_confirmed(root, receipt.issuer_rfc, receipt.portal_url)))
     uncertainties = reconcile_uncertainties(
         uncertainties,
         payment_confirmed=bool(payment and receipt.payment_code == payment and
@@ -398,7 +443,11 @@ def _read_ticket(ai, read_local_page, row, automatic, root, companions):
     note = ' '.join(dict.fromkeys(questions)) if questions else (
         'Portal localizado por búsqueda web y enlazado desde una fuente pública. Listo para preparar.'
         if ready and searched_and_verified else
+        'Portal conocido: ya se facturó en él con el mismo RFC del comercio. Listo para preparar.'
+        if ready and directory_confirmed else
         'Datos completos. Listo para preparar el portal.' if ready else 'Revisa los datos y guarda la revisión.')
+    if directory_notice:
+        note += ' ' + directory_notice  # Informative only; it never blocks the ticket.
     return receipt, ready, note, {'fields':sources, 'tools':list(dict.fromkeys(tools))}
 
 

@@ -634,6 +634,10 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         errors = receipt.ready_errors()
         row = store.get(key)
         receipt.source = row['receipt']['source']
+        # The review form does not carry these readings: a correction keeps what the ticket said.
+        for field in ('issuer_rfc', 'merchant_whatsapp', 'merchant_email'):
+            if field not in receipt.model_fields_set:
+                setattr(receipt, field, row['receipt'].get(field, ''))
         if receipt.provider not in CATALOG and receipt.provider not in {CUSTOM_PORTAL, 'solicitud_directa'}:
             errors.append("Indica el portal de facturación del comercio")
         if errors:

@@ -122,6 +122,45 @@ class Receipt(BaseModel):
     payment_code: str = ""
     details: str = ""
     source: str = "archivo"
+    # Merchant contact data printed on the ticket. Invalid values are kept empty.
+    issuer_rfc: str = ''
+    merchant_whatsapp: str = ''
+    merchant_email: str = ''
+
+    @field_validator('issuer_rfc', mode='before')
+    @classmethod
+    def valid_issuer_rfc(cls, value) -> str:
+        try:
+            return Profile.valid_rfc(value) if isinstance(value, str) and value.strip() else ''
+        except ValueError:
+            return ''
+
+    @field_validator('merchant_whatsapp', mode='before')
+    @classmethod
+    def valid_merchant_whatsapp(cls, value) -> str:
+        if not isinstance(value, str) or len(value) > 64:
+            return ''
+        number = re.sub(r'[\s().-]', '', value.strip().removeprefix('https://').removeprefix('wa.me/'))
+        if number.startswith('00'):
+            number = '+' + number[2:]
+        if re.fullmatch(r'\d{10}', number):
+            number = '+52' + number  # Ten digits are a Mexican national number.
+        elif re.fullmatch(r'52\d{10}', number):
+            number = '+' + number
+        try:
+            return Profile.valid_whatsapp_phone(number) if number else ''
+        except ValueError:
+            return ''
+
+    @field_validator('merchant_email', mode='before')
+    @classmethod
+    def valid_merchant_email(cls, value) -> str:
+        if not isinstance(value, str) or not value.strip() or len(value.strip()) > 254:
+            return ''
+        try:
+            return Profile.valid_email(value)
+        except ValueError:
+            return ''
 
     @field_validator("date")
     @classmethod
@@ -186,6 +225,10 @@ class Extraction(BaseModel):
     payment_evidence: str | None
     details: str
     uncertainties: list[str]
+    # Required and nullable in the strict schema; the default only keeps older replies valid.
+    issuer_rfc: str | None = None
+    merchant_whatsapp: str | None = None
+    merchant_email: str | None = None
 
 
 class WebAnswer(BaseModel):
