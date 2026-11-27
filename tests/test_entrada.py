@@ -44,7 +44,8 @@ class ConfigurationTests(unittest.TestCase):
         from dotenv import dotenv_values
         example = dotenv_values(WEB.parent / '.env.example')
         for name in ('FACTURADOR_MODO', 'FACTURADOR_ORIGEN_PUBLICO', 'FACTURADOR_ARCHIVO_LLAVE', 'FACTURADOR_LLAVE_MAESTRA',
-                     'FACTURADOR_PROXIES', 'FACTURADOR_NAVEGADORES_MAX', 'FACTURADOR_INSTANCIA_INACTIVA_MIN'):
+                     'FACTURADOR_PROXIES', 'FACTURADOR_NAVEGADORES_MAX', 'FACTURADOR_INSTANCIA_INACTIVA_MIN',
+                     'FACTURADOR_COMPARTIDO'):
             self.assertIn(name, example)  # Every new setting is documented there.
         self.assertIsNone(settings_from_env(example))
         self.assertFalse(secretos.load_from_env(self.root, example))

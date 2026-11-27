@@ -34,6 +34,9 @@ log = logging.getLogger(__name__)
 
 # A merchant without a portal that asks for the request by WhatsApp or by mail.
 DIRECT = 'solicitud_directa'
+# Source of a portal that only other accounts of the installation know and too few of them verified:
+# the person confirms its domain, and until then the ticket counts as having no portal.
+SHARED_PROPOSAL = 'directorio_compartido'
 DIRECT_CHANNELS = ('correo', 'whatsapp')  # Mail first when the ticket offers both.
 DIRECT_PERMISSION = {'correo': 'pedir_por_correo', 'whatsapp': 'pedir_por_whatsapp'}
 DIRECT_LABEL = {'correo': 'correo', 'whatsapp': 'WhatsApp'}
@@ -395,7 +398,9 @@ def _read_ticket(ai, read_local_page, row, automatic, root, companions):
     if entry:
         tools.append(DIRECTORY)
         receipt.provider, receipt.portal_url = CUSTOM_PORTAL, entry['url']
-        sources['provider'] = sources['portal_url'] = DIRECTORY
+        # What only other accounts know, without enough of them behind it, is a proposal like a web search.
+        proposal = bool(entry.get('shared')) and entry['level'] != 'factura'
+        sources['provider'] = sources['portal_url'] = SHARED_PROPOSAL if proposal else DIRECTORY
         # Only an invoice verified with this ticket's issuer RFC skips the domain question.
         directory_confirmed = entry['level'] == 'factura' and entry['matched_by'] == 'rfc'
         if entry['level'] == 'busqueda' and entry['evidence_url'] and result.merchant.strip():
@@ -776,7 +781,7 @@ class TicketAutomation:
                 return False
             sources = next((json.loads(event['detail']) for event in reversed(self.store.events(row['id']))
                             if event['kind'] == 'fuentes_de_campos'), {})
-            if (sources.get('fields', {}).get('provider') != 'busqueda_web'
+            if (sources.get('fields', {}).get('provider') not in {'busqueda_web', SHARED_PROPOSAL}
                     or 'enlace_publico_comprobado' in sources.get('tools', [])):
                 return False
         elif receipt.provider not in {'unknown', DIRECT}:

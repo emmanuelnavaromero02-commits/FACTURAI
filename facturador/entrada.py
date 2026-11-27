@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 
-from . import secretos
+from . import compartido, secretos
 from .instancias import Instances, Unavailable
 from .usuarios import (INVITATION_HOURS, LIFETIME_SECONDS, AccessError, Accounts, BadCredentials, Forbidden,
                        InvalidInvitation, Throttled)
@@ -32,6 +32,7 @@ log = logging.getLogger(__name__)
 BASE = Path(__file__).resolve().parent.parent
 MODE_VARIABLE = 'FACTURADOR_MODO'
 ORIGIN_VARIABLE = 'FACTURADOR_ORIGEN_PUBLICO'
+SHARING_VARIABLE = 'FACTURADOR_COMPARTIDO'
 HOST = re.compile(r'(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*')
 TOKEN = re.compile(r'[A-Za-z0-9_-]{43}')
 # The same policy the panel sends (facturador/app.py).
@@ -79,6 +80,8 @@ class Settings:
     port: int = 8765
     max_browsers: int = 3
     idle_seconds: float = 30 * 60
+    # What an account learns about the portals of the merchants also serves the other accounts.
+    share: bool = True
 
 
 def clean_origin(value: str) -> str:
@@ -124,7 +127,8 @@ def settings_from_env(env=None, *, port: int = 8765) -> Settings | None:
         raise ConfigError(NEEDS_ORIGIN)
     return Settings(public_origin=clean_origin(env[ORIGIN_VARIABLE]), data_root=data_root(env), port=port,
                     max_browsers=_number(env, 'FACTURADOR_NAVEGADORES_MAX', 3, 1, 50),
-                    idle_seconds=60 * _number(env, 'FACTURADOR_INSTANCIA_INACTIVA_MIN', 30, 1, 1440))
+                    idle_seconds=60 * _number(env, 'FACTURADOR_INSTANCIA_INACTIVA_MIN', 30, 1, 1440),
+                    share=(env.get(SHARING_VARIABLE) or '').strip() != '0')
 
 
 def open_accounts(root: Path) -> Accounts:
@@ -161,6 +165,12 @@ class Entrance:
         self.instances = instances or Instances(
             settings.data_root, factory, port=settings.port, public_origin=settings.public_origin,
             max_browsers=settings.max_browsers, idle_seconds=settings.idle_seconds, clock=clock)
+        if settings.share:
+            # What an account learns about the portal of a merchant serves the others from this folder.
+            # Nothing of a customer goes there; see portal_memory and portal_directory.
+            compartido.enable(self.instances.folder, settings.data_root / compartido.FOLDER)
+        else:
+            compartido.disable(self.instances.folder)
         self._hashing = ThreadPoolExecutor(max_workers=2, thread_name_prefix='acceso')
         self._waiting = 0
         self._upkeep: asyncio.Task | None = None

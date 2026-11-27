@@ -8,6 +8,10 @@ ticket (``$perfil.rfc``, ``$ticket.date|dd/mm/aaaa``), so the steps can be repea
 with another ticket and the file holds no personal data.
 
 Nothing reaches the file until the invoice of that attempt is verified.
+
+With several accounts (``compartido``) each one keeps this file in its own folder, exactly as a
+single person does, and what it verifies also goes to a second file that every account of the
+installation reads. That one takes less than the account's own: see ``common_screen``.
 """
 from __future__ import annotations
 
@@ -15,7 +19,9 @@ import functools
 import hashlib
 import json
 import re
+import secrets
 import sqlite3
+import threading
 import time
 import unicodedata
 from contextlib import contextmanager
@@ -24,14 +30,22 @@ from decimal import Decimal
 from pathlib import Path
 from urllib.parse import unquote
 
+from . import compartido
+from .catalog import public_portal_origin
 from .fiscal_choices import PAYMENTS, SAT_CODES, USES, code_tokens, matches, words
 from .models import money
 from .tax_document import REGIME_NAMES
 
+FILE = 'memoria_portales.sqlite'
 FAILURES_TO_DISABLE = 3
 FAMILY_SUCCESSES = 2
 PENDING_DAYS = 30
 KEYS = {'Enter', 'Tab', 'ArrowDown', 'ArrowUp', 'Escape', 'Space'}
+# What a recipe of the file shared between accounts may press besides a field. A choice among
+# options (a radio, an option, a row of a list) is never one of them: what was chosen may be
+# the state, the branch or a saved address of whoever chose it.
+SHARED_ROLES = {'button', 'link', 'tab', 'menuitem', 'checkbox', 'switch'}
+LINK = re.compile(r'\$(?:perfil|ticket)\.[a-z_]{1,40}(?:\[\d{1,2}\])?(?:\|(.{1,12}))?')
 EMAIL = re.compile(r'[^\s@]+@[^\s@]+\.[a-z]{2,}', re.I)
 RFC = re.compile(r'(?<![A-Z0-9])[A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3}(?![A-Z0-9])')
 MONTHS = ('enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre',
@@ -264,6 +278,25 @@ class Known:
             return True
         return any(re.search(r'(?<![\d.,])' + re.escape(shown) + r'(?![\d.,])', text) for shown in self.amounts)
 
+    def exposes(self, text: str, words=()) -> bool:
+        """Stricter than ``reveals``, for a text that would leave the account.
+
+        One word of the name is enough here. So is an identifier whose digits a label lost
+        («rfc xaxx#» still shows its letters) and any of ``words``, which is what the person
+        saved about themselves besides the profile.
+        """
+        if self.reveals(text):
+            return True
+        folded, shape = fold(text), plain(text)
+        if any(re.search(r'(?<![a-z])' + re.escape(word) + r'(?![a-z])', folded) for word in {*self.names, *words}):
+            return True
+        for value in self.identifiers.values():
+            piece = plain(value)
+            if (sum(char.isalpha() for char in piece) >= 3
+                    and re.search(r'(?<![a-z#])' + re.escape(piece) + r'(?![a-z#])', shape)):
+                return True
+        return False
+
     def route(self, path: str) -> str:
         """The path without ticket or personal data nor long identifiers, so it repeats across tickets."""
         text = unquote(path or '/')
@@ -308,6 +341,71 @@ def compact(steps: list[dict]) -> list[dict] | None:
     return result
 
 
+def _common_target(kind: str, target) -> bool:
+    if target is None:
+        return kind == 'upload'
+    if not isinstance(target, dict):
+        return False
+    if target.get('by') == 'campo':
+        # A field of the page by what it is. A radio is a choice among options, so it stays out.
+        return (set(target) == {'by', 'kind', 'label', 'ordinal', 'count'}
+                and isinstance(target['kind'], str) and bool(re.fullmatch(r'[a-z-]{1,20}', target['kind']))
+                and target['kind'] != 'radio'
+                and isinstance(target['label'], str) and bool(re.fullmatch(r'[a-z# ]{0,80}', target['label']))
+                and type(target['ordinal']) is int and type(target['count']) is int
+                and 0 <= target['ordinal'] < target['count'] <= 200)
+    name = target.get('name')
+    return (set(target) == {'by', 'name', 'role', 'exact'} and target['by'] == 'role'
+            and isinstance(target['role'], str) and target['role'] in SHARED_ROLES and isinstance(target['exact'], bool)
+            # A name with a number of two digits or more, or with an address, names a record, not a control.
+            and isinstance(name, str) and 0 < len(name) <= 80 and not re.search(r'\d{2}|@', name))
+
+
+def _common_value(kind: str, value) -> bool:
+    if kind == 'click':
+        return value is None
+    if not isinstance(value, str):
+        return False
+    if kind == 'press':
+        return value[:1] == '=' and value[1:] in KEYS
+    if kind == 'upload':
+        return value == '=ticket'
+    if value == '=' or (kind == 'select' and value[:5] == '$sat.' and value[5:] in SAT_ALIASES):
+        return True
+    # A literal of a list is never common: only a link, written again with each profile and ticket.
+    found = LINK.fullmatch(value)
+    return bool(found) and (found[1] is None or found[1] in {*TEXT_STYLES, *AMOUNT_STYLES, *DATE_STYLES})
+
+
+def common_steps(steps) -> bool:
+    """Whether a recipe is made only of what is the same for any person and any ticket."""
+    try:
+        return (isinstance(steps, list) and 0 < len(steps) <= 40 and all(
+            isinstance(step, dict) and set(step) == {'kind', 'target', 'value', 'risk'}
+            and step['kind'] in {'click', 'fill', 'select', 'press', 'upload'} and step['risk'] in {'normal', 'issue'}
+            and _common_target(step['kind'], step['target']) and _common_value(step['kind'], step['value'])
+            for step in steps))
+    except (TypeError, KeyError, AttributeError):
+        return False
+
+
+def common_screen(key, variant, steps) -> bool:
+    """Whether a screen and its recipe may live in the file every account of the installation reads.
+
+    It is decided by what they are made of, never by who learned them: the public address of a
+    portal, a path of words, the portal's own fields and buttons, links to the profile and to
+    the ticket, and keys. A literal chosen in a list, a choice among options, free text and a
+    path that may carry a session or a record stay in the account that learned them.
+    """
+    try:
+        origin, path, signature = key
+        return (isinstance(origin, str) and public_portal_origin(origin) == origin and compartido.plain_path(path)
+                and isinstance(signature, str) and bool(re.fullmatch(r'[0-9a-f]{32}', signature))
+                and variant in ('F', 'M') and common_steps(steps))
+    except (TypeError, ValueError):
+        return False
+
+
 def guarded(default):
     """A memory that cannot be read or written never stops a ticket: it just does not help."""
     def wrap(method):
@@ -329,7 +427,7 @@ class PortalMemory:
     """
 
     def __init__(self, root: Path):
-        self.path = Path(root) / 'memoria_portales.sqlite'
+        self.path = Path(root) / FILE
         try:
             with self.connect() as db:
                 db.executescript("""
@@ -346,6 +444,12 @@ class PortalMemory:
             self.path.chmod(0o600)
         except (sqlite3.Error, OSError):
             pass
+        # An account among several: what it verifies also serves the others. A single person has no such file.
+        try:
+            shared = compartido.shared_root(root)
+            self.commons = Commons(shared, self) if shared != Path(root) else None
+        except OSError:
+            self.commons = None
 
     @contextmanager
     def connect(self):
@@ -456,7 +560,213 @@ class PortalMemory:
                 self.confirm(key, attempt['variant'], screen['steps'])
             elif self.learn(key, attempt['variant'], screen['steps'], bool(screen.get('needs_ai'))):
                 learned += 1
+            if self.commons is not None and screen.get('shared') and not screen.get('needs_ai'):
+                # The attempt itself marked what may leave the account (Attempt.fit_to_share).
+                self.commons.publish(key, attempt['variant'], screen['steps'], learned=not screen.get('replayed'))
         return learned
+
+
+def optional(default):
+    """What the accounts share is a help on top of each one's own memory: no failure of it reaches a ticket."""
+    def wrap(method):
+        @functools.wraps(method)
+        def call(self, *args, **kwargs):
+            try:
+                return method(self, *args, **kwargs) if self.ready() else default
+            except (sqlite3.Error, OSError):
+                self.store = ''  # The file may have been emptied or replaced: it is prepared again next time.
+                return default
+            except (ValueError, TypeError, KeyError):
+                return default
+        return call
+    return wrap
+
+
+class Commons:
+    """The recipes every account of one installation may repeat, in the folder they share.
+
+    Only what ``common_screen`` accepts is written or read here. Each recipe counts how many
+    different accounts verified it without saying which ones: every account keeps in its own
+    file (``shared_marks``) the note that it was already counted for a recipe, and the note of
+    the failure it already charged to it.
+
+    Trust between accounts:
+    - A recipe is repeated only on the portal a ticket already has approved and through the
+      same emission locks as a plan of the model; that is the engine's part and it is the same.
+    - An account's own verified recipe always goes first (``Attempt.recall``), so what another
+      account publishes never replaces what already works for this one.
+    - A recipe travels to a portal it was not learned on only when ``compartido.CORROBORATION``
+      different accounts verified it: one account with a portal of its own cannot teach every
+      portal of the same shape.
+    - A failure is charged once per account until somebody succeeds with the recipe again, so
+      it takes ``FAILURES_TO_DISABLE`` different accounts in a row to switch a recipe off for
+      everyone. One account alone only switches it off for itself, in its own file, as always.
+    - The latest verified solution of a screen is the published one, but what that many
+      accounts verified is not replaced on the word of one: only once it is switched off, or
+      as many accounts in a row failed with it. Until then another solution stays with whoever
+      found it.
+    """
+    _setup = threading.Lock()
+
+    def __init__(self, folder: Path, own: PortalMemory):
+        self.path = Path(folder) / FILE
+        self.own = own
+        self.store = ''   # Which shared file the marks of this account refer to.
+        self.ready()
+
+    def ready(self) -> bool:
+        """Prepare both files once. Until that works nothing is shared and nothing else changes."""
+        if self.store:
+            return True
+        try:
+            with self._setup:
+                self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)  # It may have been emptied by hand.
+                with self.connect() as db:
+                    db.executescript("""
+                    PRAGMA journal_mode=WAL;
+                    CREATE TABLE IF NOT EXISTS screens(
+                      origin TEXT NOT NULL, path TEXT NOT NULL, signature TEXT NOT NULL, variant TEXT NOT NULL,
+                      steps TEXT NOT NULL, needs_ai INTEGER NOT NULL DEFAULT 0,
+                      successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
+                      streak INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, updated INTEGER NOT NULL,
+                      accounts INTEGER NOT NULL DEFAULT 1,
+                      PRIMARY KEY(origin, path, signature, variant));
+                    CREATE INDEX IF NOT EXISTS screens_family ON screens(signature, variant);
+                    CREATE TABLE IF NOT EXISTS store(id TEXT NOT NULL);
+                    """)
+                    db.execute('BEGIN IMMEDIATE')
+                    store = self._named(db)
+                self.path.chmod(0o600)
+            with self.own.connect() as db:
+                db.execute("""CREATE TABLE IF NOT EXISTS shared_marks(
+                    origin TEXT NOT NULL, path TEXT NOT NULL, signature TEXT NOT NULL, variant TEXT NOT NULL,
+                    store TEXT NOT NULL, recipe TEXT NOT NULL,
+                    counted INTEGER NOT NULL DEFAULT 0, struck INTEGER NOT NULL DEFAULT -1,
+                    PRIMARY KEY(origin, path, signature, variant))""")
+            self.store = store
+        except (sqlite3.Error, OSError):
+            self.store = ''
+            return False
+        return True
+
+    def _named(self, db) -> str:
+        """The name of the shared file as it is now. One that started again is another: old notes do not count in it."""
+        row = db.execute('SELECT id FROM store').fetchone()
+        if row is None:
+            db.execute('INSERT INTO store VALUES(?)', (secrets.token_hex(8),))
+            row = db.execute('SELECT id FROM store').fetchone()
+        self.store = row['id']
+        return self.store
+
+    @contextmanager
+    def connect(self):
+        db = sqlite3.connect(self.path, timeout=20)
+        db.row_factory = sqlite3.Row
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
+
+    def _mark(self, key: tuple, variant: str, recipe: str) -> dict:
+        """What this account noted about that recipe of the shared file; nothing when it is another one."""
+        with self.own.connect() as db:
+            row = db.execute("""SELECT counted, struck FROM shared_marks WHERE origin=? AND path=? AND signature=?
+                AND variant=? AND store=? AND recipe=?""", (*key, variant, self.store, recipe)).fetchone()
+        return dict(row) if row else {'counted': 0, 'struck': -1}
+
+    def _note(self, key: tuple, variant: str, recipe: str, counted: int, struck: int) -> None:
+        with self.own.connect() as db:
+            db.execute("""INSERT INTO shared_marks(origin,path,signature,variant,store,recipe,counted,struck)
+                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(origin,path,signature,variant) DO UPDATE SET
+                store=excluded.store, recipe=excluded.recipe, counted=excluded.counted, struck=excluded.struck""",
+                (*key, variant, self.store, recipe, counted, struck))
+
+    @optional(None)
+    def screen(self, key: tuple, variant: str) -> dict | None:
+        """The published row of exactly this screen, whatever its state. What is read is checked like what is written."""
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM screens WHERE origin=? AND path=? AND signature=? AND variant=?',
+                             (*key, variant)).fetchone()
+        if row is None:
+            return None
+        steps = json.loads(row['steps'])
+        return {**dict(row), 'steps': steps} if not row['needs_ai'] and common_screen(key, variant, steps) else None
+
+    @optional(None)
+    def family(self, signature: str, variant: str) -> list[dict] | None:
+        """Steps the same screen takes in other portals, once enough different accounts verified them."""
+        with self.connect() as db:
+            row = db.execute("""SELECT steps FROM screens
+                WHERE signature=? AND variant=? AND needs_ai=0 AND active=1 AND steps<>'[]'
+                GROUP BY steps HAVING SUM(successes)>=? AND MAX(accounts)>=?
+                ORDER BY SUM(successes) DESC, MAX(updated) DESC LIMIT 1""",
+                (signature, variant, FAMILY_SUCCESSES, compartido.CORROBORATION)).fetchone()
+        steps = json.loads(row['steps']) if row else None
+        return steps if steps and common_steps(steps) else None
+
+    @optional(None)
+    def publish(self, key: tuple, variant: str, steps: list[dict], learned: bool) -> None:
+        """A verified attempt of this account solved the screen with these steps (``learned``) or repeated them."""
+        if not common_screen(key, variant, steps):
+            return
+        stored = json.dumps(steps, ensure_ascii=False, sort_keys=True)
+        recipe = hashlib.sha256(stored.encode()).hexdigest()[:16]
+        place = (*key, variant)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self._named(db)
+            row = db.execute("""SELECT steps, accounts, streak, active FROM screens
+                WHERE origin=? AND path=? AND signature=? AND variant=?""", place).fetchone()
+            same = row is not None and row['steps'] == stored
+            if row is not None and not same:
+                held = (row['active'] and row['accounts'] >= compartido.CORROBORATION
+                        and row['streak'] < compartido.CORROBORATION)
+                if held or not learned:
+                    return  # Another solution is published for this screen; this account keeps its own.
+            counted = self._mark(key, variant, recipe)['counted'] if same else 0
+            if not counted:
+                # The note goes first: if the run dies between the two writes, this account counts
+                # one time less for the recipe, never one time more.
+                self._note(key, variant, recipe, 1, -1)
+            if same:
+                db.execute("""UPDATE screens SET successes=successes+1, streak=0, active=1, updated=?, accounts=accounts+?
+                    WHERE origin=? AND path=? AND signature=? AND variant=?""", (int(time.time()), 1 - counted, *place))
+            else:
+                # New here, or solved in another way: the latest verified solution is the published one.
+                db.execute("""INSERT INTO screens(origin,path,signature,variant,steps,needs_ai,successes,failures,streak,active,updated,accounts)
+                    VALUES(?,?,?,?,?,0,1,0,0,1,?,1) ON CONFLICT(origin,path,signature,variant) DO UPDATE SET
+                    steps=excluded.steps, needs_ai=0, successes=1, streak=0, active=1, updated=excluded.updated,
+                    accounts=1""", (*place, stored, int(time.time())))
+
+    @optional(False)
+    def strike(self, key: tuple, variant: str, steps: list[dict]) -> bool:
+        """This account failed with the published recipe. True when that switched it off for everyone.
+
+        It counts once: again only after somebody succeeded with the recipe, which also clears the count.
+        """
+        stored = json.dumps(steps, ensure_ascii=False, sort_keys=True)
+        recipe = hashlib.sha256(stored.encode()).hexdigest()[:16]
+        place = (*key, variant)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self._named(db)
+            row = db.execute("""SELECT steps, successes FROM screens WHERE origin=? AND path=? AND signature=?
+                AND variant=? AND active=1""", place).fetchone()
+            if row is None or row['steps'] != stored:
+                return False  # What failed is not what is published.
+            mark = self._mark(key, variant, recipe)
+            if mark['struck'] == row['successes']:
+                return False
+            self._note(key, variant, recipe, mark['counted'], row['successes'])
+            db.execute("""UPDATE screens SET failures=failures+1, streak=streak+1, updated=?
+                WHERE origin=? AND path=? AND signature=? AND variant=?""", (int(time.time()), *place))
+            return bool(db.execute("""UPDATE screens SET active=0 WHERE origin=? AND path=? AND signature=? AND variant=?
+                AND streak>=?""", (*place, FAILURES_TO_DISABLE)).rowcount)
+
+    def personal_words(self) -> set[str] | None:
+        """Words of what the person of this account saved about themselves. None when they cannot be read."""
+        return compartido.personal_words(self.own.path.parent)
 
 
 def harmless(default):
@@ -478,6 +788,8 @@ class Attempt:
 
     def __init__(self, memory: PortalMemory, known: Known):
         self.memory, self.known = memory, known
+        # What the accounts of the installation share; None for a single person.
+        self.commons: Commons | None = getattr(memory, 'commons', None)
         self.entries: list[dict] = []
         self.tainted: set[tuple] = set()
         self.replays: dict[tuple, dict] = {}
@@ -525,12 +837,18 @@ class Attempt:
     def recall(self, key: tuple, family_allowed: bool) -> tuple[list[dict] | None, bool]:
         """Steps the memory has for this screen and whether they come from another portal."""
         row = self.memory.screen(key, self.known.variant)
+        if row is None and self.commons is not None:
+            # Nothing of its own about this screen: what another account already solved here.
+            row = self.commons.screen(key, self.known.variant)
         if row is not None:
             usable = row['active'] and not row['needs_ai'] and row['steps']
             return (row['steps'] if usable else None), False
         if not family_allowed:
             return None, False
-        return self.memory.family(key[2], self.known.variant), True
+        steps = self.memory.family(key[2], self.known.variant)
+        if steps is None and self.commons is not None:
+            steps = self.commons.family(key[2], self.known.variant)
+        return steps, True
 
     def replay_started(self, key: tuple, steps: list[dict], family: bool) -> None:
         previous = self.replays.get(key, {})
@@ -548,7 +866,11 @@ class Attempt:
         if not replay or replay['state'] == 'failed':
             return False
         replay['state'] = 'failed'
-        return self.memory.failed(key, self.known.variant, replay['steps'])
+        switched = self.memory.failed(key, self.known.variant, replay['steps'])
+        if self.commons is not None:
+            # For the other accounts this failure counts once; see Commons.strike.
+            self.commons.strike(key, self.known.variant, replay['steps'])
+        return switched
 
     def state(self, key: tuple) -> str:
         return self.replays.get(key, {}).get('state', '')
@@ -586,8 +908,32 @@ class Attempt:
                 result.append({'key': list(key), 'steps': steps or [], 'needs_ai': steps is None, 'replayed': False})
         return result
 
+    def fit_to_share(self, screen: dict, words: set[str] | None) -> bool:
+        """Whether what was noted for a screen may leave the account that noted it.
+
+        Its recipe must be common to any person and ticket (``common_screen``) and neither its
+        path nor a label or a name in it may say anything of this person or this ticket, by the
+        stricter reading. ``words`` is what the person saved about themselves; None when that
+        could not be read.
+        """
+        if words is None or screen['needs_ai'] or not common_screen(screen['key'], self.known.variant, screen['steps']):
+            return False
+        texts = [screen['key'][1], *((step['target'] or {}).get('name') or (step['target'] or {}).get('label') or ''
+                                     for step in screen['steps'])]
+        return not any(self.known.exposes(text, words) for text in texts)
+
     def export(self) -> dict:
-        return {'variant': self.known.variant, 'screens': self.screens()}
+        screens = self.screens()
+        if self.commons is not None:
+            # With several accounts every screen says whether it may leave this one.
+            try:
+                words = self.commons.personal_words()
+                marks = [self.fit_to_share(screen, words) for screen in screens]
+            except Exception:
+                marks = [False] * len(screens)  # In doubt it all stays in the account; learning goes on as always.
+            for screen, mark in zip(screens, marks):
+                screen['shared'] = mark
+        return {'variant': self.known.variant, 'screens': screens}
 
     @harmless(0)
     def commit(self) -> int:
