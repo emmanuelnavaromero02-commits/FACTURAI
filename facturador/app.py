@@ -234,7 +234,9 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     mail_recovery = InvoiceMailRecovery(store, lambda: automation.enabled, lambda: runner.active_id)
     app.state.automation = automation
     app.include_router(chat_router(store, plan, automation, runner, profile))
-    wa_routes = whatsapp_router(store, runner, profile)
+    # The plan only picks a category when the rules cannot classify a merchant's question.
+    wa_routes = whatsapp_router(store, runner, profile, plan)
+    app.state.whatsapp = wa_routes
     app.include_router(wa_routes)
     app.include_router(portal_accounts_router(root, runner.viewer, profile))
     app.include_router(portal_mail_router(root, runner.viewer, profile))

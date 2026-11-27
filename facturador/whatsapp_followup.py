@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from datetime import datetime, timedelta, timezone
 
 _LOG = logging.getLogger(__name__)
@@ -19,8 +20,8 @@ def create_schedule(db):
     db.execute("CREATE INDEX IF NOT EXISTS wa_due ON whatsapp_followups(enabled, next_check)")
 
 
-def configure(db, key, enabled, when):
-    due = (when + timedelta(minutes=5)).isoformat() if enabled else None
+def configure(db, key, enabled, when, first=timedelta(minutes=5)):
+    due = (when + first).isoformat() if enabled else None
     db.execute("""INSERT INTO whatsapp_followups(job_id,enabled,next_check,detail) VALUES(?,?,?,?)
         ON CONFLICT(job_id) DO UPDATE SET enabled=excluded.enabled, next_check=excluded.next_check,
         misses=0, detail=excluded.detail""", (key, int(enabled), due, 'Seguimiento activo.' if enabled else 'Seguimiento desactivado.'))
@@ -34,12 +35,15 @@ def schedule_status(db, key):
 
 
 class WhatsAppWatcher:
-    def __init__(self, store, recover, busy, clock=time_utc):
+    def __init__(self, store, recover, busy, clock=time_utc, extras=(), pause=5):
         self.store = store
         self.recover = recover
         self.busy = busy
         self.clock = clock
         self.task = None
+        # Other periodic WhatsApp duties (own photos) share this loop and its yielding rules.
+        self.extras = list(extras)
+        self.pause = pause
 
     def start(self):
         if self.task is None or self.task.done():
@@ -60,7 +64,13 @@ class WhatsAppWatcher:
                 await self.tick()
             except Exception:
                 _LOG.exception('Error en seguimiento de respuestas de WhatsApp')
-            await asyncio.sleep(60)
+            for extra in self.extras:
+                try:
+                    await extra()
+                except Exception:
+                    _LOG.exception('Error en una tarea periódica de WhatsApp')
+            # Short pauses keep a live merchant conversation at a 20-30 s rhythm.
+            await asyncio.sleep(self.pause)
 
     def claim_due(self):
         when = self.clock()
@@ -78,10 +88,14 @@ class WhatsAppWatcher:
                            ((when + timedelta(minutes=5)).isoformat(), row['job_id']))
             return row
 
-    def reschedule(self, key, misses, detail, verified=False, interrupted=False):
+    def reschedule(self, key, misses, detail, verified=False, interrupted=False, live=False):
         when = self.clock()
-        delay = 1 if interrupted else min(120, 5 * 2**min(misses, 5))
-        next_check = None if verified else (when + timedelta(minutes=delay)).isoformat()
+        if live and not interrupted:
+            # The merchant answered in the last ten minutes: keep up with the conversation.
+            delay = timedelta(seconds=random.randint(20, 30))
+        else:
+            delay = timedelta(minutes=1 if interrupted else min(120, 5 * 2**min(misses, 5)))
+        next_check = None if verified else (when + delay).isoformat()
         with self.store.connect() as db:
             db.execute("""UPDATE whatsapp_followups SET next_check=?,enabled=?,last_check=CASE WHEN ? THEN last_check ELSE ? END,
                 misses=?, detail=? WHERE job_id=? AND enabled=1""",
@@ -107,8 +121,9 @@ class WhatsAppWatcher:
                     return
             result = await work
             verified = result['status'] == 'verified'
-            self.reschedule(key, 0 if verified else row['misses']+1,
-                            result['message'], verified=verified)
+            live = bool(result.get('live')) and not verified
+            self.reschedule(key, 0 if verified or live else row['misses']+1,
+                            result['message'], verified=verified, live=live)
         except Exception as exc:
             if isinstance(exc, ValueError):
                 detail = str(exc)
