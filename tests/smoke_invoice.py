@@ -53,6 +53,13 @@ async def smoke():
                     action('click', 'button', 'Facturar'),
                     action('click', 'link', 'Descargar PDF y XML')])
     wait = Action(kind='wait', target=None, value=None, reason='Esperar la descarga', risk='normal')
+    ask = Action(kind='human', target=None, value=None, reason='El portal pide la constancia.', risk='unknown')
+
+    def decide(*seen):
+        # Told that the portal wants a file that is not the ticket, the model asks the person for it.
+        if any('El portal exige un archivo' in str(item) for item in seen):
+            return ask
+        return next(actions, wait)
     with tempfile.TemporaryDirectory() as folder, patch.dict(CATALOG, {'prueba': merchant}):
         store = Store(Path(folder))
         runner = Runner(store)
@@ -62,7 +69,7 @@ async def smoke():
             row, _ = store.add('ticket-de-prueba', 'prueba-integracion')
             key = row['id']
             store.save_receipt(key, RECEIPT.model_copy(update={'provider': 'prueba'}), ready=True)
-            with patch('facturador.runner.AI.next_action', side_effect=lambda *_: next(actions, wait)):
+            with patch('facturador.runner.AI.next_action', side_effect=decide):
                 runner.schedule(key, PROFILE)
                 task = runner.job_tasks[key]
                 async with asyncio.timeout(30):

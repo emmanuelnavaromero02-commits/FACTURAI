@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from facturador.auth import write_private
 from facturador.models import Action, Plan
 from facturador.portal_accounts import credential_file
+from facturador.runner import ATTACHMENT_PAUSE
 from simulated_portal import ORIGIN, PAGE, Brain, Portal, WAIT, step, ticket
 from test_core import PROFILE
 from test_screen_plans import PortalCase, kinds, metrics
@@ -222,6 +223,24 @@ class PhotoBrain(Brain):
         return super().plan(profile, receipt, view)
 
 
+class DocumentPortal(Portal):
+    """The same portal, whose last page also demands a document only the person has."""
+
+    def confirm(self, query) -> str:
+        return super().confirm(query).replace(
+            '<button>', '<label>Constancia de situación fiscal<input name="constancia" type="file" required></label><button>')
+
+
+class AskingBrain(Brain):
+    """Told that the portal wants a file, asks the person for it, as the hint says for any other document."""
+
+    def plan(self, profile, receipt, view):
+        if HINT in view['ultimo_error']:
+            return Plan(steps=[Action(kind='human', target=None, value=None,
+                                      reason='El portal pide un documento que no tengo.', risk='unknown')])
+        return super().plan(profile, receipt, view)
+
+
 class AttachmentHintTests(PortalCase):
     def add(self, receipt):
         """Like the base one, with a real photo behind the ticket: the upload sends that file."""
@@ -264,6 +283,30 @@ class AttachmentHintTests(PortalCase):
         self.assertEqual(self.store.get(key)['message'],
                          'Toma el control y abre el selector del portal. Elige el documento en el panel y pulsa Adjuntar al portal.')
         self.assertEqual(portal.lookups, [])
+        await self.runner.stop(key)
+
+    async def test_emission_pressed_while_a_document_is_missing_pauses_for_the_file_and_attempts_nothing(self):
+        portal = await self.serve(DocumentPortal())
+        brain = Brain()  # Ignores the hint and presses «Emitir factura».
+        key = await self.bill(portal.add(ticket('TKT-55120-D', '2026-11-18', '310.00')), brain, until='attachment')
+        row = self.store.get(key)
+        self.assertEqual(row['message'], ATTACHMENT_PAUSE)
+        # Nothing was sent and no emission was recorded: the form could not even be submitted.
+        self.assertFalse(row['issue_attempted'])
+        self.assertEqual(portal.emitted, [])
+        self.assertEqual(sum(HINT in call['ultimo_error'] for call in brain.calls), 1)
+        await self.runner.stop(key)
+
+    async def test_model_that_asks_for_the_document_gets_the_file_pause_at_once(self):
+        portal = await self.serve(DocumentPortal())
+        brain = AskingBrain()
+        key = await self.bill(portal.add(ticket('TKT-55121-E', '2026-11-19', '42.00', payment='01')), brain,
+                              until='attachment')
+        self.assertEqual(self.store.get(key)['message'], ATTACHMENT_PAUSE)
+        # One consultation with the hint, no «resuélvelo tú» and no question in the chat.
+        self.assertEqual(sum(HINT in call['ultimo_error'] for call in brain.calls), 1)
+        self.assertNotIn('question', kinds(self.store, key))
+        self.assertEqual(portal.emitted, [])
         await self.runner.stop(key)
 
 

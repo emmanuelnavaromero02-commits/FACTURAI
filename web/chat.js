@@ -138,7 +138,9 @@ function actionSignature(row, actions) {
     node.getAttribute('href'), node.disabled, node.title])]);
 }
 
-export function installChat({api, getState, actionsFor}) {
+// ``token`` resolves to the panel token once the first state arrived; ``changed`` asks the panel
+// to read its state again now, instead of at its next round.
+export function installChat({api, getState, actionsFor, token = async () => getState().token, changed = async () => {}}) {
   const thread = $('chat-thread');
   const text = $('chat-text');
   const input = $('chat-files');
@@ -419,7 +421,7 @@ export function installChat({api, getState, actionsFor}) {
         upload = {title: ready.length > 1 ? ready.length + ' fotos del ticket' : 'Ticket nuevo', started: Date.now(),
           size: sizeLabel(bytes), fraction: 0, detail: ''};
         showUpload(0);
-        await sendForm('/api/chat', body, {token: getState().token, onProgress: showUpload});
+        await sendForm('/api/chat', body, {token: await token(), onProgress: showUpload});
       } else await api('/api/chat', 'POST', body);
       text.value = '';
       files = [];
@@ -429,6 +431,8 @@ export function installChat({api, getState, actionsFor}) {
       upload = null;
       bar.hidden = true;
       await readMessages(true);
+      // The ticket just sent shows up at once, not at the panel's next round.
+      await changed();
       await refresh(getState(), true);
     } catch (error) {
       feedback(error.message || 'No se pudo enviar. Puedes volver a intentarlo.', true);

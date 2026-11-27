@@ -173,6 +173,7 @@ LIMIT_MESSAGE = ('No pude terminar este portal en el tiempo previsto. No se envi
 SOLO = TOOLS | {'ask', 'human', 'done'}
 # Consultations in which the model is told that the portal wants a file, before the person is asked.
 ATTACHMENT_HINTS = 2
+ATTACHMENT_PAUSE = 'Toma el control y abre el selector del portal. Elige el documento en el panel y pulsa Adjuntar al portal.'
 # Fiscal lists that load late (often after the RFC is typed) get this long before an emission, looked at this often.
 FISCAL_WAIT = 8.0
 FISCAL_POLL = 0.5
@@ -1976,7 +1977,7 @@ class Runner:
             if challenge:
                 message = {'captcha': 'Completa la verificación en este navegador.',
                            'login': 'Inicia sesión en el portal y regresa al trámite.',
-                           'attachment': 'Toma el control y abre el selector del portal. Elige el documento en el panel y pulsa Adjuntar al portal.'}[challenge]
+                           'attachment': ATTACHMENT_PAUSE}[challenge]
                 await self.human(key, page, challenge, message, challenge_seen=True)
                 continue
             if accounts.private_observation(snapshot):
@@ -2322,6 +2323,14 @@ class Runner:
                 # back, it and the rest are discarded and the screen is observed and planned again.
                 course.drop()
                 recent.append({'tipo': 'plan_interrumpido', 'control': 'una acción de riesgo va sola y al final'})
+                continue
+            if attachment_hint and (risk in {'issue', 'confirm', 'unknown', 'terms', 'blocked'}
+                                    or action.kind in {'human', 'done'}):
+                # The portal still wants its file and the agent did not attach it: nothing is sent,
+                # confirmed or approved before the person attaches it, as it always was.
+                attachment_tries = ATTACHMENT_HINTS
+                course.drop()
+                await self.human(key, page, 'attachment', ATTACHMENT_PAUSE, challenge_seen=True)
                 continue
             if risk == 'confirm' and (committed or issued):
                 risk = 'normal'

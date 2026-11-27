@@ -139,6 +139,29 @@ class UploadInBrowserTests(unittest.IsolatedAsyncioTestCase):
         await expect(preview).to_have_attribute('src', re.compile(r'/api/chat/files/[0-9a-f]{32}\?w=320$'))
         self.assertEqual(errors, [])
 
+    async def test_action_before_the_first_state_waits_for_the_panel_token(self):
+        page = await self.browser.new_page()
+        held, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(route):
+            held.set()
+            await release.wait()
+            await route.continue_()
+        # The first state is held back: the panel is on screen but has no token yet.
+        await page.route('**/api/state', hold)
+        tokens = []
+        page.on('request', lambda request: tokens.append(request.headers.get('x-app-token'))
+                if request.method == 'POST' and request.url.endswith('/api/demo') else None)
+        await page.goto(f'http://127.0.0.1:{self.port}/#bandeja')
+        await asyncio.wait_for(held.wait(), 20)
+        await page.get_by_role('button', name='Cargar ticket de ejemplo').click()
+        await asyncio.sleep(.4)
+        self.assertEqual(tokens, [])  # Nothing leaves without the token, and nothing is refused.
+        await expect(page.locator('#notice')).to_be_hidden()
+        release.set()
+        await expect(page.locator('#notice')).to_contain_text('Ticket de ejemplo disponible')
+        self.assertEqual(tokens, [self.app.state.csrf_token])
+
     async def test_inbox_upload_shows_progress_and_reading_stage(self):
         page = await self.browser.new_page()
         await page.add_init_script(RECORD_PROGRESS)

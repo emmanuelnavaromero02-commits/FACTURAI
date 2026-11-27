@@ -77,8 +77,17 @@ function notify(message, failed = false) {
   $('notice').classList.toggle('error', failed);
 }
 
+// The panel token arrives with the first state. An action pressed before that waits for it
+// instead of being refused by the server.
+let announceToken;
+const tokenArrived = new Promise(resolve => { announceToken = resolve; });
+async function panelToken() {
+  if (!state.token) await Promise.race([tokenArrived, new Promise(resolve => setTimeout(resolve, 10_000))]);
+  return state.token;
+}
+
 async function api(path, method = 'GET', payload) {
-  const headers = {'x-app-token': state.token};
+  const headers = {'x-app-token': method === 'GET' ? state.token : await panelToken()};
   const options = {method, headers};
   if (payload instanceof FormData) options.body = payload;
   else if (payload !== undefined) {
@@ -263,7 +272,8 @@ const mail = installMail({api, currency, profile: () => state.profile, showSetti
   changed: changedElsewhere});
 const ai = installAI({api, changed: changedElsewhere});
 const measurement = installMeasurement({api, catalog: () => state.catalog});
-const chat = installChat({api, getState: () => state, actionsFor: row => chatActions(row)});
+const chat = installChat({api, getState: () => state, actionsFor: row => chatActions(row), token: panelToken,
+  changed: () => refresh().catch(() => {})});
 $('chat-progress').after($('captcha-alert'));
 
 function blank(title, description, mark = '▤') {
@@ -977,6 +987,11 @@ async function refresh() {
   }
   const latest = result.data;
   stateTag = result.tag;
+  // The token is kept before anything else is awaited, for whoever is already waiting to act.
+  if (latest.token) {
+    state = {...state, token: latest.token};
+    announceToken();
+  }
   if (!latest.catalog) latest.catalog = (await loadCatalog()) || state.catalog || {};
   else catalog = latest.catalog;
   const interacting = document.hidden || viewer.hasControl() || Boolean(document.querySelector('dialog[open], .row-actions details[open]')) ||
@@ -1021,7 +1036,7 @@ function upload(files) {
       const data = new FormData();
       for (const file of ready) data.append('files', file);
       const label = `${ready.length} ${ready.length === 1 ? 'archivo' : 'archivos'} (${sizeLabel(ready.reduce((sum, file) => sum + file.size, 0))})`;
-      rows = await sendForm('/api/upload', data, {token: state.token, onProgress: fraction => uploadProgress(label, fraction)});
+      rows = await sendForm('/api/upload', data, {token: await panelToken(), onProgress: fraction => uploadProgress(label, fraction)});
     } finally {
       uploading = false;
       uploadProgress('', null);

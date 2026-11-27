@@ -13,14 +13,11 @@ import uvicorn
 from PIL import Image
 from playwright.async_api import async_playwright, expect
 
-from facturador.app import BASE, create_app
-from facturador.avisos import Avisos
+from facturador.app import create_app
 from facturador.avisos_push import PushDevices
-from facturador.avisos_rutas import avisos_router, piezas_router
 from facturador.models import Receipt
 from facturador.permisos import permitido
-from facturador.permisos_rutas import permisos_router
-from facturador.registro_datos import datos_de_registro, registro_router
+from facturador.registro_datos import datos_de_registro
 
 
 def seed_ticket(store, root):
@@ -40,14 +37,9 @@ async def smoke():
         root = Path(folder)
         app = create_app(root, port=port)
         store = app.state.store
-        sent = []
-        avisos = Avisos(store, push=PushDevices(store, send=lambda **kw: sent.append(kw)),
-                        panel_url=f'http://127.0.0.1:{port}')
-        # The same wiring the coordinator adds to app.py.
-        app.include_router(avisos_router(store, avisos))
-        app.include_router(permisos_router(store))
-        app.include_router(registro_router(root))
-        app.include_router(piezas_router(BASE / 'web'))
+        # The panel's own notices, with a sender that reaches no push service.
+        avisos = app.state.avisos
+        avisos.push = PushDevices(store, send=lambda **kw: None)
         key = seed_ticket(store, root)
         avisos.avisar('te_necesito', clave='uno', job_id=key, comercio='Cafetería Luna',
                       motivo='Resuelve la verificación «no soy un robot»')
@@ -70,8 +62,7 @@ async def smoke():
                 ui.on('console', lambda m: problems.append(m.text) if m.type == 'error' else None)
                 ui.on('pageerror', lambda e: problems.append(str(e)))
                 await ui.goto(origin + '/#bandeja')
-                await ui.add_script_tag(url='/avisos.js', type='module')
-                bell = ui.get_by_role('button', name='Avisos: 1 sin leer')
+                bell =ui.get_by_role('button', name='Avisos: 1 sin leer')
                 await expect(bell).to_be_visible(timeout=10_000)
                 await bell.click()
                 dialog = ui.locator('#avisos-dialog')
@@ -85,8 +76,7 @@ async def smoke():
                 assert avisos.sin_leer() == 0
 
                 await ui.goto(origin + '/#ajustes')
-                await ui.add_script_tag(url='/avisos.js', type='module')
-                cards = ui.locator('#screen-ajustes')
+                cards =ui.locator('#screen-ajustes')
                 await expect(cards.get_by_role('heading', name='Avisos', exact=True)).to_be_visible(timeout=10_000)
                 await expect(cards.get_by_role('heading', name='Permisos')).to_be_visible()
                 await expect(cards.get_by_role('heading', name='Datos para registros')).to_be_visible()
@@ -141,7 +131,6 @@ async def smoke():
 
                 # A notice link opened from outside lands on the ticket and the address is cleaned.
                 await ui.goto(origin + f'/?ticket={key}#bandeja')
-                await ui.add_script_tag(url='/avisos.js', type='module')
                 await expect(ui.locator(f'#tickets tr[data-job-id="{key}"]')).to_have_class('aviso-destacado', timeout=10_000)
                 assert ui.url == origin + '/#bandeja', ui.url
                 csp = [p for p in problems if 'Content Security Policy' in p or 'avisos' in p.lower()]
