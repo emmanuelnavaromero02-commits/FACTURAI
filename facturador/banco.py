@@ -429,9 +429,16 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             if plan is not None:
                 plan.close()
-    args.salida.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+    figures = json.dumps(result, ensure_ascii=False, indent=2)
+    output = args.salida
+    try:
+        output.write_text(figures, encoding='utf-8')
+    except OSError:
+        # The folder may be read-only (inside the container): the measurement is not thrown away.
+        output = Path(tempfile.gettempdir()) / output.name
+        output.write_text(figures, encoding='utf-8')
     print(resumen(result))
-    print('Cifras completas en ' + str(args.salida))
+    print('Cifras completas en ' + str(output))
     return 0
 
 

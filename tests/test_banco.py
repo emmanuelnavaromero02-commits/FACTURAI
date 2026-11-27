@@ -328,6 +328,17 @@ class AislamientoTests(unittest.TestCase):
         self.assertEqual(data['ia'], 'guionizada')
         self.assertIn('1 de 1 portales nuevos salieron solos', printed.getvalue())
 
+    def test_comando_no_pierde_la_medicion_si_no_puede_escribir_donde_se_pidio(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'FACTURADOR_CHROMIUM_PATH': CHROME}):
+            missing = Path(folder) / 'no-existe' / 'medicion-sin-carpeta.json'
+            saved = Path(tempfile.gettempdir()) / missing.name
+            self.addCleanup(saved.unlink, missing_ok=True)
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                self.assertEqual(banco.main(['--portales', 'una_pagina', '--salida', str(missing)]), 0)
+            self.assertEqual(json.loads(saved.read_text(encoding='utf-8'))['ia'], 'guionizada')
+            self.assertIn(str(saved), printed.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()
