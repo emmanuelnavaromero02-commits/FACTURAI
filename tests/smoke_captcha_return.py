@@ -42,7 +42,7 @@ async def smoke():
                         value=None,risk='issue',reason='Confirmar emisión')
         try:
             with patch.object(runner, 'start_browser', open_browser), patch('facturador.runner.AI.next_action', return_value=action) as model:
-                def next_action(_, observation, __):
+                def next_action(_, observation, __, *_rest, **_options):
                     if 'Continuar' in json.loads(observation)['estado_visible']:
                         return Action(kind='click', target=Target(by='role', role='link', name='Continuar', exact=True),
                                       value=None, risk='normal', reason='Avanzar tras la verificación')

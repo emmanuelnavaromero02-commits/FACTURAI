@@ -252,7 +252,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
             raise ValueError("Guarda primero tus datos fiscales en el panel")
         return Profile.model_validate_json(path.read_text(encoding="utf-8"))
 
-    automation = TicketAutomation(store, runner, plan, profile)
+    automation = TicketAutomation(store, runner, plan, profile, whatsapp=lambda: app.state.whatsapp, mail=True)
     # The worker itself checks whether any mailbox (Gmail or IMAP) is connected.
     mail_recovery = InvoiceMailRecovery(store, lambda: automation.enabled, lambda: runner.active_id)
     app.state.automation = automation

@@ -5,19 +5,23 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
 import threading
 import time
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 
 import httpx
 from pypdf.errors import PyPdfError
 
+from . import permisos
 from .ai import AI
 from .auth import PlanError, read_json, write_private
 from .uso_ia import en_ticket
 from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, portal_suggestions, public_portal_origin
-from .db import READ_DELAYS
+from .correo_envio import MailOutbox, can_send
+from .db import AUTO_ELIGIBLE, READ_DELAYS, now
 from .local_reader import read_local_page
 from .models import Receipt
 from .portal_directory import SOURCE as DIRECTORY, invoice_confirmed, lookup_safely, record_safely, ticket_values
@@ -27,6 +31,42 @@ from .read_http import ServiceWait, retry_seconds
 from .receipt_evidence import local_ticket, portal_evidence, printed_payment
 
 log = logging.getLogger(__name__)
+
+# A merchant without a portal that asks for the request by WhatsApp or by mail.
+DIRECT = 'solicitud_directa'
+DIRECT_CHANNELS = ('correo', 'whatsapp')  # Mail first when the ticket offers both.
+DIRECT_PERMISSION = {'correo': 'pedir_por_correo', 'whatsapp': 'pedir_por_whatsapp'}
+DIRECT_LABEL = {'correo': 'correo', 'whatsapp': 'WhatsApp'}
+DIRECT_TITLE = {'correo': 'Correo', 'whatsapp': 'WhatsApp'}
+OWN_PHOTOS = 'leer_mis_fotos_de_whatsapp'
+# Refusals raised while the channel is busy, before anything was reserved: try again later.
+CHANNEL_BUSY = ('Hay una operación de WhatsApp en curso.', 'Espera a que termine el trámite del navegador.',
+                'El navegador está ocupado.', 'Hay un envío de correo en curso.')
+
+
+def _epoch(value) -> float:
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def permission_since(root, name):
+    """Epoch since when a standing permission is on, or None while it is off."""
+    for item in permisos.estado(root):
+        if item['nombre'] == name and item['activo'] and isinstance(item['desde'], (int, float)):
+            return item['desde']
+    return None
+
+
+def direct_channels(receipt: Receipt) -> list[str]:
+    return [channel for channel, value in (('correo', receipt.merchant_email),
+                                           ('whatsapp', receipt.merchant_whatsapp)) if value]
+
+
+def direct_note(receipt: Receipt) -> str:
+    labels = [DIRECT_LABEL[channel] for channel in direct_channels(receipt)]
+    return 'Este comercio factura por ' + ' y por '.join(labels) + '.'
 
 
 def transient_read_delay(error):
@@ -50,7 +90,7 @@ def review_questions(receipt: Receipt, *, confirmed_portal: bool = False) -> lis
     if receipt.provider == CUSTOM_PORTAL and receipt.portal_url and not confirmed_portal:
         errors.append('Confirma el dominio del portal antes de compartir tus datos fiscales: '
                       + (public_portal_origin(receipt.portal_url) or 'revisa la dirección impresa'))
-    elif receipt.provider not in CATALOG and receipt.provider != CUSTOM_PORTAL:
+    elif receipt.provider not in CATALOG and receipt.provider not in {CUSTOM_PORTAL, DIRECT}:
         errors.append('Indica el portal de facturación que aparece en el ticket.')
     return errors
 
@@ -463,8 +503,19 @@ READ_PHASES = {
 
 
 class TicketAutomation:
-    def __init__(self, store, runner, plan, get_profile):
+    def __init__(self, store, runner, plan, get_profile, *, whatsapp=None, mail=None):
+        """`whatsapp` returns the WhatsApp routes (or None); `mail` is a mail outbox, or True for the program's own.
+
+        Without them a ticket that asks for a direct request waits for the person."""
         self.store, self.runner, self.plan, self.get_profile = store, runner, plan, get_profile
+        self.whatsapp = whatsapp
+        self.mail = MailOutbox(store) if mail is True else mail
+        # Only tickets created after this start may be requested by the queue: a new
+        # version never sends anything for a ticket that already existed.
+        self.started, self.started_at = time.time(), now()
+        self._direct: dict[str, dict] = {}  # Direct requests this run may still send.
+        self._direct_checked: dict[str, str] = {}  # Last reading examined for a direct channel.
+        self._adopted: set[str] = set()  # Own WhatsApp photos already sent down the chat path.
         self.settings = store.root / 'automation.json'
         settings = read_json(self.settings, {})
         self.enabled = settings.get('enabled') is True
@@ -663,6 +714,12 @@ class TicketAutomation:
             self._set('reading', key, 'Esperando la lectura de las demás imágenes de esta carga.')
             return False
         receipt = Receipt.model_validate(row['receipt'])
+        if receipt.provider == DIRECT:
+            # A direct request never opens a portal; it is asked by WhatsApp or by mail.
+            message = direct_note(receipt) if direct_channels(receipt) else 'Solicita el CFDI al comercio.'
+            self.store.note_review(row, message + ' Pídela desde el ticket.')
+            self._set('review', key, message)
+            return self.store.get(key)['status'] != 'ready'
         confirmed_portal = portal_confirmed(self.store, row, receipt)
         questions = review_questions(receipt, confirmed_portal=confirmed_portal)
         if questions:
@@ -689,6 +746,225 @@ class TicketAutomation:
         self._set('queued', key, 'En cola para preparar el portal y continuar donde los datos sean comprobables.')
         return True
 
+    # Direct requests: a merchant without a portal that asks for WhatsApp or mail.
+
+    def _without_portal(self, row) -> bool:
+        """True only when no portal is known: catalog, printed link, directory or verified search."""
+        receipt = Receipt.model_validate(row['receipt'])
+        if receipt.provider == CUSTOM_PORTAL:
+            # Only an unverified web suggestion is not a portal; the ticket's own instruction wins.
+            if portal_confirmed(self.store, row, receipt):
+                return False
+            sources = next((json.loads(event['detail']) for event in reversed(self.store.events(row['id']))
+                            if event['kind'] == 'fuentes_de_campos'), {})
+            if (sources.get('fields', {}).get('provider') != 'busqueda_web'
+                    or 'enlace_publico_comprobado' in sources.get('tools', [])):
+                return False
+        elif receipt.provider not in {'unknown', DIRECT}:
+            return False
+        for path in [Path(row['source_path']), *self.store.companion_paths(row['id'])]:
+            try:
+                links, _ = portal_evidence(path, read_local_page(path))
+            except (OSError, ValueError, RuntimeError, PyPdfError):
+                continue
+            if links:
+                return False  # A printed fiscal link (even an ambiguous one) is a portal.
+        return True
+
+    async def _direct_from_read(self, row) -> bool:
+        """Turn a reading without a portal into a direct request when the ticket names a channel."""
+        key = row['id']
+        receipt = Receipt.model_validate(row['receipt'])
+        if (row['status'] != 'review' or row['auto_stage'] != 'review' or not direct_channels(receipt)
+                or row['historical'] or row['issue_attempted'] or row['human_exposed'] or row['issuance_seen']
+                or row['uuid'] or receipt.source.startswith('Ejemplo:') or not row['source_path']
+                or _epoch(row['updated']) < self.started or self._direct_checked.get(key) == row['updated']):
+            return False
+        self._direct_checked[key] = row['updated']
+        if not await asyncio.to_thread(self._without_portal, row):
+            return False
+        direct = receipt.model_copy(update={'provider': DIRECT, 'portal_url': ''})
+        errors = review_questions(direct)
+        note = ' '.join([direct_note(direct), *(error.rstrip('.') + '.' for error in errors)])
+        with self._classify:
+            current = self.store.get(key)
+            if current['updated'] != row['updated']:
+                return False  # A person or another read changed it meanwhile.
+            # auto_stage 'review' is the token here: any save by a person clears it.
+            saved = self.store.save_receipt(key, direct, not errors, claim='review', note=note)
+        if saved['receipt'] != direct.model_dump() or saved['status'] not in {'external', 'review'}:
+            return False
+        self._note_direct(key, note)
+        dropped = public_portal_origin(receipt.portal_url) if receipt.portal_url else ''
+        self.store.event(key, 'canal_directo', note + (' Sugerencia web sin comprobar descartada: ' + dropped
+                                                        if dropped else ''))
+        self._direct[key] = {'failed': {}, 'message': ''}
+        self._set('review', key, note)
+        return True
+
+    def _note_direct(self, key, message):
+        with self.store.connect() as db:
+            db.execute("UPDATE jobs SET message=?,updated=? WHERE id=? AND status='external' AND issue_attempted=0 "
+                       "AND message<>?", (message, now(), key, message))
+
+    def _requested(self, key) -> bool:
+        """Either channel already holds a request for this case (sent, uncertain or being prepared)."""
+        with self.store.connect() as db:
+            for table in ('mail_requests', 'whatsapp_requests'):
+                try:
+                    if db.execute(f'SELECT 1 FROM {table} WHERE job_id=?', (key,)).fetchone():
+                        return True
+                except sqlite3.OperationalError:
+                    pass  # That channel was never set up in this data folder.
+        return False
+
+    def _browser_busy(self):
+        viewer = self.runner.viewer
+        return bool(self.runner.has_active_jobs() or self.runner.lock.locked() or viewer.channel
+                    or viewer.dialog or viewer.file_request)
+
+    async def _channel_state(self, row, channel, info):
+        """('send' | 'wait' | 'manual', message for the person) for one channel of the ticket."""
+        if channel in info['failed']:
+            return 'manual', (f'No se pudo pedir por {DIRECT_LABEL[channel]}: '
+                              f'{info["failed"][channel].rstrip(".")}. Pídela desde el ticket.')
+        since = permission_since(self.store.root, DIRECT_PERMISSION[channel])
+        if since is None:
+            return 'manual', 'Pídela desde el ticket, o activa el permiso en Ajustes para que los próximos se pidan solos.'
+        created = _epoch(row['created'])
+        if created < since or created < self.started:
+            return 'manual', 'Pídela desde el ticket.'  # Turning a permission on never sends old tickets.
+        if channel == 'correo':
+            if self.mail is None or not can_send(self.store.root):
+                return 'wait', 'Conecta un correo con envío en Ajustes para pedirla sola.'
+        else:
+            routes = self.whatsapp() if self.whatsapp else None
+            try:
+                link = await routes.link_state() if routes is not None else {}
+            except Exception:
+                link = {}  # An unreadable WhatsApp page counts as not linked.
+            if not link.get('ready'):
+                return 'wait', 'Vincula WhatsApp para pedirla sola.'
+            if self._browser_busy():
+                return 'wait', 'Se pedirá por WhatsApp cuando se libere el navegador.'
+        try:
+            self.get_profile()
+        except ValueError:
+            return 'wait', 'Guarda tu perfil fiscal en Ajustes para pedirla sola.'
+        return 'send', ''
+
+    async def _send_direct(self, key, channel, receipt):
+        """'done' once a request exists, 'busy' to try later, or the error that stopped it."""
+        try:
+            if channel == 'correo':
+                await asyncio.to_thread(self.mail.request, key, receipt.merchant_email, False, self.get_profile())
+            else:
+                await self.whatsapp().request_automatically(key)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._requested(key):
+                return 'done'  # It may have reached the merchant: its own subsystem follows it up.
+            message = str(exc) if isinstance(exc, ValueError) else 'Revisa el canal en Ajustes.'
+            if message in CHANNEL_BUSY:
+                return 'busy'
+            if not isinstance(exc, ValueError):
+                log.exception('Error al pedir una factura por %s', DIRECT_LABEL[channel])
+            self.store.event(key, 'pedido_directo_error', f'{channel}: {message}')
+            return message
+        self.store.event(key, 'pedido_directo_auto', channel)
+        return 'done'
+
+    async def _direct_request(self, key) -> bool:
+        info = self._direct[key]
+        try:
+            row = self.store.get(key)
+        except KeyError:
+            self._direct.pop(key, None)
+            return False
+        receipt = Receipt.model_validate(row['receipt'])
+        if row['status'] == 'review' and receipt.provider == DIRECT and not row['issue_attempted']:
+            return False  # Still waits for the person to complete the ticket.
+        if (row['status'] != 'external' or receipt.provider != DIRECT or row['historical'] or row['issue_attempted']
+                or row['human_exposed'] or row['issuance_seen'] or row['uuid'] or receipt.ready_errors()
+                or receipt.source.startswith('Ejemplo:') or self._requested(key)):
+            self._direct.pop(key, None)  # Already requested, invoiced or changed by the person.
+            return False
+        states = {}
+        for channel in direct_channels(receipt):
+            states[channel] = await self._channel_state(row, channel, info)
+            if states[channel][0] != 'send':
+                continue
+            self._set('requesting', key, f'Pidiendo la factura por {DIRECT_LABEL[channel]}.')
+            outcome = await self._send_direct(key, channel, receipt)
+            if outcome == 'done':
+                self._direct.pop(key, None)
+                self._set('requested', key, self.store.get(key)['message'])
+                return True
+            if outcome == 'busy':
+                return False  # Nothing was reserved; this channel is tried again on the next round.
+            info['failed'][channel] = outcome  # Recorded once; never retried by the queue.
+            states[channel] = await self._channel_state(row, channel, info)
+        both = len(states) > 1
+        message = ' '.join([direct_note(receipt), *dict.fromkeys(
+            (DIRECT_TITLE[channel] + ': ' if both else '') + text for channel, (_, text) in states.items())])
+        if message != info['message']:
+            info['message'] = message
+            self._note_direct(key, message)
+        if not any(state == 'wait' for state, _ in states.values()):
+            self._direct.pop(key, None)  # Nothing left to wait for: the person decides.
+        return False
+
+    async def _direct_step(self) -> bool:
+        for key in list(self._direct):
+            if await self._direct_request(key):
+                return True
+        return False
+
+    async def _direct_inbox(self) -> bool:
+        """Inbox tickets read in this run (the toggle is on) that name a WhatsApp or a mail."""
+        with self.store.connect() as db:
+            rows = [self.store.decode(row) for row in db.execute(
+                f"""SELECT * FROM jobs WHERE {AUTO_ELIGIBLE} AND status='review' AND auto_stage='review'
+                    AND updated>=? AND json_extract(receipt,'$.provider') IN (?,?,?)
+                    AND (COALESCE(json_extract(receipt,'$.merchant_whatsapp'),'')<>''
+                         OR COALESCE(json_extract(receipt,'$.merchant_email'),'')<>'')
+                    ORDER BY created,id""", (self.started_at, 'unknown', DIRECT, CUSTOM_PORTAL))]
+        for row in rows:
+            if await self._direct_from_read(row):
+                return True
+        return False
+
+    def _own_photos_on(self) -> bool:
+        return permisos.permitido(self.store.root, OWN_PHOTOS)
+
+    def _adopt_own_photos(self):
+        """Photos the WhatsApp watcher took from the owner's own chat follow the chat path."""
+        if not self._own_photos_on():
+            return
+        try:
+            with self.store.connect() as db:
+                media = db.execute("SELECT at,job_ids FROM whatsapp_own_media WHERE state='imported' AND at>=?",
+                                   (self.started_at,)).fetchall()
+        except sqlite3.OperationalError:
+            return  # The WhatsApp watcher never ran in this data folder.
+        for item in media:
+            imported = _epoch(item['at'])
+            for key in filter(None, item['job_ids'].split(',')):
+                if key in self._adopted:
+                    continue
+                self._adopted.add(key)
+                try:
+                    row = self.store.get(key)
+                except KeyError:
+                    continue
+                # Only the ticket this import created now; never an older one with the same photo.
+                if (row['status'] == 'new' and row['auto_stage'] == '' and not row['batch_id']
+                        and not row['historical'] and row['receipt']['source'].startswith('WhatsApp')
+                        and self.started <= _epoch(row['created']) <= imported + 1
+                        and imported - _epoch(row['created']) < 300):
+                    self.store.queue_chat_job(key)
+
     async def chat_step(self, wait=True):
         """Process chat uploads independently of the legacy inbox toggle.
 
@@ -698,6 +974,7 @@ class TicketAutomation:
         # new read goes to the model; the originals are read locally instead.
         ready = self.plan.status()['status'] == 'ready' and self.plan_read_after <= time.time()
         launched = []
+        self._adopt_own_photos()
         try:
             for row in self.store.chat_jobs():
                 key, stage = row['id'], row['auto_stage']
@@ -721,6 +998,7 @@ class TicketAutomation:
                     if prepared:
                         return True
                     continue
+                await self._direct_from_read(row)
                 self.store.finish_chat_job(key)
                 return True
             return bool(launched)
@@ -734,8 +1012,12 @@ class TicketAutomation:
         """One round of the queue; `wait` as in chat_step."""
         if await self.chat_step(wait):
             return True
+        if await self._direct_step():
+            return True
         if not self.enabled:
             return False
+        if await self._direct_inbox():
+            return True
         # Explain already extracted tickets without another model request or a field change.
         previous = self.store.auto_candidates('review')
         if previous:
@@ -811,6 +1093,8 @@ class TicketAutomation:
                 log.exception('Error al procesar la bandeja de tickets')
                 self._set('review', self._state.get('current_id'), 'Revisa el estado del ticket en la bandeja.')
             try:
-                await asyncio.wait_for(self.wake.wait(), timeout=2 if self.enabled or self.store.has_chat_jobs() else None)
+                # Direct requests waiting for a channel and own WhatsApp photos are not announced by a wake.
+                polling = (self.enabled or self.store.has_chat_jobs() or self._direct or self._own_photos_on())
+                await asyncio.wait_for(self.wake.wait(), timeout=2 if polling else None)
             except asyncio.TimeoutError:
                 pass

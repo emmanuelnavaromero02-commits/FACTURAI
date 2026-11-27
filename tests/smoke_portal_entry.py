@@ -56,7 +56,7 @@ async def smoke():
                 contexts.add(runner.context)
                 await runner.context.route(origin+'/**', merchant)
 
-        def infer(_, observation, __):
+        def infer(_, observation, __, *_rest, **_options):
             page = json.loads(observation)['estado_visible']
             if 'RFC receptor' in page:
                 return click('button', 'Facturar', 'issue')

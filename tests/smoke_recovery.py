@@ -95,7 +95,7 @@ async def smoke():
                         raise failure from (session_errors[-1] if session_errors else None)
                     await asyncio.sleep(.04)
 
-        def infer(instructions, state, screenshot):
+        def infer(instructions, state, screenshot, *_, **__):
             if 'Factura emitida' in state:
                 raise PlanError('Cuota de prueba agotada.', 'limit')
             return action('click', 'button', 'Facturar')

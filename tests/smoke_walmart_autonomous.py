@@ -65,7 +65,7 @@ async def smoke():
             key = row['id']
             store.save_receipt(key, RECEIPT, ready=True)
 
-            def next_action(_instructions, observation, _screenshot):
+            def next_action(_instructions, observation, _screenshot, *_, **__):
                 if 'Número de Ticket' in observation:
                     return click('Continuar')
                 if 'Razón Social' in observation:

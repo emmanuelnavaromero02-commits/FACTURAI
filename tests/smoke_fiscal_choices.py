@@ -70,7 +70,7 @@ async def smoke():
                           value=TICKET.billing_codes[0], reason='Completar el campo que habilita la emisión', risk='normal')
             actions = iter([click('Facturar conceptos'), click('Sí estoy seguro'), fill, click('Sí estoy seguro'),
                             Action(kind='done', target=None, value=None, reason='Terminó', risk='normal')])
-            def next_action(instructions, observation, screenshot):
+            def next_action(instructions, observation, screenshot, *_, **__):
                 action = next(actions)
                 if action is fill:
                     assert 'deshabilitado' in observation and not store.get(key)['issue_attempted']
