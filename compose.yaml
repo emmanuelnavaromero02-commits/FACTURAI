@@ -38,6 +38,9 @@ services:
     #u   # Red de Docker desde la que llega el proxy; de ahí se toma la dirección real de quien entra.
     #u   FACTURADOR_PROXIES: 172.16.0.0/12
     #u   FACTURADOR_NAVEGADORES_MAX: '3'
+    #u   # Opcional: identificador de la aplicación registrada en Microsoft, para que cada persona
+    #u   # conecte su Outlook o Hotmail con solo pulsar «Conectar Outlook» (ver README).
+    #u   # FACTURADOR_OUTLOOK_APLICACION: 00000000-0000-0000-0000-000000000000
     #u secrets:
     #u   - llave_maestra
 

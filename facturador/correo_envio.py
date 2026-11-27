@@ -12,7 +12,7 @@ from pathlib import Path
 
 import httpx
 
-from . import buzon, gmail
+from . import buzon, gmail, outlook
 from .db import now
 from .ingest import MAX_UPLOAD, validate_document
 from .models import Profile, Receipt
@@ -21,7 +21,10 @@ from .permisos import permitido
 SEND_LOCK = threading.Lock()
 REFUSED = 'El servidor de correo rechazó la dirección del comercio. Revisa el correo escrito.'
 SENDER_REFUSED = 'El servidor de correo no aceptó enviar desde tu cuenta. Revisa la cuenta en Ajustes.'
-NO_SENDER = 'Conecta en Ajustes una cuenta de correo que pueda enviar (servidor de salida o Gmail con permiso de envío).'
+NO_SENDER = ('Conecta en Ajustes una cuenta de correo que pueda enviar '
+             '(servidor de salida, o Gmail u Outlook con permiso de envío).')
+OUTLOOK_SENDING = ('Microsoft no dejó enviar desde tu correo de Outlook. Vuelve a dar el permiso de envío en Ajustes; '
+                   'en una cuenta de empresa lo activa quien administra el correo.')
 UNCERTAIN = ('El envío pudo haber llegado: revisa la carpeta de enviados de tu correo. '
              'La respuesta del comercio se buscará sola; no se repetirá la solicitud.')
 
@@ -61,6 +64,7 @@ def smtp_security(account: dict) -> str:
 class SmtpSender:
     """SMTP with implicit TLS or mandatory STARTTLS (587 by default). Never plain text."""
     channel = 'smtp'
+    refused = buzon.LOGIN
 
     def __init__(self, account: dict, password: str):
         self.account = dict(account)
@@ -70,6 +74,9 @@ class SmtpSender:
 
     def __repr__(self):
         return f'SmtpSender({self.account.get("smtp_host", "")!r})'
+
+    def _login(self, smtp):
+        smtp.login(self.account['user'], self.__password)
 
     def connect(self):
         host, port = self.account['smtp_host'], int(self.account.get('smtp_port') or 465)
@@ -90,10 +97,10 @@ class SmtpSender:
             raise ValueError(buzon.CONNECTION) from None
         self.smtp = smtp
         try:
-            smtp.login(self.account['user'], self.__password)
+            self._login(smtp)
         except (smtplib.SMTPException, UnicodeError):
             self.close()
-            raise ValueError(buzon.LOGIN) from None
+            raise buzon.LoginRefused(self.refused) from None
         except OSError:
             self.close()
             raise ValueError(buzon.CONNECTION) from None
@@ -133,6 +140,45 @@ class SmtpSender:
             self.smtp = None
 
 
+class OutlookSender(SmtpSender):
+    """Outlook.com, Hotmail and Microsoft 365: the same SMTP, opened with a Microsoft access token."""
+    channel = 'outlook'
+    refused = OUTLOOK_SENDING
+
+    def __init__(self, account: dict, tokens):
+        super().__init__(account, '')
+        self.__tokens = tokens   # tokens(force=False) -> an access token that is valid now
+        self.__token = ''
+
+    def __repr__(self):
+        return 'OutlookSender()'
+
+    def _login(self, smtp):
+        try:
+            smtp.ehlo_or_helo_if_needed()
+            # The credentials do not fit in the AUTH line (RFC 4954): they go after the server's 334.
+            smtp.auth('XOAUTH2', outlook.sasl(self.account['user'], self.__token), initial_response_ok=False)
+        except smtplib.SMTPException:
+            raise
+        except ValueError:
+            raise smtplib.SMTPException('XOAUTH2') from None  # A challenge that is not base64.
+
+    def connect(self):
+        self.__token = self.__tokens()
+        try:
+            try:
+                super().connect()
+            except buzon.LoginRefused:
+                # A permission taken away stops a token before its time: renew it once and try again.
+                fresh = self.__tokens(force=True)
+                if not fresh or fresh == self.__token:
+                    raise
+                self.__token = fresh
+                super().connect()
+        finally:
+            self.__token = ''
+
+
 class GmailSender:
     """Gmail API send, available only when the optional send permission was granted."""
     channel = 'gmail'
@@ -162,12 +208,15 @@ def default_sender(root):
         return SmtpSender(account, buzon.account_password(root))
     if gmail.can_send(Path(root)):
         return GmailSender(root)
+    microsoft = outlook.mail_account(root) if outlook.can_send(root) else None
+    if microsoft:
+        return OutlookSender(microsoft, lambda force=False: outlook.access_token(root, force=force))
     raise ValueError(NO_SENDER)
 
 
 def can_send(root) -> bool:
     account = buzon.load_account(root)
-    return bool(account and account.get('smtp_host')) or gmail.can_send(Path(root))
+    return bool(account and account.get('smtp_host')) or gmail.can_send(Path(root)) or outlook.can_send(root)
 
 
 class MailOutbox:

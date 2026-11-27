@@ -11,6 +11,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 
+from . import outlook
 from .invoice_mail import AMBIGUOUS
 
 _LOG = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ PREGUNTA = 'Contesta una pregunta en el chat'
 CORREO_AMBIGUO = 'Llegaron varias facturas por correo: elige la de este ticket'
 WHATSAPP_PIDE = 'El comercio pide algo por WhatsApp'
 WHATSAPP_VINCULO = 'Vuelve a vincular WhatsApp con el código QR'
+BUZON_RECONECTAR = 'Vuelve a conectar tu correo de Outlook'
 ESTADOS_TICKET = {
     'verified': ('factura_lista', 'La factura quedó comprobada con su PDF y XML'),
     'blocked': ('ticket_detenido', 'El trámite se detuvo y necesita tu revisión'),
@@ -105,6 +107,10 @@ class VigilanteAvisos:
                 await self.revisar_whatsapp()
             except Exception:
                 _LOG.warning('No se completó la revisión de avisos de WhatsApp.')
+            try:
+                await asyncio.to_thread(self.revisar_buzon)
+            except Exception:
+                _LOG.warning('No se completó la revisión de avisos del correo.')
             try:
                 await asyncio.wait_for(self.stop.wait(), timeout=self.tick)
             except asyncio.TimeoutError:
@@ -252,6 +258,32 @@ class VigilanteAvisos:
                 count = db.execute("SELECT COUNT(*) FROM avisos WHERE clave LIKE 'whatsapp:vinculo:%'").fetchone()[0]
                 aviso = self.avisos.registrar(db, 'whatsapp', clave=f'whatsapp:vinculo:{count + 1}',
                                               motivo=WHATSAPP_VINCULO, pantalla='ajustes')
+        if aviso:
+            self.avisos.entregar(aviso)
+        return aviso
+
+    # ------------------------------------------------------------ mailbox
+
+    def revisar_buzon(self) -> dict | None:
+        """Notify once when Microsoft stops renewing the mailbox's permission and it must be connected again."""
+        root = self.store.root
+        state = 'reconectar' if outlook.needs_reconnect(root) else 'bien' if outlook.connected(root) else ''
+        if not state:
+            return None
+        aviso = None
+        with self.store.connect() as db:
+            if _mark(db, 'outlook') == state:
+                return None
+            db.execute('BEGIN IMMEDIATE')
+            previous = _mark(db, 'outlook')
+            if previous == state:
+                return None
+            _set_mark(db, 'outlook', state)
+            # The first state seen is the starting point; only a mailbox that worked and stopped is told.
+            if previous == 'bien' and state == 'reconectar':
+                count = db.execute("SELECT COUNT(*) FROM avisos WHERE clave LIKE 'outlook:reconectar:%'").fetchone()[0]
+                aviso = self.avisos.registrar(db, 'te_necesito', clave=f'outlook:reconectar:{count + 1}',
+                                              motivo=BUZON_RECONECTAR, pantalla='ajustes')
         if aviso:
             self.avisos.entregar(aviso)
         return aviso

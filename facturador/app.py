@@ -31,7 +31,7 @@ from .auth import CALLBACK, ChatGPTPlan, PlanError, read_json, write_private
 from .automation import TicketAutomation
 from .catalog import CATALOG, CUSTOM_PORTAL, portal_suggestions
 from .chat import chat_router
-from .correo_ajustes import correo_router
+from .correo_ajustes import correo_router, outlook_router
 from .db import Store
 from .diagnostics import check_tools
 from .invoice_mail import InvoiceMailRecovery
@@ -295,6 +295,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
     app.include_router(permisos_router(store))
     app.include_router(registro_router(root))
     app.include_router(piezas_router(BASE / 'web'))
+    app.include_router(outlook_router(root, port=port, public_origin=public_origin))
 
     @app.exception_handler(ValueError)
     async def invalid(request, exc):

@@ -347,6 +347,16 @@ main { margin-left: 0; }
 #mail-feedback:empty, #ia-feedback:empty, #medicion-status:empty { display: none; }
 #mail-feedback.error, #ia-feedback.error { color: var(--danger); }
 #mail-summary, #wa-link-message { overflow-wrap: anywhere; }
+.mail-option { display: grid; gap: 10px; min-width: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; }
+.mail-option-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.mail-option-form { display: grid; gap: 10px; }
+.mail-option-title { margin-top: 4px; }
+.mail-steps { display: grid; gap: 6px; margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; font-weight: 400; }
+.mail-steps code { overflow-wrap: anywhere; user-select: all; color: var(--ink); }
+#outlook-summary, #outlook-feedback { overflow-wrap: anywhere; }
+#outlook-feedback { font-size: 13px; }
+#outlook-feedback:empty { display: none; }
+#outlook-feedback.error { color: var(--danger); }
 .ia-options { display: grid; gap: 10px; }
 .ia-option span { font-size: 13px; }
 .ia-keys { display: grid; gap: 12px; }

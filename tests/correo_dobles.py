@@ -106,6 +106,16 @@ def _tokens(text):
     return [b if b else a for a, b in re.findall(r'"((?:[^"\\]|\\.)*)"|(\S+)', text)]
 
 
+def xoauth2(payload):
+    """User and access token of a SASL XOAUTH2 answer, or two empty texts when it is not one."""
+    try:
+        text = base64.b64decode(payload, validate=True).decode('utf-8')
+    except (ValueError, UnicodeError):
+        return '', ''
+    found = re.fullmatch('user=([^\x01]*)\x01auth=Bearer ([^\x01]*)\x01\x01', text)
+    return (found.group(1), found.group(2)) if found else ('', '')
+
+
 class _ImapHandler(_Handler):
     def setup(self):
         try:
@@ -136,12 +146,29 @@ class _ImapHandler(_Handler):
                 command = 'UID ' + command.upper()
             imap.commands.append(command)
             if command == 'CAPABILITY':
-                self.out(b'* CAPABILITY IMAP4rev1 AUTH=PLAIN\r\n' + tag.encode() + b' OK listo\r\n')
+                extra = b' AUTH=XOAUTH2' if imap.tokens is not None else b''
+                self.out(b'* CAPABILITY IMAP4rev1 AUTH=PLAIN' + extra + b'\r\n' + tag.encode() + b' OK listo\r\n')
+            elif command == 'AUTHENTICATE' and imap.tokens is not None:
+                mechanism, _, answer = args.partition(' ')
+                if mechanism.upper() != 'XOAUTH2':
+                    self.out(tag.encode() + b' NO mecanismo no admitido\r\n')
+                    continue
+                if not answer:
+                    self.out(b'+ \r\n')
+                    answer = self.rfile.readline().decode('ascii', 'replace').strip()
+                user, token = xoauth2(answer)
+                imap.presented.append((user, token))
+                if token and imap.tokens.get(token) == user:
+                    imap.logins += 1
+                    self.out(tag.encode() + b' OK AUTHENTICATE completed.\r\n')
+                else:
+                    self.out(tag.encode() + b' NO AUTHENTICATE failed.\r\n')
             elif command == 'LOGIN':
                 parts = re.fullmatch(r'(\S+) "((?:[^"\\]|\\.)*)"', args)
                 user = parts.group(1) if parts else ''
                 password = re.sub(r'\\(.)', r'\1', parts.group(2)) if parts else ''
-                if user == imap.user and password == imap.password:
+                # A server that takes tokens refuses every password, as Microsoft's do.
+                if imap.tokens is None and user == imap.user and password == imap.password:
                     imap.logins += 1
                     self.out(tag.encode() + b' OK sesion iniciada\r\n')
                 else:
@@ -206,10 +233,15 @@ class _ImapHandler(_Handler):
 
 
 class FakeImap(_Base):
-    """IMAP4rev1 subset that imaplib uses: LOGIN, EXAMINE, UID SEARCH and UID FETCH."""
+    """IMAP4rev1 subset that imaplib uses: LOGIN, EXAMINE, UID SEARCH and UID FETCH.
 
-    def __init__(self, user='buzon@example.org', password='clave-app-ficticia', messages=()):
+    With ``tokens`` (access token -> mailbox address) it also takes AUTHENTICATE XOAUTH2, the way
+    Microsoft's servers do: a token opens only the mailbox it was issued for.
+    """
+
+    def __init__(self, user='buzon@example.org', password='clave-app-ficticia', messages=(), tokens=None):
         self.user, self.password = user, password
+        self.tokens, self.presented = tokens, []
         self.messages, self.commands, self.selected, self.downloads = [], [], [], []
         self.logins, self.validity = 0, 7
         for raw, when in messages:
@@ -291,7 +323,7 @@ class _SmtpHandler(_Handler):
                 if smtp.mode == 'starttls' and not self.secure:
                     features.append('250-STARTTLS')
                 if self.secure:
-                    features.append('250-AUTH PLAIN')
+                    features.append('250-AUTH PLAIN' + (' XOAUTH2' if smtp.tokens is not None else ''))
                 features.append('250 OK')
                 for item in features:
                     self.out(item)
@@ -309,6 +341,23 @@ class _SmtpHandler(_Handler):
                     self.out('538 se requiere cifrado')
                     continue
                 parts = text.split(' ')
+                if smtp.tokens is not None and len(parts) > 1 and parts[1].upper() == 'XOAUTH2':
+                    inline = len(parts) > 2
+                    if not inline:
+                        self.out('334 ')
+                        parts.append(self.rfile.readline().decode('ascii', 'replace').strip())
+                    user, token = xoauth2(parts[2])
+                    smtp.presented.append((user, token, inline))
+                    if token and smtp.tokens.get(token) == user:
+                        authenticated = True
+                        smtp.logins += 1
+                        self.out('235 2.7.0 Authentication successful')
+                    else:
+                        self.out('535 5.7.3 Authentication unsuccessful')
+                    continue
+                if smtp.tokens is not None:
+                    self.out('535 5.7.139 Authentication unsuccessful, basic authentication is disabled')
+                    continue
                 try:
                     _, user, password = base64.b64decode(parts[2]).decode().split('\0')
                 except (IndexError, ValueError):
@@ -360,8 +409,11 @@ class _SmtpHandler(_Handler):
 
 
 class FakeSmtp(_Base):
-    def __init__(self, mode='ssl', user='buzon@example.org', password='clave-app-ficticia'):
+    """SMTP over TLS with AUTH PLAIN and, with ``tokens`` (access token -> address), AUTH XOAUTH2."""
+
+    def __init__(self, mode='ssl', user='buzon@example.org', password='clave-app-ficticia', tokens=None):
         self.mode, self.user, self.password = mode, user, password
+        self.tokens, self.presented = tokens, []
         self.commands, self.received, self.refuse = [], [], set()
         self.logins = 0
         self.on_data = None

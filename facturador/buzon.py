@@ -2,7 +2,8 @@
 
 The rest of the program searches and reads messages through `Mailbox` and never needs to know
 which provider is behind it. The IMAP/SMTP password is kept encrypted, like portal passwords,
-and is never returned, logged or attached to events.
+and is never returned, logged or attached to events. Outlook.com, Hotmail and Microsoft 365 are
+IMAP too: only the login changes, to the access token of Microsoft's sign-in.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ from pathlib import Path
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 
-from . import gmail, secretos
+from . import gmail, outlook, secretos
 from .auth import read_json, write_private
 
 MAX_MESSAGE = 50 * 1024 * 1024
@@ -37,6 +38,8 @@ MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 
 CERTIFICATE = 'El servidor de correo presentó un certificado no válido. Revisa el nombre del servidor.'
 CONNECTION = 'No se pudo conectar con el servidor de correo. Revisa el servidor y el puerto.'
 LOGIN = 'El servidor de correo rechazó el usuario o la contraseña de aplicación.'
+OUTLOOK_LOGIN = ('Microsoft no dejó abrir tu buzón de Outlook. Revisa en Outlook que el acceso IMAP esté activado '
+                 '(Configuración → Correo → Reenvío e IMAP) y vuelve a intentarlo.')
 READING = 'El servidor de correo no completó la consulta. Vuelve a intentarlo.'
 
 
@@ -59,11 +62,29 @@ def valid_host(value: str) -> str:
     return value
 
 
+# Microsoft's servers write Authentication-Results without an identifier: the header starts with the
+# SPF result and carries their own «compauth» verdict. This name stands for them. It is not a valid
+# identifier, so no header can claim it and nobody can type it; it is pinned only for a mailbox
+# opened with Microsoft's sign-in, and that mailbox pins nothing else.
+MICROSOFT_AUTHORITY = 'microsoft:compauth'
+_METHOD_RESULT = re.compile(r'(?:spf|dkim|dmarc)=', re.I)
+_COMPOSITE_RESULT = re.compile(r'(?:^|;)\s*compauth\s*=', re.I)
+
+
 def authserv_id(report: str) -> str:
     """Identifier of the server that wrote an Authentication-Results header (RFC 8601)."""
-    head = re.sub(r'\([^)]*\)', ' ', str(report).partition(';')[0]).split()
+    text = re.sub(r'\([^)]*\)', ' ', str(report))
+    head = text.partition(';')[0].split()
     value = head[0].casefold() if head else ''
-    return value if AUTHORITY.fullmatch(value) else ''
+    if AUTHORITY.fullmatch(value):
+        return value
+    if _METHOD_RESULT.match(value) and _COMPOSITE_RESULT.search(text):
+        return MICROSOFT_AUTHORITY
+    return ''
+
+
+class LoginRefused(ValueError):
+    """The mail server answered and did not accept the credentials."""
 
 
 # ---------------------------------------------------------------- encrypted account
@@ -133,7 +154,7 @@ def gmail_connected(root) -> bool:
 
 
 def mailbox_connected(root) -> bool:
-    return gmail_connected(root) or load_account(root) is not None
+    return gmail_connected(root) or load_account(root) is not None or outlook.connected(root)
 
 
 # ---------------------------------------------------------------- interface
@@ -254,6 +275,7 @@ def _fetch_parts(data):
 
 class ImapMailbox(Mailbox):
     provider = 'imap'
+    refused = LOGIN
 
     def __init__(self, account: dict, password: str):
         self.account = dict(account)
@@ -265,6 +287,9 @@ class ImapMailbox(Mailbox):
 
     def __repr__(self):
         return f'ImapMailbox({self.account.get("imap_host", "")!r})'
+
+    def _login(self, conn):
+        conn.login(self.account['user'], self.__password)
 
     def open(self):
         if self.conn is not None:
@@ -278,9 +303,9 @@ class ImapMailbox(Mailbox):
             raise ValueError(CONNECTION) from None
         try:
             try:
-                conn.login(self.account['user'], self.__password)
+                self._login(conn)
             except (imaplib.IMAP4.error, UnicodeError):
-                raise ValueError(LOGIN) from None
+                raise LoginRefused(self.refused) from None
             typ, _ = conn.select('INBOX', readonly=True)
             if typ != 'OK':
                 raise ValueError(READING)
@@ -334,7 +359,7 @@ class ImapMailbox(Mailbox):
             return None
         head = email.message_from_bytes(headers or b'', policy=policy.default)
         kind = head.get_content_type()
-        return {'ref': f'imap:{self.validity}.{uid.decode()}', 'sender': str(head.get('From', ''))[:250],
+        return {'ref': f'{self.provider}:{self.validity}.{uid.decode()}', 'sender': str(head.get('From', ''))[:250],
                 'to': ', '.join(str(v) for k in ('To', 'Cc') for v in head.get_all(k, []))[:500],
                 'subject': str(head.get('Subject', ''))[:250], 'date': str(head.get('Date', ''))[:150],
                 'received': received, 'size': int(size.group(1)),
@@ -364,7 +389,7 @@ class ImapMailbox(Mailbox):
         return rows
 
     def read(self, ref):
-        found = re.fullmatch(r'imap:(\d+)\.(\d+)', ref or '')
+        found = re.fullmatch(re.escape(self.provider) + r':(\d+)\.(\d+)', ref or '')
         if not found:
             raise ValueError('Mensaje de correo desconocido.')
         self.open()
@@ -393,8 +418,44 @@ class ImapMailbox(Mailbox):
                 stamped += 1
         # Require two or more messages that agree. One message alone may carry a forged header.
         if stamped >= 2 and len(seen) == 1 and '' not in seen:
-            return seen.pop()
+            found = seen.pop()
+            # Microsoft's unnamed report is never learned from what a mailbox happens to hold.
+            return '' if found == MICROSOFT_AUTHORITY else found
         return ''
+
+
+class OutlookMailbox(ImapMailbox):
+    """Outlook.com, Hotmail and Microsoft 365: the same IMAP, opened with a Microsoft access token."""
+    provider = 'outlook'
+    refused = OUTLOOK_LOGIN
+
+    def __init__(self, account: dict, tokens):
+        super().__init__(account, '')
+        self.__tokens = tokens   # tokens(force=False) -> an access token that is valid now
+        self.__token = ''
+
+    def __repr__(self):
+        return 'OutlookMailbox()'
+
+    def _login(self, conn):
+        conn.authenticate('XOAUTH2', outlook.sasl(self.account['user'], self.__token))
+
+    def open(self):
+        if self.conn is not None:
+            return
+        self.__token = self.__tokens()
+        try:
+            try:
+                super().open()
+            except LoginRefused:
+                # A permission taken away stops a token before its time: renew it once and try again.
+                fresh = self.__tokens(force=True)
+                if not fresh or fresh == self.__token:
+                    raise
+                self.__token = fresh
+                super().open()
+        finally:
+            self.__token = ''
 
 
 def message_parts(message) -> dict:
@@ -418,11 +479,18 @@ def message_parts(message) -> dict:
     return {'headers': headers, 'text': body('plain'), 'html': body('html'), 'attachments': attachments}
 
 
-def imap_mailboxes(root) -> list[Mailbox]:
-    account = load_account(root)
+def outlook_mailboxes(root) -> list[Mailbox]:
+    account = outlook.mail_account(root)
     if not account:
         return []
-    return [ImapMailbox(account, account_password(root))]
+    return [OutlookMailbox(account, lambda force=False: outlook.access_token(root, force=force))]
+
+
+def imap_mailboxes(root) -> list[Mailbox]:
+    """Mailboxes read over IMAP: the one with an application password and the one of Microsoft's sign-in."""
+    account = load_account(root)
+    boxes = [ImapMailbox(account, account_password(root))] if account else []
+    return boxes + outlook_mailboxes(root)
 
 
 def open_mailboxes(root) -> list[Mailbox]:
@@ -431,7 +499,8 @@ def open_mailboxes(root) -> list[Mailbox]:
     try:
         boxes.extend(imap_mailboxes(root))
     except ValueError:
-        pass
+        # A password that cannot be opened does not take the Microsoft mailbox away with it.
+        boxes.extend(outlook_mailboxes(root))
     if gmail_connected(root):
         boxes.append(GmailMailbox(root))
     return boxes
@@ -468,3 +537,53 @@ def check_account(settings: dict, password: str) -> str:
         finally:
             sender.close()
     return authority
+
+
+def _outlook_sends(account: dict, tokens) -> None:
+    from .correo_envio import OutlookSender
+    sender = OutlookSender(account, tokens)
+    try:
+        sender.connect()
+    finally:
+        sender.close()
+
+
+def check_outlook(addresses, token: str, *, send: bool, personal: bool) -> tuple[str, str, bool]:
+    """Open with a Microsoft access token the mailbox it belongs to, before the connection is saved.
+
+    Microsoft names an account in more than one way; the first name its mail server accepts with
+    this token is the mailbox. Returns that address, the authority to pin for registration mail
+    (always Microsoft's own report) and whether the outgoing server also accepts the token.
+    Nothing is sent.
+    """
+    def tokens(force=False):
+        return token
+
+    for address in addresses:
+        account = outlook.settings_for(valid_address(address), personal)
+        try:
+            with OutlookMailbox(account, tokens):
+                pass
+        except LoginRefused:
+            continue
+        sends = False
+        if send:
+            try:
+                _outlook_sends(account, tokens)
+                sends = True
+            except ValueError:
+                sends = False  # The mailbox is still good for reading.
+        return account['address'], MICROSOFT_AUTHORITY, sends
+    raise LoginRefused(OUTLOOK_LOGIN)
+
+
+def check_outlook_account(root) -> None:
+    """Log in to the connected Microsoft mailbox (and to its outgoing server when it may send)."""
+    boxes = outlook_mailboxes(root)
+    if not boxes:
+        outlook.access_token(root)  # Says why: not connected, or the permission has to be given again.
+        raise ValueError(outlook.NOT_CONNECTED)
+    with boxes[0]:
+        pass
+    if outlook.can_send(root):
+        _outlook_sends(outlook.mail_account(root), lambda force=False: outlook.access_token(root, force=force))

@@ -190,16 +190,17 @@ Siempre queda para la persona: resolver el «no soy un robot», cualquier dato q
 
 ### Correo
 
-Conecta un buzón en **Ajustes → Correo**. Hay dos formas:
+Conecta un buzón en **Ajustes → Correo**. Hay tres formas:
 
 - **Gmail**, por su API con un cliente OAuth de escritorio (ver [Conexiones y datos](#conexiones-y-datos)). Solo lee, salvo que pulses **Permitir que Gmail también envíe**.
-- **Cualquier buzón por IMAP**, con servidor, puerto (993 por omisión), usuario y **contraseña de aplicación** (una contraseña aparte que crea tu proveedor, no la de tu correo). La conexión usa TLS con el certificado validado. La contraseña se guarda cifrada y no vuelve a salir por la API, los eventos ni los registros. Con un servidor de salida (SMTP, puerto 465 por omisión) también puede pedir facturas. **Probar** inicia sesión sin enviar nada.
+- **Outlook, Hotmail, Live y Microsoft 365**, entrando con tu cuenta de Microsoft (ver [Conexiones y datos](#conexiones-y-datos)). Microsoft dejó de aceptar contraseñas en estos buzones, también las de aplicación: FACTURAI recibe un permiso que se renueva solo y con él abre el buzón. Tu contraseña no pasa por FACTURAI y el permiso se guarda cifrado. Solo lee, salvo que pulses **Permitir que también envíe**. Si Microsoft deja de renovar el permiso, la tarjeta dice **Requiere volver a conectar** y te llega un aviso.
+- **Cualquier otro buzón por IMAP**, con servidor, puerto (993 por omisión), usuario y **contraseña de aplicación** (una contraseña aparte que crea tu proveedor, no la de tu correo). La conexión usa TLS con el certificado validado. La contraseña se guarda cifrada y no vuelve a salir por la API, los eventos ni los registros. Con un servidor de salida (SMTP, puerto 465 por omisión) también puede pedir facturas. **Probar** inicia sesión sin enviar nada.
 
 Qué hace el correo:
 
 - **Buscar la factura aunque no se conozca el folio fiscal.** Se revisan los mensajes con XML, PDF o ZIP desde la fecha del ticket y solo se acepta lo que pasa el cotejo de siempre. Con más de un candidato no se elige y se te avisa. La búsqueda se repite cada 2 minutos la primera media hora, cada 10 minutos hasta las 6 horas y cada hora hasta las 72 horas, y sobrevive a los reinicios.
 - **Leer el correo de alta** de un portal, con el remitente del dominio del portal y el mensaje autenticado por el proveedor.
-- **Pedir la factura por correo** al comercio, con el correo de facturación leído del ticket (puedes corregirlo en **Revisar**). Sale desde el servidor SMTP o desde Gmail con permiso de envío, con un mensaje fijo, una referencia del expediente y el ticket adjunto. Solo se envía con tu confirmación en ese ticket o con el permiso **Pedir por correo**, una vez por expediente y registrado antes de salir.
+- **Pedir la factura por correo** al comercio, con el correo de facturación leído del ticket (puedes corregirlo en **Revisar**). Sale desde el servidor SMTP, desde Gmail o desde Outlook con permiso de envío (en ese orden si hay varios), con un mensaje fijo, una referencia del expediente y el ticket adjunto. Solo se envía con tu confirmación en ese ticket o con el permiso **Pedir por correo**, una vez por expediente y registrado antes de salir.
 
 ### WhatsApp
 
@@ -259,10 +260,18 @@ La pantalla **Medición** (periodos: hoy, 7 días, 30 días o todo) muestra tick
 - **ChatGPT** usa OAuth de aplicación local y la cuota del plan autorizado. La conexión usa HTTPS con OpenAI. Cuando la cuenta informa un límite, conserva los tickets y permite continuar al recuperar cupo. En [Ajustes de uso de ChatGPT](https://chatgpt.com/#settings/usage) puedes consultar los límites y si autorizaste créditos. El panel permite desconectar el plan.
 - **Gmail.** Habilita Gmail API en el proyecto de Google Cloud y crea un cliente OAuth de tipo **Aplicación de escritorio**. Si el proyecto está en modo de prueba, añade tu cuenta a los usuarios de prueba. En la aplicación personal, abre **Ajustes → Gmail**, importa el JSON del cliente y pulsa **Conectar Gmail**. En Google Chrome de tu equipo, elige el buzón que usará FACTURAI y concede lectura. Al volver al panel, FACTURAI comprueba que Gmail responde antes de guardar la conexión. Para recuperar comprobantes puedes buscar por remitente, fecha o UUID. [Guía de Google para aplicaciones de escritorio](https://developers.google.com/identity/protocols/oauth2/native-app?hl=es)
 - **Gmail por el túnel de Azure.** Mantén el lanzador y el túnel activos hasta volver a Ajustes. Google devuelve la autorización a `127.0.0.1:8765` en el mismo equipo donde abriste Chrome. Una instalación de prueba iniciada con `--port 18765` recibe la respuesta en `127.0.0.1:18765`. Con un túnel, el puerto local de la app y el remoto deben coincidir. Un rechazo o un intento vencido se puede volver a iniciar desde Ajustes. Para cambiar de cliente OAuth con una cuenta conectada, primero usa **Desvincular**.
-- **Otros buzones.** Cualquier otro proveedor (Outlook, Hotmail, Yahoo, el de tu empresa) se conecta por IMAP con contraseña de aplicación, como se explica en [Correo](#correo).
+- **Outlook, Hotmail y Microsoft 365.** Hay que registrar una vez, gratis, una aplicación propia en Microsoft (pide una cuenta de Azure):
+  1. Entra a [entra.microsoft.com](https://entra.microsoft.com) y abre **Entra ID → Registros de aplicaciones → Nuevo registro**. Ponle un nombre, por ejemplo FACTURAI.
+  2. En **Tipos de cuenta admitidos** elige **Cualquier inquilino de Entra ID + cuentas personales de Microsoft** y pulsa **Registrar**.
+  3. En **Autenticación → Agregar URI de redirección → Aplicaciones móviles y de escritorio** escribe `http://localhost:8765/auth/outlook/callback` (con el puerto de tu panel; Ajustes la muestra lista para copiar) y pulsa **Configurar**. No se crea ningún secreto.
+  4. En **Información general** copia el **Identificador de aplicación (cliente)**, pégalo en **Ajustes → Correo → Outlook / Hotmail** y pulsa **Conectar Outlook**.
+  5. En tu correo de Outlook activa **Configuración → Correo → Reenvío e IMAP → Permitir que los dispositivos y las aplicaciones usen IMAP**: viene apagado.
+
+  Microsoft abre su página en otra pestaña; al volver, FACTURAI abre el buzón antes de guardar la conexión. La respuesta regresa a `localhost` con el puerto del panel: con un túnel, el puerto local y el remoto deben coincidir, y la pestaña que regresa dice `localhost` aunque hayas abierto el panel en `127.0.0.1` (es el mismo panel). En una cuenta de empresa puede hacer falta que su administrador apruebe la aplicación y que tenga encendido el envío por SMTP. Estos pasos salen de la documentación de Microsoft y de pruebas con servicios simulados: todavía no se probaron contra Microsoft ni contra un buzón real.
+- **Otros buzones.** Cualquier otro proveedor (Yahoo, el de tu empresa, tu propio dominio) se conecta por IMAP con contraseña de aplicación, como se explica en [Correo](#correo).
 - **Historial previo** admite el `historial_sesion.json` del facturador anterior. Los expedientes y originales siguen en el volumen privado. Puedes exportar el registro a CSV.
 
-El modo local es una instancia privada para una persona. Con el modo de varios usuarios, cada cliente tiene su propio espacio, pero la conexión del plan de ChatGPT y la de Gmail por OAuth no se ofrecen en ese modo (regresan a `127.0.0.1`): ahí la IA se conecta con una llave de pago por uso, o la fija el servidor, y el correo se conecta con contraseña de aplicación. La modalidad comercial alojada con el plan de ChatGPT de cada cliente depende del [programa de integración de OpenAI](https://developers.openai.com/siwc/request-client-id). Los portales del catálogo tienen guías de navegación. Su acceso y las emisiones en vivo dependen del portal y de la sesión activa.
+El modo local es una instancia privada para una persona. Con el modo de varios usuarios, cada cliente tiene su propio espacio, pero la conexión del plan de ChatGPT y la de Gmail por OAuth no se ofrecen en ese modo (regresan a `127.0.0.1`): ahí la IA se conecta con una llave de pago por uso, o la fija el servidor, y el correo se conecta con contraseña de aplicación o, si quien instala registró la aplicación de Microsoft, con **Conectar Outlook**. La modalidad comercial alojada con el plan de ChatGPT de cada cliente depende del [programa de integración de OpenAI](https://developers.openai.com/siwc/request-client-id). Los portales del catálogo tienen guías de navegación. Su acceso y las emisiones en vivo dependen del portal y de la sesión activa.
 
 ## Dos modos de uso
 
@@ -272,7 +281,7 @@ El modo local es una instancia privada para una persona. Con el modo de varios u
 
 Cómo activarlo (los mismos pasos están comentados en `compose.yaml`, apagados por omisión):
 
-1. Crea la llave maestra **fuera** de la carpeta de datos y del repositorio. Con ella se cifran las llaves de las contraseñas de portales y del correo, las de la IA, la llave privada de los avisos y las conexiones de ChatGPT y Gmail. Si falta o es otra, el programa no arranca y nada de lo guardado se toca. Guarda una copia en otro lugar seguro.
+1. Crea la llave maestra **fuera** de la carpeta de datos y del repositorio. Con ella se cifran las llaves de las contraseñas de portales y del correo, las de la IA, la llave privada de los avisos y las conexiones de ChatGPT, Gmail y Outlook. Si falta o es otra, el programa no arranca y nada de lo guardado se toca. Guarda una copia en otro lugar seguro.
 
    ```bash
    python -m facturador crear-llave ../facturai-llave/llave-maestra.key
@@ -290,6 +299,7 @@ Cómo activarlo (los mismos pasos están comentados en `compose.yaml`, apagados 
    | `FACTURADOR_PROXIES` | Direcciones o redes del proxy. Solo de ellas se acepta la dirección real de quien entra. |
    | `FACTURADOR_NAVEGADORES_MAX` | Navegadores abiertos a la vez entre todos los clientes (3 por omisión, de 1 a 50). El ticket que no alcanza espera su turno. |
    | `FACTURADOR_INSTANCIA_INACTIVA_MIN` | Minutos sin uso para cerrar el espacio de un cliente sin trabajo pendiente (30 por omisión, de 1 a 1440). |
+   | `FACTURADOR_OUTLOOK_APLICACION` | Opcional. Identificador de aplicación (cliente) de Microsoft para toda la instalación: con él cada persona conecta su Outlook o Hotmail con solo pulsar **Conectar Outlook**. Se registra como en [Conexiones y datos](#conexiones-y-datos), con la dirección de regreso `https://tu-dominio/auth/outlook/callback`. Sin ella, Outlook no se ofrece en este modo. |
    | `FACTURADOR_COMPARTIDO` | Con `0` las cuentas no comparten lo que aprenden de los portales. Vacío: lo comparten, sin datos de nadie (ver [Cómo resuelve un portal](#cómo-resuelve-un-portal)). |
 
 4. Arranca y crea el primer administrador desde la terminal. La contraseña (mínimo 12 caracteres) se escribe con el teclado; nunca se pasa por argumento ni por variable.
@@ -306,10 +316,10 @@ Cómo activarlo (los mismos pasos están comentados en `compose.yaml`, apagados 
 - **No resuelve el «no soy un robot».** Siempre lo completa una persona en la vista en vivo. FACTURAI no lo automatiza ni lo rodea.
 - **No inventa datos.** Si un portal pide algo que no dejaste (por ejemplo la fecha de nacimiento), el ticket espera y dice qué agregar.
 - **Los códigos que no puede contestar se quedan contigo:** los de segundo factor o recuperación y los códigos de seguridad que pide un robot de WhatsApp. El código que un portal manda al teléfono durante el alta o el acceso sí te lo pide por el chat, sin guardarlo (ver [Registro en portales](#registro-en-portales)).
-- **Outlook y Hotmail por OAuth no existen.** Esos buzones, como cualquier otro que no sea Gmail, se conectan por IMAP con contraseña de aplicación.
+- **Outlook y Hotmail no se conectan con contraseña, y no hay «Outlook con un clic».** Microsoft exige entrar con la cuenta, y para eso hay que registrar antes una aplicación propia en Microsoft (gratis, una sola vez). En el modo de varios usuarios la registra quien instala; sin ella, Outlook no se ofrece.
 - **No hay «Gmail con un clic».** Conectar Gmail exige crear en Google Cloud un cliente OAuth de escritorio e importar su JSON.
 - **Nunca emite si la página no muestra** el RFC del perfil, el folio o código del ticket y su importe, y la factura recibida siempre se coteja contra el perfil y el ticket.
-- **WhatsApp, correo y la IA de pago por uso se probaron con dobles, no contra los servicios reales.** Las pruebas usan una página que imita WhatsApp Web, servidores IMAP y SMTP locales con TLS, un servidor local que imita a Gmail y respuestas simuladas de las APIs de OpenAI y Anthropic. Ninguna prueba toca WhatsApp, un buzón, Gmail, un portal de comercio ni una IA de verdad. Conecta tus cuentas y prueba con un ticket tuyo antes de depender de ellas.
+- **WhatsApp, correo y la IA de pago por uso se probaron con dobles, no contra los servicios reales.** Las pruebas usan una página que imita WhatsApp Web, servidores IMAP y SMTP locales con TLS, un servidor local que imita a Gmail, otro que imita el inicio de sesión de Microsoft (con IMAP y SMTP que solo aceptan sus permisos) y respuestas simuladas de las APIs de OpenAI y Anthropic. Ninguna prueba toca WhatsApp, un buzón, Gmail, Microsoft, un portal de comercio ni una IA de verdad. Conecta tus cuentas y prueba con un ticket tuyo antes de depender de ellas.
 
 ## Verificación
 
