@@ -719,3 +719,78 @@ class Store:
     def events(self, key: str):
         with self.connect() as db:
             return [dict(x) for x in db.execute("SELECT at,kind,detail FROM events WHERE job_id=? ORDER BY id", (key,))]
+
+    # Read-only queries for the lightweight panel state.
+    PANEL_OPEN = ('new', 'review', 'ready', 'queued', 'running', 'issuing', 'needs_user', 'blocked', 'external',
+                  'issued_waiting_files', 'uncertain', 'whatsapp_preparing')
+
+    def panel_jobs(self, recent: int = 60, keep=()) -> tuple[list[dict], str]:
+        """The newest rows, every open one, the given ids and their companion images.
+
+        Returns the rows (newest first) and the cursor of the oldest recent row, or '' when nothing older exists.
+        """
+        keep = [key for key in keep if key]
+        open_marks = ','.join('?' * len(self.PANEL_OPEN))
+        keep_marks = ','.join('?' * len(keep)) or "''"
+        with self.connect() as db:
+            newest = db.execute('SELECT id,created FROM jobs ORDER BY created DESC, id DESC LIMIT ?',
+                                (recent + 1,)).fetchall()
+            older = len(newest) > recent
+            newest = newest[:recent]
+            chosen = f"""SELECT id FROM jobs WHERE status IN ({open_marks}) OR id IN ({keep_marks})"""
+            ids = {row['id'] for row in newest}
+            ids.update(row['id'] for row in db.execute(chosen, (*self.PANEL_OPEN, *keep)))
+            ids.update(row['id'] for row in db.execute(
+                f"SELECT id FROM jobs WHERE companion_of<>'' AND (companion_of IN ({chosen}) OR companion_of IN "
+                f"(SELECT id FROM jobs ORDER BY created DESC, id DESC LIMIT ?))", (*self.PANEL_OPEN, *keep, recent)))
+            rows = []
+            listed = list(ids)
+            for start in range(0, len(listed), 500):
+                part = listed[start:start + 500]
+                rows += db.execute(self._job_select + f" WHERE j.id IN ({','.join('?' * len(part))})", part).fetchall()
+        rows = sorted((self.decode(row) for row in rows), key=lambda row: (row['created'], row['id']), reverse=True)
+        cursor = f"{newest[-1]['created']}|{newest[-1]['id']}" if older and newest else ''
+        return rows, cursor
+
+    def jobs_page(self, before: tuple[str, str] | None, limit: int = 100) -> tuple[list[dict], str]:
+        """Rows older than the cursor, newest first, with the cursor of the next page ('' at the end)."""
+        query, values = self._job_select, []
+        if before:
+            query += " WHERE (j.created < ? OR (j.created = ? AND j.id < ?))"
+            values = [before[0], before[0], before[1]]
+        with self.connect() as db:
+            rows = db.execute(query + " ORDER BY j.created DESC, j.id DESC LIMIT ?", (*values, limit + 1)).fetchall()
+        more = len(rows) > limit
+        rows = [self.decode(row) for row in rows[:limit]]
+        return rows, (f"{rows[-1]['created']}|{rows[-1]['id']}" if more and rows else '')
+
+    def job_summary(self) -> dict:
+        with self.connect() as db:
+            row = db.execute("""SELECT COUNT(*) AS total,
+                COALESCE(SUM(j.status NOT IN ('verified','duplicate','attached','historical')),0) AS pending,
+                COUNT(DISTINCT CASE WHEN j.status='verified'
+                      THEN COALESCE(m.invoice_uuid, s.invoice_uuid, j.uuid, j.id) END) AS verified
+                FROM jobs j LEFT JOIN invoice_matches m ON m.job_id=j.id
+                LEFT JOIN observed_shared_invoices s ON s.job_id=j.id""").fetchone()
+        return dict(row)
+
+    def events_after(self, key: str, after: int = 0) -> list[dict]:
+        with self.connect() as db:
+            return [dict(x) for x in db.execute(
+                "SELECT id,at,kind,detail FROM events WHERE job_id=? AND id>? ORDER BY id", (key, after))]
+
+    def chat_messages_after(self, after: int = 0, limit: int = 100) -> list[dict]:
+        """Messages with their sequence number; the newest ``limit`` ones when ``after`` is 0."""
+        with self.connect() as db:
+            if after:
+                rows = db.execute('SELECT rowid AS seq,* FROM chat_messages WHERE rowid>? ORDER BY rowid LIMIT ?',
+                                  (after, limit)).fetchall()
+            else:
+                rows = db.execute('SELECT rowid AS seq,* FROM chat_messages ORDER BY rowid DESC LIMIT ?',
+                                  (limit,)).fetchall()[::-1]
+        return [{**dict(row), 'files': json.loads(row['files']), 'job_ids': json.loads(row['job_ids'])}
+                for row in rows]
+
+    def chat_last_seq(self) -> int:
+        with self.connect() as db:
+            return db.execute('SELECT COALESCE(MAX(rowid),0) FROM chat_messages').fetchone()[0]

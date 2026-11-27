@@ -13,7 +13,30 @@ from .db import Store
 
 MAX_UPLOAD = 25 * 1024 * 1024
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
-Image.MAX_IMAGE_PIXELS = 40_000_000
+HEIF_EXT = {".heic", ".heif"}
+MAX_PIXELS = 40_000_000
+Image.MAX_IMAGE_PIXELS = MAX_PIXELS
+
+
+def heif_to_jpeg(name: str, data: bytes) -> tuple[str, bytes]:
+    """Convert an iPhone HEIC/HEIF photo to a JPEG that is kept as the original."""
+    if Path(name).suffix.lower() not in HEIF_EXT:
+        return name, data
+    if not data or len(data) > MAX_UPLOAD:
+        raise ValueError("Elige un documento de hasta 25 MB")
+    from PIL import ImageOps
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+    with Image.open(io.BytesIO(data)) as img:
+        if img.format not in {'HEIF', 'AVIF'}:
+            raise ValueError('La foto HEIC está dañada o no es válida.')
+        if img.width * img.height > MAX_PIXELS:
+            raise ValueError("Imagen demasiado grande")
+        picture = ImageOps.exif_transpose(img).convert('RGB')
+    output = io.BytesIO()
+    picture.save(output, 'JPEG', quality=92)
+    return Path(name).with_suffix('.jpg').name, output.getvalue()
 
 
 def validate_document(name: str, data: bytes) -> str:
@@ -24,6 +47,9 @@ def validate_document(name: str, data: bytes) -> str:
         with Image.open(io.BytesIO(data)) as img:
             if img.width * img.height > 40_000_000:
                 raise ValueError("Imagen demasiado grande")
+            if img.format in {'HEIF', 'AVIF'}:
+                # HEIC photos are converted to JPEG on arrival; they are never stored under another extension.
+                raise ValueError('La extensión no coincide con el contenido del documento.')
             mime = Image.MIME.get(img.format)
             img.verify()
     elif suffix == ".pdf":
@@ -33,7 +59,7 @@ def validate_document(name: str, data: bytes) -> str:
             raise ValueError("Límite de 20 páginas")
         mime = 'application/pdf'
     else:
-        raise ValueError("Sube JPG, PNG, WEBP o PDF; ZIP de exportación de WhatsApp también está admitido")
+        raise ValueError("Sube JPG, PNG, WEBP, HEIC o PDF; ZIP de exportación de WhatsApp también está admitido")
     return mime
 
 
@@ -76,16 +102,18 @@ def write_original(path: Path, data: bytes) -> None:
 
 def save_upload(store: Store, name: str, data: bytes, source: str = "archivo", batch_id: str = '') -> list[dict]:
     if Path(name).suffix.lower() != ".zip":
+        name, data = heif_to_jpeg(name, data)
         return [save_input(store, name, data, source, batch_id=batch_id)]
     if len(data) > MAX_UPLOAD:
         raise ValueError("ZIP supera 25 MB")
     result = []
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        members = [m for m in archive.infolist() if not m.is_dir() and Path(m.filename).suffix.lower() in IMAGE_EXT | {".pdf"}]
+        members = [m for m in archive.infolist() if not m.is_dir() and Path(m.filename).suffix.lower() in IMAGE_EXT | HEIF_EXT | {".pdf"}]
         if len(members) > 100 or sum(m.file_size for m in members) > 100 * 1024 * 1024:
             raise ValueError("ZIP supera 100 documentos o 100 MB descomprimidos")
         for member in members:
             if member.file_size > MAX_UPLOAD:
                 raise ValueError("Archivo del ZIP demasiado grande")
-            result.append(save_input(store, member.filename, archive.read(member), source + " / ZIP", batch_id=batch_id))
+            member_name, member_data = heif_to_jpeg(member.filename, archive.read(member))
+            result.append(save_input(store, member_name, member_data, source + " / ZIP", batch_id=batch_id))
     return result

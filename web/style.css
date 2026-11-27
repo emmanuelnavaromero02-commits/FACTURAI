@@ -300,6 +300,35 @@ main { margin-left: 0; }
 .chat-screen.chat-dragging .chat-compose-row { border-color: var(--green); background: #eff8f1; }
 #chat-status { min-height: 18px; margin: 4px 6px 0; color: var(--muted); font-size: 11px; }
 #chat-status.error { color: var(--danger); }
+.upload-bar { display: block; width: 100%; height: 6px; margin-top: 7px; border: 0; border-radius: 4px; overflow: hidden; background: #e2ebe5; accent-color: var(--green); }
+.upload-bar::-webkit-progress-bar { background: #e2ebe5; }
+.upload-bar::-webkit-progress-value { background: var(--green); transition: width .2s; }
+.upload-bar::-moz-progress-bar { background: var(--green); }
+.upload-progress { display: grid; gap: 4px; margin: 0 0 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #f7faf6; font-size: 12px; color: var(--muted); }
+.history-more { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+.history-more:has(button[hidden]):not(:has(span:not(:empty))) { display: none; }
+.stages { margin-top: 10px; }
+.stages ol { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 4px; margin: 0; padding: 0; list-style: none; }
+.stages li { position: relative; padding-top: 9px; color: #8a9a92; font-size: 10px; line-height: 1.25; text-align: center; overflow-wrap: anywhere; }
+.stages li::before { content: ''; position: absolute; inset: 0 0 auto; height: 4px; border-radius: 3px; background: #e2ebe5; }
+.stages li.past { color: var(--green); }
+.stages li.past::before { background: #7bad91; }
+.stages li.current { color: var(--ink); font-weight: 700; }
+.stages li.current::before { background: var(--green); animation: stage-pulse 1.6s ease-in-out infinite; }
+.stages li.waiting::before { background: #d39a3a; animation: none; }
+.stages.done li::before { background: var(--green); animation: none; }
+.stage-now { margin-top: 7px; font-size: 12px; color: var(--muted); }
+.stage-now strong { color: var(--ink); }
+.stages.waiting .stage-now strong { color: #8a5a10; }
+.stage-time { font-variant-numeric: tabular-nums; }
+.stages.compact { margin-top: 6px; min-width: 120px; }
+.stages.compact ol { gap: 2px; }
+.stages.compact li { padding-top: 4px; }
+.stages.compact li::before { height: 3px; }
+.stages.compact .stage-now { margin-top: 3px; font-size: 11px; }
+@keyframes stage-pulse { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .stages li.current::before { animation: none; } }
+.type-form input { flex: 1; min-width: 140px; }
 @media (max-width: 710px) {
   .chat-screen { padding: 0 12px; }
   .chat-header { min-height: 58px; }

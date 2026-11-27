@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
 import re
 import secrets
 import time
@@ -17,14 +19,38 @@ KEY = re.compile(r'(?:Backspace|Delete|Tab|Enter|Escape|Home|End|PageUp|PageDown
 CAPTCHA_IDLE_SECONDS = 120
 
 
-class ViewerInput(BaseModel):
+class ViewerEvent(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    channel: str = Field(max_length=64)
     kind: Literal['down', 'move', 'up', 'wheel', 'text', 'key']
     x: float = Field(default=0, ge=0, le=1)
     y: float = Field(default=0, ge=0, le=1)
     delta: int = Field(default=0, ge=-1200, le=1200)
     value: str = Field(default='', max_length=2000)
+
+
+class ViewerInput(ViewerEvent):
+    channel: str = Field(max_length=64)
+
+
+class ViewerBatch(BaseModel):
+    """Several pointer and keyboard events of one lease, applied in order."""
+    model_config = ConfigDict(extra='forbid')
+    channel: str = Field(max_length=64)
+    events: list[ViewerEvent] = Field(min_length=1, max_length=40)
+
+
+def shrink_jpeg(frame: bytes, width: int) -> bytes:
+    """Scale a JPEG frame down to ``width`` pixels; frames that are already narrower stay untouched."""
+    from PIL import Image
+
+    with Image.open(io.BytesIO(frame)) as image:
+        if image.width <= width:
+            return frame
+        height = max(1, round(image.height * width / image.width))
+        small = image.convert('RGB').resize((width, height), Image.Resampling.BILINEAR)
+    output = io.BytesIO()
+    small.save(output, 'JPEG', quality=66)
+    return output.getvalue()
 
 
 @dataclass(frozen=True)
@@ -153,29 +179,51 @@ class BrowserView:
             except Exception:
                 return None
 
+    async def frame_update(self, revision: int, have: str = '', width: int | None = None) -> tuple[bytes | None, str]:
+        """Return the frame and its digest; ``b''`` means it equals ``have`` and None means no frame."""
+        frame = await self.frame(revision)
+        if frame is None:
+            return None, ''
+        digest = hashlib.blake2b(frame, digest_size=12).hexdigest()
+        if have and secrets.compare_digest(have, digest):
+            return b'', digest
+        if width:
+            frame = await asyncio.to_thread(shrink_jpeg, frame, width)
+        return frame, digest
+
     async def send(self, request: ViewerInput):
         async with self.commands:
             self.require_control(request.channel)
-            page = self.page
-            if request.kind in {'down', 'move', 'up', 'wheel'}:
-                viewport = page.viewport_size
-                if not viewport:
-                    raise ValueError('El navegador todavía está ajustando el tamaño de la página.')
-                x = request.x * (viewport['width'] - 1)
-                y = request.y * (viewport['height'] - 1)
-                await page.mouse.move(x, y)
-                if request.kind == 'down' and not self.pointer_down:
-                    await page.mouse.down()
-                    self.pointer_down = True
-                elif request.kind == 'up' and self.pointer_down:
-                    await page.mouse.up()
-                    self.pointer_down = False
-                elif request.kind == 'wheel':
-                    await page.mouse.wheel(0, request.delta)
-            elif request.kind == 'text' and request.value:
-                await page.keyboard.insert_text(request.value)
-            elif request.kind == 'key' and KEY.fullmatch(request.value):
-                await page.keyboard.press(request.value)
+            await self._apply(request)
+
+    async def send_batch(self, batch: ViewerBatch):
+        async with self.commands:
+            for request in batch.events:
+                # Each event repeats the lease, page and dialog checks of a single command.
+                self.require_control(batch.channel)
+                await self._apply(request)
+
+    async def _apply(self, request: ViewerEvent):
+        page = self.page
+        if request.kind in {'down', 'move', 'up', 'wheel'}:
+            viewport = page.viewport_size
+            if not viewport:
+                raise ValueError('El navegador todavía está ajustando el tamaño de la página.')
+            x = request.x * (viewport['width'] - 1)
+            y = request.y * (viewport['height'] - 1)
+            await page.mouse.move(x, y)
+            if request.kind == 'down' and not self.pointer_down:
+                await page.mouse.down()
+                self.pointer_down = True
+            elif request.kind == 'up' and self.pointer_down:
+                await page.mouse.up()
+                self.pointer_down = False
+            elif request.kind == 'wheel':
+                await page.mouse.wheel(0, request.delta)
+        elif request.kind == 'text' and request.value:
+            await page.keyboard.insert_text(request.value)
+        elif request.kind == 'key' and KEY.fullmatch(request.value):
+            await page.keyboard.press(request.value)
 
     def require_control(self, channel: str):
         if not self.visible or not self.open or not self.manual or not self.channel or self.dialog or not secrets.compare_digest(channel, self.channel):

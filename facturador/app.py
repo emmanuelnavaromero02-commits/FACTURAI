@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import csv
+import hashlib
 import io
 import json
 import mimetypes
 import os
+import re
 import secrets
 import sqlite3
 import zipfile
@@ -15,11 +18,12 @@ from tempfile import TemporaryDirectory
 from typing import Literal
 
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field, ValidationError
 from PIL import UnidentifiedImageError
 from pypdf.errors import PyPdfError
+from starlette.middleware.gzip import DEFAULT_EXCLUDED_CONTENT_TYPES, GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .auth import CALLBACK, ChatGPTPlan, PlanError, read_json, write_private
@@ -39,10 +43,103 @@ from .sat import sat_router
 from .portal_accounts import portal_accounts_router
 from .portal_discovery import review_links
 from .portal_mail import portal_mail_router
-from .viewer import ViewerInput
+from .viewer import ViewerBatch, ViewerInput
 from .whatsapp import whatsapp_router
 
 BASE = Path(__file__).resolve().parent.parent
+STATIC_FILES = ('app.js', 'chat.js', 'style.css', 'visor.js', 'navegacion.js', 'cuentas-portal.js', 'correo-portal.js',
+                'herramientas.js', 'seguimiento.js', 'avance.js', 'subida.js')
+IMMUTABLE = 'public, max-age=31536000, immutable'
+RECENT_JOBS = 60
+HISTORY_PAGE = 100
+
+
+def entity_tag(body: bytes) -> str:
+    return '"' + hashlib.blake2b(body, digest_size=16).hexdigest() + '"'
+
+
+def matches_tag(request: Request, tag: str) -> bool:
+    values = [value.strip().removeprefix('W/') for value in request.headers.get('if-none-match', '').split(',')]
+    return tag in values or '*' in values
+
+
+def tagged_json(request: Request, payload) -> Response:
+    """JSON with a strong ETag; answers 304 when the client already holds the same bytes."""
+    body = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode()
+    tag = entity_tag(body)
+    if matches_tag(request, tag):
+        return Response(status_code=304, headers={'ETag': tag})
+    return Response(body, media_type='application/json', headers={'ETag': tag})
+
+
+class StaticAssets:
+    """Panel files read once at start-up; scripts and styles are referenced by content version."""
+    KINDS = {'.js': 'application/javascript', '.css': 'text/css'}
+
+    def __init__(self, folder: Path):
+        self.files: dict[str, tuple[bytes, str]] = {}
+        raw = {name: (folder / name).read_text(encoding='utf-8') for name in STATIC_FILES if (folder / name).is_file()}
+        versions: dict[str, str] = {}
+
+        def build(name: str, trail=()) -> str:
+            if name in versions:
+                return versions[name]
+            text = raw[name]
+            if name.endswith('.js'):
+                def versioned(match):
+                    target = match.group(3)
+                    if target not in raw or target in trail:
+                        return match.group(0)
+                    return f"{match.group(1)}{match.group(2)}./{target}?v={build(target, (*trail, name))}{match.group(2)}"
+                text = re.sub(r"""(\bfrom\s*|\bimport\s*\(?\s*)(['"])\./([\w-]+\.js)\2""", versioned, text)
+            body = text.encode()
+            versions[name] = hashlib.sha256(body).hexdigest()[:16]
+            self.files[name] = (body, versions[name])
+            return versions[name]
+
+        for name in raw:
+            build(name)
+        page = (folder / 'index.html').read_text(encoding='utf-8')
+        for name, (_, version) in self.files.items():
+            page = page.replace(f'"/{name}"', f'"/{name}?v={version}"')
+        preload = ''.join(f'\n  <link rel="modulepreload" href="/{name}?v={version}">'
+                          for name, (_, version) in self.files.items() if name.endswith('.js') and name != 'app.js')
+        page = page.replace('</head>', preload + '\n</head>', 1)
+        self.index = page.encode()
+        self.index_tag = entity_tag(self.index)
+
+    def response(self, request: Request, name: str) -> Response:
+        body, version = self.files[name]
+        kind = self.KINDS[Path(name).suffix]
+        if request.query_params.get('v') == version:
+            return Response(body, media_type=kind, headers={'Cache-Control': IMMUTABLE})
+        tag = f'"{version}"'
+        headers = {'Cache-Control': 'no-cache', 'ETag': tag}
+        if matches_tag(request, tag):
+            return Response(status_code=304, headers=headers)
+        return Response(body, media_type=kind, headers=headers)
+
+    def page(self, request: Request) -> Response:
+        headers = {'Cache-Control': 'no-cache', 'ETag': self.index_tag}
+        if matches_tag(request, self.index_tag):
+            return Response(status_code=304, headers=headers)
+        return Response(self.index, media_type='text/html; charset=utf-8', headers=headers)
+
+
+def page_cursor(value: str) -> tuple[str, str] | None:
+    if not value:
+        return None
+    try:
+        created, key = base64.urlsafe_b64decode(value.encode() + b'=' * (-len(value) % 4)).decode().split('|', 1)
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError('Página del historial inválida.') from exc
+    if not re.fullmatch(r'[0-9T:.+\-]{10,40}', created) or not re.fullmatch(r'[\w-]{1,160}', key):
+        raise ValueError('Página del historial inválida.')
+    return created, key
+
+
+def encode_cursor(value: str) -> str:
+    return base64.urlsafe_b64encode(value.encode()).decode().rstrip('=') if value else ''
 
 
 class RunRequest(BaseModel):
@@ -98,6 +195,8 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     app.state.csrf_token = token
     app.include_router(sat_router(store))
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
+    assets = StaticAssets(BASE / 'web')
+    cacheable_paths = {'/', *('/' + name for name in assets.files)}
 
     @app.middleware("http")
     async def local_guard(request: Request, call_next):
@@ -110,10 +209,18 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Cache-Control"] = "no-store"
+        # Only the panel files and chat previews choose their own caching; everything else stays private.
+        if not (request.url.path in cacheable_paths or request.url.path.startswith('/api/chat/files/')) \
+                or 'cache-control' not in response.headers:
+            response.headers["Cache-Control"] = "no-store"
         response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'"
         return response
+
+    # Outermost layer: compresses JSON, scripts, styles and the page; images, PDF and archives pass as they are.
+    app.add_middleware(GZipMiddleware, minimum_size=600, compresslevel=6,
+                       exclude_content_types=(*DEFAULT_EXCLUDED_CONTENT_TYPES, 'application/pdf',
+                                              'application/octet-stream', 'application/xml', 'text/xml'))
 
     def profile() -> Profile:
         path = root / "profile.json"
@@ -152,45 +259,18 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     async def bad_document(request, exc):
         return PlainTextResponse('No fue posible leer este documento. Revisa que sea un PDF o una imagen válida.', status_code=422)
 
-    @app.get("/", response_class=HTMLResponse)
-    def index():
-        return (BASE / "web" / "index.html").read_text(encoding="utf-8")
+    @app.get("/")
+    def index(request: Request):
+        return assets.page(request)
 
-    @app.get("/app.js")
-    def javascript():
-        return FileResponse(BASE / "web" / "app.js", media_type="application/javascript")
+    def static_route(name: str):
+        def serve(request: Request):
+            return assets.response(request, name)
+        serve.__name__ = 'static_' + re.sub(r'\W', '_', name)
+        return serve
 
-    @app.get('/chat.js')
-    def chat_script():
-        return FileResponse(BASE / 'web' / 'chat.js', media_type='application/javascript')
-
-    @app.get("/style.css")
-    def stylesheet():
-        return FileResponse(BASE / "web" / "style.css", media_type="text/css")
-
-    @app.get('/visor.js')
-    def viewer_script():
-        return FileResponse(BASE / 'web' / 'visor.js', media_type='application/javascript')
-
-    @app.get('/navegacion.js')
-    def navigation_script():
-        return FileResponse(BASE / 'web' / 'navegacion.js', media_type='application/javascript')
-
-    @app.get('/cuentas-portal.js')
-    def portal_accounts_script():
-        return FileResponse(BASE / 'web' / 'cuentas-portal.js', media_type='application/javascript')
-
-    @app.get('/correo-portal.js')
-    def portal_mail_script():
-        return FileResponse(BASE / 'web' / 'correo-portal.js', media_type='application/javascript')
-
-    @app.get('/herramientas.js')
-    def receipt_tools_script():
-        return FileResponse(BASE / 'web' / 'herramientas.js', media_type='application/javascript')
-
-    @app.get('/seguimiento.js')
-    def tracking_script():
-        return FileResponse(BASE / 'web' / 'seguimiento.js', media_type='application/javascript')
+    for asset_name in assets.files:
+        app.add_api_route('/' + asset_name, static_route(asset_name), methods=['GET'], include_in_schema=False)
 
     @app.get('/healthz')
     async def health():
@@ -316,12 +396,16 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         return await runner.return_to_job(channel)
 
     @app.get('/api/browser/frame')
-    async def browser_frame(revision: int):
+    async def browser_frame(revision: int, have: str = Query(default='', max_length=64),
+                            w: int | None = Query(default=None, ge=160, le=2560)):
         view = runner.screen
-        value = await view.frame(revision)
+        value, digest = await view.frame_update(revision, have, w)
         if view is not runner.screen:
-            value = None
-        return Response(content=value, media_type='image/jpeg') if value else Response(status_code=204)
+            value, digest = None, ''
+        headers = {'X-Frame-Hash': digest} if digest else {}
+        # 204 when there is no frame or it is identical to the one the panel already shows.
+        return Response(content=value, media_type='image/jpeg', headers=headers) if value else Response(
+            status_code=204, headers=headers)
 
     @app.post('/api/browser/control')
     async def browser_control(revision: int = Body(embed=True), job_id: str | None = Body(default=None, max_length=100)):
@@ -379,7 +463,10 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         return {'released': True}
 
     @app.post('/api/browser/input')
-    async def browser_input(value: ViewerInput):
+    async def browser_input(value: ViewerInput | ViewerBatch):
+        if isinstance(value, ViewerBatch):
+            await runner.screen.send_batch(value)
+            return {'sent': True, 'count': len(value.events)}
         await runner.screen.send(value)
         return {'sent': True}
 
@@ -429,24 +516,42 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         path = browser_file(root, file_id)
         return FileResponse(path, filename=path.name[17:])
 
+    def panel_row(row: dict) -> dict:
+        row['retry_action'] = runner.retry_action(row)
+        row['can_retry'] = bool(row['status'] == 'blocked' and row['billing_profile'] and
+                                not (row['issue_attempted'] or row['human_exposed'] or row['issuance_seen'] or row['uuid']))
+        row.pop("source_path", None)
+        row.pop("source_hash", None)
+        row.pop('billing_profile', None)
+        row.pop('auto_stage', None)
+        row.pop('confirmed_payment', None)
+        row["has_pdf"], row["has_xml"] = bool(row.pop("pdf")), bool(row.pop("xml"))
+        row["human_kind"] = runner.pending.get(row["id"], {}).get("kind")
+        return row
+
     @app.get("/api/state")
-    def state():
+    def state(request: Request):
         path = root / "profile.json"
-        jobs = store.list()
-        for row in jobs:
-            row['retry_action'] = runner.retry_action(row)
-            row['can_retry'] = bool(row['status'] == 'blocked' and row['billing_profile'] and
-                                    not (row['issue_attempted'] or row['human_exposed'] or row['issuance_seen'] or row['uuid']))
-            row.pop("source_path", None)
-            row.pop("source_hash", None)
-            row.pop('billing_profile', None)
-            row.pop('auto_stage', None)
-            row.pop('confirmed_payment', None)
-            row["has_pdf"], row["has_xml"] = bool(row.pop("pdf")), bool(row.pop("xml"))
-            row["human_kind"] = runner.pending.get(row["id"], {}).get("kind")
-        return {"token": token, "profile": read_json(path), "jobs": jobs, "supports_ticket_retry": True, "supports_captcha_control": True,
-                'catalog': CATALOG, 'plan': plan.status(), 'gmail': gmail_connection.status(),
-                'automation': automation.status(), 'browser': runner.browser_state(), 'active_job': runner.active_id}
+        status = automation.status()
+        keep = {runner.active_id, status.get('current_id'), *runner.pending, *(status.get('jobs') or {})}
+        jobs, cursor = store.panel_jobs(RECENT_JOBS, tuple(key for key in keep if isinstance(key, str)))
+        # Recent and open tickets only; the rest of the history is paged from /api/jobs.
+        return tagged_json(request, {
+            "token": token, "profile": read_json(path), "jobs": [panel_row(row) for row in jobs],
+            "jobs_summary": store.job_summary(), "history_cursor": encode_cursor(cursor),
+            "supports_ticket_retry": True, "supports_captcha_control": True, 'catalog_url': '/api/catalog',
+            'plan': plan.status(), 'gmail': gmail_connection.status(), 'automation': status,
+            'browser': runner.browser_state(), 'active_job': runner.active_id})
+
+    @app.get('/api/catalog')
+    def catalog(request: Request):
+        return tagged_json(request, CATALOG)
+
+    @app.get('/api/jobs')
+    def job_history(request: Request, before: str = Query(default='', max_length=400),
+                    limit: int = Query(default=HISTORY_PAGE, ge=1, le=200)):
+        rows, cursor = store.jobs_page(page_cursor(before), limit)
+        return tagged_json(request, {'jobs': [panel_row(row) for row in rows], 'next': encode_cursor(cursor)})
 
     @app.put('/api/automation')
     async def configure_automation(enabled: bool = Body(embed=True, strict=True)):
@@ -570,9 +675,12 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         return await runner.retry_job(key, profile)
 
     @app.get("/api/jobs/{key}/events")
-    def events(key: str):
+    def events(key: str, after: int | None = Query(default=None, ge=0)):
         store.get(key)
-        return store.events(key)
+        if after is None:
+            return store.events(key)
+        # Only the events the panel has not seen yet, each with its id for the next request.
+        return store.events_after(key, after)
 
     def original_path(key: str) -> Path:
         row = store.get(key)

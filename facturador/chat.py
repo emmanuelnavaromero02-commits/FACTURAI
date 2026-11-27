@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import mimetypes
 import re
 import unicodedata
@@ -10,13 +11,14 @@ import uuid
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
+from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict
 
 from .ai import read_receipt
 from .auth import PlanError
-from .ingest import MAX_UPLOAD, validate_document, write_original
+from .ingest import IMAGE_EXT, MAX_UPLOAD, heif_to_jpeg, validate_document, write_original
 
 
 class ChatDecision(BaseModel):
@@ -100,7 +102,7 @@ def _model_decision(plan, store, text: str, files: bool) -> ChatDecision | None:
     content = [{'type': 'input_text', 'text':
                 'Historial:\n' + _recent_context(store) + '\n\nMensaje nuevo: ' + text[:4000] +
                 '\nAdjuntos en este mensaje: ' + ('sí' if files else 'no')}]
-    return plan.infer(instructions, content, ChatDecision)
+    return plan.infer(instructions, content, ChatDecision, effort='low')
 
 
 def _example_answer(plan, text: str, paths: list[Path]) -> str:
@@ -115,7 +117,7 @@ def _example_answer(plan, text: str, paths: list[Path]) -> str:
     for path in paths:
         content.extend(read_receipt(path))
     try:
-        return plan.infer(instructions, content, ChatAnswer).reply.strip()[:1200] or 'Recibí el ejemplo.'
+        return plan.infer(instructions, content, ChatAnswer, effort='low').reply.strip()[:1200] or 'Recibí el ejemplo.'
     except (PlanError, ValueError, OSError):
         return 'Recibí las imágenes como ejemplo. No iniciaré un trámite con ellas.'
 
@@ -148,26 +150,85 @@ async def _retry_answer(store, runner, get_profile) -> tuple[str, list[str]]:
     return 'Este ticket necesita completar su lectura o revisión antes de reanudar el portal.', [key]
 
 
+def thumbnail(path: Path, width: int) -> bytes:
+    """A small JPEG preview of a chat photo for the conversation thread."""
+    with Image.open(path) as image:
+        image.draft(image.mode, (width, width))  # Faster JPEG decoding; both sides stay at least ``width``.
+        picture = ImageOps.exif_transpose(image)
+        if picture.mode in {'RGBA', 'LA', 'P'}:
+            picture = picture.convert('RGBA')
+            background = Image.new('RGB', picture.size, 'white')
+            background.paste(picture, mask=picture.getchannel('A'))
+            picture = background
+        picture = picture.convert('RGB')
+        if picture.width > width:
+            picture = picture.resize((width, max(1, round(picture.height * width / picture.width))),
+                                     Image.Resampling.LANCZOS)
+    output = io.BytesIO()
+    picture.save(output, 'JPEG', quality=80)
+    return output.getvalue()
+
+
 def chat_router(store, plan, automation, runner, get_profile) -> APIRouter:
     router = APIRouter()
     send_lock = asyncio.Lock()
     asset_root = (store.root / 'chat_uploads').resolve()
     asset_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    originals_root = (store.root / 'originales').resolve()
 
     @router.get('/api/chat')
-    def history():
-        return {'messages': store.chat_messages()}
+    def history(request: Request, after: int = Query(default=0, ge=0)):
+        last = store.chat_last_seq()
+        tag = f'"chat-{last}"'
+        if tag in request.headers.get('if-none-match', '').replace('W/', '').split(', '):
+            return Response(status_code=304, headers={'ETag': tag})
+        messages = store.chat_messages_after(after, 200 if after else 100)
+        return JSONResponse({'messages': messages, 'last': max([last, *(m['seq'] for m in messages)]),
+                             'partial': bool(after)}, headers={'ETag': tag})
 
     @router.get('/api/chat/files/{asset_id}')
-    def asset(asset_id: str):
+    async def asset(asset_id: str, w: int | None = Query(default=None, ge=80, le=1280)):
         if not re.fullmatch('[0-9a-f]{32}', asset_id):
             raise HTTPException(404)
         item = store.chat_asset(asset_id)
         path = Path(item['path']).resolve()
-        if not path.is_relative_to(asset_root) or not path.is_file():
+        if not (path.is_relative_to(asset_root) or path.is_relative_to(originals_root)) or not path.is_file():
             raise HTTPException(404)
+        if w is not None:
+            if path.suffix.lower() not in IMAGE_EXT:
+                raise HTTPException(404)
+            preview = await asyncio.to_thread(thumbnail, path, w)
+            # Asset ids are random and their files never change, so the preview can stay in the browser.
+            return Response(preview, media_type='image/jpeg', headers={
+                'Content-Disposition': 'inline', 'Cache-Control': 'private, max-age=31536000, immutable'})
         return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or 'application/octet-stream',
                             headers={'Content-Disposition': 'inline'})
+
+    async def read_uploads(uploads) -> list[tuple[str, Path, str]]:
+        """Validate every photo, then store each one once under its content hash."""
+        checked = []
+        total = 0
+        for upload in uploads:
+            name = Path(upload.filename or 'foto').name[:100]
+            data = await upload.read(MAX_UPLOAD + 1)
+            total += len(data)
+            if total > 50 * 1024 * 1024:
+                raise ValueError('El mensaje supera 50 MB de imágenes.')
+            name, data = await asyncio.to_thread(heif_to_jpeg, name, data)
+            await asyncio.to_thread(validate_document, name, data)
+            checked.append((name, data))
+        prepared = []
+        if checked:
+            originals_root.mkdir(exist_ok=True, mode=0o700)
+        for name, data in checked:
+            digest = hashlib.sha256(data).hexdigest()
+            path = originals_root / (digest + Path(name).suffix.lower())
+            await asyncio.to_thread(write_original, path, data)
+            prepared.append((name, path, digest))
+        return prepared
+
+    def turn(messages):
+        return {'messages': messages, 'job_ids': messages[0]['job_ids'], 'intent': messages[0]['intent']}
 
     @router.post('/api/chat')
     async def send(text: str = Form(default='', max_length=4000), client_id: str = Form(default=''),
@@ -180,34 +241,19 @@ def chat_router(store, plan, automation, runner, get_profile) -> APIRouter:
             raise ValueError('Escribe un mensaje o adjunta fotos del ticket.')
         if len(uploads) > 4:
             raise ValueError('Envía hasta cuatro partes del mismo ticket por mensaje.')
+        previous = store.chat_turn(request_id)
+        if previous:
+            return turn(previous)
+        prepared = await read_uploads(uploads)
         async with send_lock:
             previous = store.chat_turn(request_id)
             if previous:
-                return {'messages': previous, 'job_ids': previous[0]['job_ids'],
-                        'intent': previous[0]['intent']}
-            prepared = []
-            total = 0
-            for upload in uploads:
-                name = Path(upload.filename or 'foto').name[:100]
-                data = await upload.read(MAX_UPLOAD + 1)
-                total += len(data)
-                if total > 50 * 1024 * 1024:
-                    raise ValueError('El mensaje supera 50 MB de imágenes.')
-                await asyncio.to_thread(validate_document, name, data)
-                prepared.append((name, data))
-            asset_files = []
-            asset_paths = []
-            for name, data in prepared:
-                path = asset_root / (uuid.uuid4().hex + Path(name).suffix.lower())
-                await asyncio.to_thread(write_original, path, data)
-                asset_id = store.save_chat_asset(name, str(path))
-                asset_files.append({'name': name, 'url': '/api/chat/files/' + asset_id})
-                asset_paths.append(path)
+                return turn(previous)
             waiting = runner.open_question() if not prepared and text.strip() else None
             if waiting:
                 # The agent asked something about the ticket in progress: this is the answer.
                 runner.answer_question(waiting, text.strip())
-                messages = store.save_chat_turn(request_id, text.strip(), asset_files, [waiting], 'answer',
+                messages = store.save_chat_turn(request_id, text.strip(), [], [waiting], 'answer',
                                                 'Gracias. Sigo con el trámite con lo que me dijiste.')
                 return {'messages': messages, 'job_ids': [waiting], 'intent': 'answer'}
             running = runner.running_job() if not prepared and text.strip() else None
@@ -222,33 +268,37 @@ def chat_router(store, plan, automation, runner, get_profile) -> APIRouter:
                 answer = 'Se lo pasé al trámite en curso; lo toma en cuenta en su siguiente paso.'
                 if status:
                     answer += ' Ahora: ' + status[:200]
-                messages = store.save_chat_turn(request_id, text.strip(), asset_files, [running], 'note', answer)
+                messages = store.save_chat_turn(request_id, text.strip(), [], [running], 'note', answer)
                 return {'messages': messages, 'job_ids': [running], 'intent': 'note'}
             earlier = next((m for m in reversed(store.chat_messages(8)) if m['role'] == 'user'), None)
-            reference = clearly_example(text) or (bool(prepared) and not text.strip() and earlier is not None
-                                                  and not earlier['files'] and clearly_example(earlier['text']))
-            retry = not prepared and clearly_retry(text)
-            correction, payment_code = payment_correction(text) if not prepared else (False, '')
-            decision = None
-            if not reference and not retry and not correction and text.strip():
-                try:
-                    decision = await asyncio.to_thread(_model_decision, plan, store, text, bool(prepared))
-                except (PlanError, ValueError, OSError):
-                    pass
-            intent = ('example' if reference else 'retry' if retry else 'correction' if correction else
-                      decision.intent if decision else 'invoice' if prepared else 'conversation')
-            if prepared and intent in {'retry', 'conversation'}:
-                intent = 'example' if reference else 'invoice'
+        reference = clearly_example(text) or (bool(prepared) and not text.strip() and earlier is not None
+                                              and not earlier['files'] and clearly_example(earlier['text']))
+        retry = not prepared and clearly_retry(text)
+        correction, payment_code = payment_correction(text) if not prepared else (False, '')
+        decision = None
+        if not reference and not retry and not correction and text.strip():
+            # The model classifies outside the lock so other messages are not held behind it.
+            try:
+                decision = await asyncio.to_thread(_model_decision, plan, store, text, bool(prepared))
+            except (PlanError, ValueError, OSError):
+                pass
+        intent = ('example' if reference else 'retry' if retry else 'correction' if correction else
+                  decision.intent if decision else 'invoice' if prepared else 'conversation')
+        if prepared and intent in {'retry', 'conversation'}:
+            intent = 'example' if reference else 'invoice'
+        answer = ''
+        if intent == 'example' and prepared:
+            answer = await asyncio.to_thread(_example_answer, plan, text, [path for _, path, _ in prepared])
+        async with send_lock:
+            previous = store.chat_turn(request_id)
+            if previous:
+                return turn(previous)
+            asset_files = [{'name': name, 'url': '/api/chat/files/' + store.save_chat_asset(name, str(path))}
+                           for name, path, _ in prepared]
             job_ids = []
+            created = False
             if intent == 'invoice' and prepared:
-                originals = []
-                directory = store.root / 'originales'
-                directory.mkdir(exist_ok=True, mode=0o700)
-                for name, data in prepared:
-                    digest = hashlib.sha256(data).hexdigest()
-                    path = directory / (digest + Path(name).suffix.lower())
-                    await asyncio.to_thread(write_original, path, data)
-                    originals.append((str(path), digest, name))
+                originals = [(str(path), digest, name) for name, path, digest in prepared]
                 key, created = store.add_chat_bundle(originals, request_id=request_id)
                 job_ids = [key]
                 answer = ('Recibí ' + str(len(prepared)) + ' partes del mismo ticket. Las leeré juntas y mostraré '
@@ -257,7 +307,7 @@ def chat_router(store, plan, automation, runner, get_profile) -> APIRouter:
                 if not created:
                     answer = 'Esta foto ya estaba en un expediente. Muestro aquí su estado actual.'
             elif intent == 'example' and prepared:
-                answer = await asyncio.to_thread(_example_answer, plan, text, asset_paths)
+                pass
             elif intent == 'retry':
                 answer, job_ids = await _retry_answer(store, runner, get_profile)
             elif intent == 'correction':

@@ -35,6 +35,7 @@
         <div id="chat-thread" class="chat-thread" role="log" aria-live="polite" aria-label="Conversación"></div>
         <section id="chat-progress" class="chat-progress" aria-label="Actividad del trámite" hidden>
           <div class="chat-progress-heading"><strong id="chat-progress-title">Trámite</strong><span id="chat-progress-state"></span></div>
+          <div id="chat-stages" class="chat-stages" hidden></div>
           <p id="chat-progress-message"></p>
           <div id="chat-progress-actions" class="buttons"></div>
           <div id="chat-events" class="chat-events"></div>
@@ -45,12 +46,15 @@
         <div id="chat-attachments" class="chat-attachments" aria-live="polite"></div>
         <div class="chat-compose-row">
           <button id="chat-attach" type="button" class="chat-icon" aria-label="Adjuntar fotos o PDF" title="Adjuntar fotos o PDF">＋</button>
+          <button id="chat-camera" type="button" class="chat-icon" aria-label="Tomar foto" title="Tomar foto">◉</button>
           <textarea id="chat-text" rows="1" maxlength="4000" placeholder="Escribe un mensaje o adjunta fotos de un ticket…" aria-label="Mensaje"></textarea>
           <button id="chat-send" type="submit" class="chat-send" aria-label="Enviar mensaje" title="Enviar mensaje">➜</button>
         </div>
+        <progress id="chat-upload" class="upload-bar" max="100" value="0" aria-label="Avance de la subida" hidden></progress>
         <p id="chat-status" role="status"></p>
       </form>
-      <input id="chat-files" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,image/jpeg,image/png,image/webp,application/pdf" multiple hidden>
+      <input id="chat-files" type="file" accept=".jpg,.jpeg,.png,.webp,.heic,.heif,.pdf,image/jpeg,image/png,image/webp,image/heic,image/heif,application/pdf" multiple hidden>
+      <input id="chat-camera-file" type="file" accept="image/*" capture="environment" hidden>
     </section>
 
     <section class="screen" id="screen-bandeja" hidden aria-labelledby="inbox-title">
@@ -70,12 +74,15 @@
             <button id="automation-review" type="button" class="primary" hidden></button>
           </div>
           <div class="table-tools"><div class="filters" aria-label="Filtrar tickets"><button data-filter="all" aria-pressed="true">Todos</button><button data-filter="review" aria-pressed="false">Por revisar</button><button data-filter="working" aria-pressed="false">En trámite</button></div><div class="search" role="search" aria-label="Buscar tickets"><span aria-hidden="true">⌕</span><input id="ticket-search" name="buscar-ticket" type="search" autocomplete="off" spellcheck="false" placeholder="Buscar ticket" aria-label="Buscar por comercio o folio"><button id="clear-ticket-search" type="button" aria-label="Borrar búsqueda" title="Borrar búsqueda" hidden>×</button></div></div>
+          <div id="upload-progress" class="upload-progress" role="status" hidden><div id="upload-stage"></div><span id="upload-label"></span><progress id="upload-bar" class="upload-bar" max="100" value="0" aria-label="Avance de la subida"></progress></div>
           <div id="tickets"></div>
+          <div class="history-more"><button id="history-more" type="button" class="secondary" hidden>Ver tickets anteriores</button><span id="history-status" role="status"></span></div>
         </section>
         <aside class="side-cards">
           <section class="card source-card" id="dropzone">
             <span class="source-icon mint" aria-hidden="true">↥</span><h2>Importar comprobantes</h2><p>Arrastra fotos, PDF, correos .eml o un ZIP de WhatsApp.</p>
             <button id="choose-file" class="secondary wide-button">Seleccionar archivos</button>
+            <button id="take-photo" class="secondary wide-button">Tomar foto</button>
             <button id="gmail-inbox" class="secondary wide-button">Importar desde Gmail</button>
             <button id="add-sample" class="plain wide-button">Cargar ticket de ejemplo</button>
           </section>
@@ -110,6 +117,7 @@
             <button id="page-text" class="secondary">Leer página</button><button id="page-png" class="secondary">Guardar captura PNG</button>
           </div>
           <form id="paste-form" class="paste-form" hidden><label for="remote-text">Pegar texto en el campo activo</label><div class="buttons"><input id="remote-text" type="password" autocomplete="off" maxlength="2000" required><button class="secondary">Escribir</button></div></form>
+          <form id="type-form" class="paste-form type-form" hidden><label for="remote-keys">Escribir con el teclado del teléfono</label><div class="buttons"><input id="remote-keys" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="send" maxlength="2000" placeholder="Toca un campo del portal y escribe aquí"><button type="button" id="remote-backspace" class="secondary" aria-label="Borrar un carácter" title="Borrar un carácter">⌫</button><button class="secondary" aria-label="Enviar Enter al portal">Enter</button></div></form>
         </section>
         <section class="card task-card"><h2 id="browser-task-title">Trámite actual</h2><div id="browser-task"><p class="muted">El resumen, la forma de pago y las intervenciones aparecen aquí.</p></div>
           <button id="browser-downloads" class="secondary wide-button">Descargas manuales</button></section>
@@ -118,7 +126,7 @@
 
     <section class="screen" id="screen-comprobantes" hidden aria-labelledby="documents-title">
       <header class="screen-header"><div><h1 id="documents-title">Comprobantes</h1><p>Consulta las emisiones, recupera archivos y descarga tus CFDI.</p></div><a class="secondary button-link" href="/api/export.csv">Exportar CSV ↓</a></header>
-      <section class="card receipts"><div class="card-heading"><div><h2>Registro de CFDI</h2><p>Incluye estados de recuperación e historial importado.</p></div></div><div id="documents"></div></section>
+      <section class="card receipts"><div class="card-heading"><div><h2>Registro de CFDI</h2><p>Incluye estados de recuperación e historial importado.</p></div></div><div id="documents"></div><div class="history-more"><button id="history-more-documents" type="button" class="secondary" hidden>Ver comprobantes anteriores</button></div></section>
     </section>
 
     <section class="screen" id="screen-portales" hidden aria-labelledby="portals-title">
@@ -158,7 +166,8 @@
     </section>
   </main>
 
-  <input id="file-upload" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,.zip,.eml" multiple hidden>
+  <input id="file-upload" type="file" accept=".jpg,.jpeg,.png,.webp,.heic,.heif,.pdf,.zip,.eml" multiple hidden>
+  <input id="photo-upload" type="file" accept="image/*" capture="environment" hidden>
   <input id="gmail-file" type="file" accept=".json,application/json" hidden>
   <input id="csf-file" type="file" accept=".pdf,.jpg,.jpeg,.png,.webp" hidden>
   <input id="history-file" type="file" accept=".json,application/json" hidden>

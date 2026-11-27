@@ -9,7 +9,11 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
   let channel = '';
   let challengeOwner = '';
   let frameUrl = '';
+  let frameHash = '';
+  let frameWidth = 0;
+  let unchangedFrames = 0;
   let commandTail = Promise.resolve();
+  let batch = null;
   let dragging = false;
   let lastMove = 0;
   let updating = false;
@@ -22,6 +26,7 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
   function releaseFrame() {
     if (frameUrl) URL.revokeObjectURL(frameUrl);
     frameUrl = '';
+    frameHash = '';
     image.removeAttribute('src');
   }
 
@@ -32,6 +37,7 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
     take.textContent = channel ? 'Devolver control' : 'Tomar control';
     image.classList.toggle('controlling', Boolean(channel));
     byId('paste-form').hidden = !channel;
+    byId('type-form').hidden = !channel;
     byId('browser-tools').hidden = !channel;
     const currentUpload = channel ? (browser.upload?.id || '') : '';
     if (uploadId !== currentUpload) byId('portal-file').value = '';
@@ -77,16 +83,32 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
     syncControls();
   }
 
+  // Ask for frames as wide as the viewer is drawn (in steps), so phones and slow tunnels get smaller images.
+  function wantedWidth() {
+    const box = byId('browser-image').parentElement?.getBoundingClientRect();
+    const pixels = Math.ceil((box?.width || 0) * Math.min(window.devicePixelRatio || 1, 2));
+    if (!pixels || pixels >= 1200) return 0;
+    return Math.max(320, Math.ceil(pixels / 160) * 160);
+  }
+
   async function frame() {
     if (!browser.open || (browser.mode === 'personal' && !browser.url) || browser.dialog ||
         document.hidden || byId('screen-navegador').hidden || updating) return;
     updating = true;
     const revision = browser.revision;
+    const width = wantedWidth();
+    if (width !== frameWidth) { frameWidth = width; frameHash = ''; }
     try {
-      const response = await fetch(`/api/browser/frame?revision=${revision}`, {headers: {'x-app-token': token()}});
+      const query = new URLSearchParams({revision: String(revision)});
+      if (frameHash && frameUrl) query.set('have', frameHash);
+      if (width) query.set('w', String(width));
+      const response = await fetch(`/api/browser/frame?${query}`, {headers: {'x-app-token': token()}});
+      if (response.status === 204) unchangedFrames += 1;
       if (response.status === 200 && revision === browser.revision) {
         const blob = await response.blob();
         if (revision !== browser.revision || !browser.open) return;
+        unchangedFrames = 0;
+        frameHash = response.headers.get('x-frame-hash') || '';
         const previous = frameUrl;
         frameUrl = URL.createObjectURL(blob);
         image.src = frameUrl;
@@ -98,26 +120,71 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
     finally { updating = false; }
   }
 
-  function send(command) {
-    const lease = channel;
-    if (!lease) return;
+  function frameLoop() {
+    frame().finally(() => {
+      // A still page is checked less often unless the person is operating it.
+      setTimeout(frameLoop, channel || unchangedFrames < 8 ? 360 : 900);
+    });
+  }
+
+  function post(current) {
+    const events = current.events;
+    return api('/api/browser/input', 'POST', events.length === 1 ? {...events[0], channel: current.lease} :
+      {channel: current.lease, events});
+  }
+
+  function flush() {
+    const current = batch;
+    if (!current) return commandTail;
+    batch = null;
+    clearTimeout(current.timer);
     commandTail = commandTail.then(async () => {
-      if (channel === lease) await api('/api/browser/input', 'POST', {...command, channel: lease});
+      if (channel === current.lease) await post(current);
     }).catch(error => {
-      if (channel === lease) {
+      if (channel === current.lease) {
         channel = '';
         dragging = false;
         syncControls();
       }
       showError(error.message);
-    });
+    }).then(current.resolve);
     return commandTail;
   }
 
+  // Pointer and keyboard events are grouped in small ordered batches of the same lease.
+  function send(command) {
+    const lease = channel;
+    if (!lease) return Promise.resolve();
+    if (batch && batch.lease !== lease) flush();
+    if (!batch) {
+      let resolve;
+      const done = new Promise(value => { resolve = value; });
+      batch = {lease, events: [], done, resolve, timer: setTimeout(flush, 35)};
+    }
+    const last = batch.events.at(-1);
+    if (command.kind === 'text' && last?.kind === 'text' && last.value.length + command.value.length <= 2000) {
+      last.value += command.value;
+    } else if (command.kind === 'move' && last?.kind === 'move') {
+      last.x = command.x;
+      last.y = command.y;
+    } else batch.events.push({...command});
+    const done = batch.done;
+    if (batch.events.length >= 30) flush();
+    return done;
+  }
+
+  // Map a pointer to the page even when the frame is letterboxed by object-fit: contain.
   function coords(event) {
     const box = image.getBoundingClientRect();
-    return {x: Math.min(1, Math.max(0, (event.clientX - box.left) / box.width)),
-            y: Math.min(1, Math.max(0, (event.clientY - box.top) / box.height))};
+    const naturalWidth = image.naturalWidth || box.width;
+    const naturalHeight = image.naturalHeight || box.height;
+    const scale = Math.min(box.width / naturalWidth, box.height / naturalHeight) || 1;
+    const width = naturalWidth * scale;
+    const height = naturalHeight * scale;
+    const left = box.left + (box.width - width) / 2;
+    const top = box.top + (box.height - height) / 2;
+    return {x: Math.min(1, Math.max(0, (event.clientX - left) / width)),
+            y: Math.min(1, Math.max(0, (event.clientY - top) / height))};
   }
 
   function releasePersonal() {
@@ -183,7 +250,7 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
   }
   async function releaseControl() {
     const previous = channel;
-    await commandTail;
+    await flush();
     if (!previous || previous !== channel) return;
     await api('/api/browser/release', 'POST', {channel: previous});
     if (channel === previous) { channel = ''; challengeOwner = ''; }
@@ -209,7 +276,7 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
     send({kind: 'down', ...coords(event)});
   });
   image.addEventListener('pointermove', event => {
-    if (!channel || !dragging || performance.now() - lastMove < 75) return;
+    if (!channel || !dragging || performance.now() - lastMove < 50) return;
     lastMove = performance.now();
     send({kind: 'move', ...coords(event)});
   });
@@ -249,6 +316,37 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
     await send({kind: 'text', value: field.value});
     field.value = '';
     image.focus();
+  });
+  // Phones do not open their keyboard for an image: this field forwards what is typed to the portal.
+  const keys = byId('remote-keys');
+  function forwardTyped() {
+    if (!channel || !keys.value) return;
+    const value = keys.value.slice(0, 2000);
+    keys.value = '';
+    send({kind: 'text', value});
+  }
+  keys.addEventListener('input', event => { if (!event.isComposing) forwardTyped(); });
+  keys.addEventListener('compositionend', forwardTyped);
+  keys.addEventListener('beforeinput', event => {
+    if (!channel || keys.value) return;
+    if (event.inputType === 'deleteContentBackward') {
+      event.preventDefault();
+      send({kind: 'key', value: 'Backspace'});
+    }
+  });
+  keys.addEventListener('keydown', event => {
+    if (!channel || event.isComposing || keys.value) return;
+    if (event.key === 'Backspace' && !event.repeat) {
+      event.preventDefault();
+      send({kind: 'key', value: 'Backspace'});
+    }
+  });
+  byId('remote-backspace').addEventListener('click', () => { forwardTyped(); send({kind: 'key', value: 'Backspace'}); keys.focus(); });
+  byId('type-form').addEventListener('submit', event => {
+    event.preventDefault();
+    forwardTyped();
+    send({kind: 'key', value: 'Enter'});
+    keys.focus();
   });
   take.addEventListener('click', () => perform(async () => {
     if (channel) await releaseControl();
@@ -306,7 +404,7 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
   for (const [id, accept] of [['native-yes', true], ['native-no', false]]) {
     byId(id).addEventListener('click', () => perform(() => api('/api/browser/dialog', 'POST', {dialog_id: browser.dialog.id, accept})));
   }
-  setInterval(frame, 360);
+  frameLoop();
   return {update, hasControl: () => Boolean(channel), openPersonal: navigation.openPersonal,
     returnToJob: navigation.returnToJob, gmail: navigation.gmail, acquireControl, releaseControl,
     returnToCaptcha: id => api('/api/browser/return', 'POST', {channel, job_id: id})};

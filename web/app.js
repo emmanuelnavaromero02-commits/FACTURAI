@@ -3,6 +3,8 @@ import {installPortalMail} from './correo-portal.js';
 import {installReceiptTools} from './herramientas.js';
 import {installSAT, installWhatsApp} from './seguimiento.js';
 import {installChat} from './chat.js';
+import {startStageClock, stageView, ticketStage, uploadStage} from './avance.js';
+import {prepareFiles, sendForm, sizeLabel} from './subida.js';
 
 const $ = id => document.getElementById(id);
 const sections = {chat: 'Conversación', bandeja: 'Bandeja', navegador: 'Navegador', comprobantes: 'Comprobantes', portales: 'Portales', ajustes: 'Ajustes'};
@@ -47,6 +49,11 @@ let lastLiveJob = null;
 const handledLiveJobs = new Set();
 let selectedRetry = '';
 let lastUploadedId = '';
+let catalog = null;
+let stateTag = '';
+let lastActivity = 0;
+let pollTimer = 0;
+const history = {rows: new Map(), next: '', started: false, loading: null, pages: 0};
 const retryStrip = document.createElement('div');
 retryStrip.id = 'ticket-retry';
 retryStrip.className = 'buttons';
@@ -99,7 +106,76 @@ async function perform(fn) {
     await refresh().catch(() => {});
   } finally {
     busy = false;
+    // An action may have changed an older ticket: read the pages already shown again.
+    if (history.started) reloadHistory();
   }
+}
+
+// GET with the ETag of the last answer; ``unchanged`` means the server replied 304.
+async function cachedJSON(path, tag) {
+  const headers = {'x-app-token': state.token};
+  if (tag) headers['if-none-match'] = tag;
+  const response = await fetch(path, {headers});
+  if (response.status === 304) return {unchanged: true, tag};
+  if (!response.ok) throw Error((await response.text()).slice(0, 450) || 'No se completó la solicitud.');
+  return {data: await response.json(), tag: response.headers.get('etag') || ''};
+}
+
+async function loadCatalog() {
+  if (catalog) return catalog;
+  try {
+    catalog = (await cachedJSON('/api/catalog')).data;
+  } catch { catalog = null; }
+  return catalog;
+}
+
+function allJobs() {
+  if (!history.rows.size) return state.jobs;
+  const current = new Set(state.jobs.map(row => row.id));
+  const older = [...history.rows.values()].filter(row => !current.has(row.id));
+  return [...state.jobs, ...older].sort((a, b) => String(b.created || '').localeCompare(String(a.created || '')) ||
+    String(b.id).localeCompare(String(a.id)));
+}
+
+function moreHistory() {
+  return Boolean(history.started ? history.next : state.history_cursor);
+}
+
+function loadHistory(all = false) {
+  if (history.loading) return history.loading;
+  if (!moreHistory()) return Promise.resolve();
+  history.loading = (async () => {
+    $('history-status').textContent = 'Cargando tickets anteriores…';
+    try {
+      do {
+        const cursor = history.started ? history.next : state.history_cursor;
+        const {data} = await cachedJSON('/api/jobs?before=' + encodeURIComponent(cursor));
+        for (const row of data.jobs || []) history.rows.set(row.id, row);
+        history.started = true;
+        history.pages += 1;
+        history.next = data.next || '';
+      } while (all && history.next);
+      $('history-status').textContent = '';
+    } catch (error) {
+      $('history-status').textContent = error.message;
+    } finally {
+      history.loading = null;
+      renderTickets(true);
+    }
+  })();
+  return history.loading;
+}
+
+function reloadHistory() {
+  const pages = history.pages;
+  history.rows.clear();
+  history.started = false;
+  history.next = '';
+  history.pages = 0;
+  if (!pages) return;
+  (async () => {
+    for (let page = 0; page < pages && moreHistory(); page += 1) await loadHistory();
+  })();
 }
 
 function button(label, handler, variant = 'secondary') {
@@ -229,7 +305,9 @@ function request(row) {
 async function logs(row) {
   const events = await api(`/api/jobs/${row.id}/events`);
   $('logs-label').textContent = row.receipt.merchant || 'Ticket por identificar';
-  const values = events.toReversed().map(event => {
+  // Measurements kept for the owner's dashboard are not steps of the ticket.
+  const technical = new Set(['read_timing', 'session_metrics', 'memory_miss']);
+  const values = events.filter(event => !technical.has(event.kind)).toReversed().map(event => {
     const item = el('div', '', 'log-item');
     let detail = event.detail;
     if (event.kind === 'fuentes_de_campos') {
@@ -576,9 +654,9 @@ function rowActions(row) {
   return group;
 }
 
-function table(container, rows, isDocs = false) {
+function table(container, rows, isDocs = false, everything = state.jobs) {
   if (!rows.length) {
-    if (!isDocs && state.jobs.length) {
+    if (!isDocs && everything.length) {
       const empty = blank('Sin tickets con estos filtros', 'Prueba con otro comercio o folio.');
       empty.append(button('Mostrar todos los tickets', () => {
         $('ticket-search').value = '';
@@ -599,20 +677,26 @@ function table(container, rows, isDocs = false) {
   const head = el('thead');
   head.append(headers);
   const body = el('tbody');
+  const companions = new Map();
+  for (const item of everything) {
+    if (item.companion_of) companions.set(item.companion_of, (companions.get(item.companion_of) || 0) + 1);
+  }
   for (const row of rows) {
     const receipt = row.receipt;
     const title = receipt.merchant || 'Ticket por identificar';
     const info = el('td');
     info.append(el('strong', title, 'ticket-name'), el('span', [receipt.date, receipt.ticket_number || receipt.billing_codes[0],
       row.uuid ? `UUID ${row.uuid}` : null].filter(Boolean).join(' · ') || receipt.source, 'ticket-meta'));
-    const extras = state.jobs.filter(item => item.companion_of === row.id);
-    if (extras.length) info.append(el('span', `${extras.length} imagen${extras.length === 1 ? '' : 'es'} complementaria${extras.length === 1 ? '' : 's'}`, 'ticket-meta'));
+    const extras = companions.get(row.id) || 0;
+    if (extras) info.append(el('span', `${extras} imagen${extras === 1 ? '' : 'es'} complementaria${extras === 1 ? '' : 's'}`, 'ticket-meta'));
     if (row.message) info.append(el('p', row.message, 'ticket-note'));
     const stateCell = el('td');
     const statusLabel = reading(row) ? 'Leyendo ticket' :
       row.status === 'new' && state.automation?.enabled && !row.historical && state.plan.status === 'ready' ? 'En cola de lectura' :
       row.status === 'external' && row.issue_attempted ? 'Solicitud en seguimiento' : jobLabels[row.status];
     stateCell.append(el('span', statusLabel || row.status, 'job-status', row.status));
+    const stage = !isDocs && !row.historical && !terminal.has(row.status) ? ticketStage(row, state) : null;
+    if (stage) stateCell.append(stageView(stage, {compact: true}));
     const actions = el('td');
     actions.append(rowActions(row));
     const tr = el('tr');
@@ -635,21 +719,29 @@ function renderTickets(force = false) {
   const search = $('ticket-search');
   $('clear-ticket-search').hidden = !search.value;
   const query = search.value.trim().toLowerCase();
-  const signature = JSON.stringify([filter, query, state.jobs, state.supports_ticket_retry, state.automation?.enabled, state.automation?.current_id,
-    state.automation?.phase, liveJob()?.id, state.plan.status, Boolean(state.profile)]);
+  const signature = JSON.stringify([filter, query, state.jobs, history.rows.size, state.supports_ticket_retry, state.automation?.enabled,
+    state.automation?.current_id, state.automation?.phase, state.automation?.jobs, liveJob()?.id, state.plan.status, Boolean(state.profile)]);
   if (!force && signature === rowSignature) return;
   rowSignature = signature;
   renderRetryStrip();
-  const rows = state.jobs.filter(row => (filter === 'all' || filter === 'review' && (review.has(row.status) && !existingAttempt(row) || retryKind(row)) ||
+  // Searching covers the whole history: the older pages are read once when needed.
+  if (query && moreHistory()) loadHistory(true);
+  const everything = allJobs();
+  const rows = everything.filter(row => (filter === 'all' || filter === 'review' && (review.has(row.status) && !existingAttempt(row) || retryKind(row)) ||
     filter === 'working' && (working.has(row.status) || row.status === 'whatsapp_preparing' || row.status === 'external' && row.issue_attempted))
     && [row.receipt.merchant, row.receipt.ticket_number,
       row.receipt.amount, row.receipt.source, ...row.receipt.billing_codes].join(' ').toLowerCase().includes(query));
-  table($('tickets'), rows);
-  table($('documents'), state.jobs.filter(row => documents.has(row.status) || row.has_pdf || row.has_xml ||
-    row.status === 'external' && row.issue_attempted), true);
-  $('count-total').textContent = state.jobs.length;
-  $('count-pending').textContent = state.jobs.filter(row => !terminal.has(row.status)).length;
-  $('count-verified').textContent = new Set(state.jobs.filter(row => row.status === 'verified').map(row => row.uuid || row.id)).size;
+  table($('tickets'), rows, false, everything);
+  table($('documents'), everything.filter(row => documents.has(row.status) || row.has_pdf || row.has_xml ||
+    row.status === 'external' && row.issue_attempted), true, everything);
+  const more = moreHistory();
+  $('history-more').hidden = !more;
+  $('history-more-documents').hidden = !more;
+  const summary = state.jobs_summary;
+  $('count-total').textContent = summary ? summary.total : state.jobs.length;
+  $('count-pending').textContent = summary ? summary.pending : state.jobs.filter(row => !terminal.has(row.status)).length;
+  $('count-verified').textContent = summary ? summary.verified :
+    new Set(state.jobs.filter(row => row.status === 'verified').map(row => row.uuid || row.id)).size;
   $('batch').disabled = !state.jobs.some(row => row.status === 'ready' && !row.receipt.source.startsWith('Ejemplo:'));
 }
 
@@ -756,11 +848,47 @@ function renderPortals() {
   $('portal-list').replaceChildren(...(cards.length ? cards : [blank('Sin resultados', 'Busca por el nombre del comercio.')])) ;
 }
 
+function activeWork() {
+  const automation = state.automation || {};
+  const reading = automation.jobs && typeof automation.jobs === 'object' && Object.keys(automation.jobs).length;
+  return Boolean(state.active_job || state.browser?.open || reading || chat.busy() || uploading ||
+    ['reading', 'queued', 'running'].includes(automation.phase) ||
+    state.jobs.some(row => working.has(row.status) || row.status === 'issued_waiting_files' ||
+      row.status === 'new' && !row.historical && (automation.enabled || row.batch_id?.startsWith('chat-'))));
+}
+
+// Poll every 1.25 s while something moves (and for a short while after), every 5 s at rest,
+// never while the tab is hidden.
+function schedule() {
+  clearTimeout(pollTimer);
+  pollTimer = 0;
+  if (document.hidden) return;
+  if (activeWork()) lastActivity = Date.now();
+  const delay = Date.now() - lastActivity < 15_000 ? 1250 : 5000;
+  pollTimer = setTimeout(poll, delay);
+}
+
+async function poll() {
+  pollTimer = 0;
+  if (busy) return schedule();
+  try { await refresh(); }
+  catch (error) { notify(error.message, true); schedule(); }
+}
+
 async function refresh() {
   const request = ++refreshNumber;
-  const latest = await api('/api/state');
+  const result = await cachedJSON('/api/state', stateTag);
   if (request < appliedRefresh) return;
   appliedRefresh = request;
+  if (result.unchanged) {
+    await chat.refresh(state);
+    schedule();
+    return;
+  }
+  const latest = result.data;
+  stateTag = result.tag;
+  if (!latest.catalog) latest.catalog = (await loadCatalog()) || state.catalog || {};
+  else catalog = latest.catalog;
   const interacting = document.hidden || viewer.hasControl() || Boolean(document.querySelector('dialog[open], .row-actions details[open]')) ||
     Boolean(document.activeElement?.matches('input:not([type=checkbox]):not([type=file]), select, textarea, [contenteditable=true]'));
   state = latest;
@@ -772,15 +900,42 @@ async function refresh() {
   renderSettings();
   await chat.refresh(state);
   if (activeScreen === 'portales' && !$('portal-list').children.length) renderPortals();
+  schedule();
+}
+
+let uploading = false;
+let uploadStarted = 0;
+
+function uploadProgress(label, fraction) {
+  const box = $('upload-progress');
+  box.hidden = fraction === null;
+  if (fraction === null) return;
+  if (!fraction) uploadStarted = Date.now();
+  const percent = Math.round(fraction * 100);
+  $('upload-label').textContent = fraction >= 1 ? 'Archivos recibidos. Registrando…' : `Subiendo ${label} · ${percent}%`;
+  $('upload-bar').value = percent;
+  const step = stageView({...uploadStage(fraction, uploadStarted), percent: undefined}, {compact: true});
+  $('upload-stage').replaceChildren(step);
 }
 
 function upload(files) {
   if (!files.length) return;
   lastUploadedId = '';
   perform(async () => {
-    const data = new FormData();
-    for (const file of files) data.append('files', file);
-    const rows = await api('/api/upload', 'POST', data);
+    uploading = true;
+    let rows;
+    try {
+      uploadProgress('', 0);
+      $('upload-label').textContent = 'Preparando las fotos…';
+      const ready = await prepareFiles(files);
+      const data = new FormData();
+      for (const file of ready) data.append('files', file);
+      const label = `${ready.length} ${ready.length === 1 ? 'archivo' : 'archivos'} (${sizeLabel(ready.reduce((sum, file) => sum + file.size, 0))})`;
+      rows = await sendForm('/api/upload', data, {token: state.token, onProgress: fraction => uploadProgress(label, fraction)});
+    } finally {
+      uploading = false;
+      uploadProgress('', null);
+    }
     const count = rows.filter(row => row.created).length;
     const duplicates = rows.length - count;
     lastUploadedId = rows.find(row => row.created)?.id || rows[0]?.id || '';
@@ -810,6 +965,10 @@ function upload(files) {
 
 for (const id of ['primary-upload', 'choose-file']) $(id).onclick = () => $('file-upload').click();
 $('file-upload').onchange = event => {upload([...event.target.files]); event.target.value = '';};
+$('take-photo').onclick = () => $('photo-upload').click();
+$('photo-upload').onchange = event => {upload([...event.target.files]); event.target.value = '';};
+$('history-more').onclick = () => loadHistory();
+$('history-more-documents').onclick = () => loadHistory();
 $('batch').onclick = () => prepare(state.jobs.filter(row => row.status === 'ready'));
 $('automation-enabled').onchange = async event => {
   const enabled = event.target.checked;
@@ -1100,10 +1259,13 @@ if (outcome) {
   } else if (outcome === 'chatgpt-error') notify('La conexión no se completó. Puedes volver a iniciarla.', true);
   else if (outcome.startsWith('chatgpt')) notify('Conexión guardada. Revisa su estado en Ajustes.');
 }
+startStageClock();
 refresh().then(() => {
   if (activeScreen === 'portales') renderPortals();
   resumePersonalIfIdle();
-}).catch(error => notify(error.message, true));
-setInterval(() => {
-  if (!busy && !document.hidden) refresh().catch(error => notify(error.message, true));
-}, 1250);
+}).catch(error => { notify(error.message, true); schedule(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { clearTimeout(pollTimer); pollTimer = 0; }
+  else if (!busy) poll();
+  else schedule();
+});
