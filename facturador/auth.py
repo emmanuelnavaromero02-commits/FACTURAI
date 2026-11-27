@@ -16,6 +16,7 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 import jwt
 
+from . import secretos
 from .read_http import retry_seconds
 
 ISSUER = 'https://auth.openai.com'
@@ -111,6 +112,12 @@ class ChatGPTPlan:
         self._rejected_efforts: set[tuple[str, str]] = set()  # (model, effort) refused by the API
         self.client = client or httpx.Client(timeout=httpx.Timeout(90, connect=12), follow_redirects=False)
 
+    def _session(self) -> dict:
+        return secretos.read_json(self.session_path, {}, purpose=secretos.CHATGPT_SESSION)
+
+    def _save_session(self, record: dict) -> None:
+        secretos.write_json(self.session_path, record, purpose=secretos.CHATGPT_SESSION)
+
     @staticmethod
     def _active_hold(record):
         hold = record.get('hold', '')
@@ -118,7 +125,7 @@ class ChatGPTPlan:
         return '' if hold == 'limit' and until and until <= time.time() else hold
 
     def status(self) -> dict:
-        record = read_json(self.session_path, {})
+        record = self._session()
         if hold := self._active_hold(record):
             state = hold
         elif not record.get('access_token'):
@@ -132,7 +139,7 @@ class ChatGPTPlan:
 
     def start(self, new_account: bool = False, consent: bool = False) -> str:
         with self.lock:
-            record = read_json(self.session_path, {})
+            record = self._session()
             client_id = (record.get('client_id') if not new_account else None) or PUBLIC_CLIENT
             host = read_json(self.root / 'host.json', {})
             if not host:
@@ -177,10 +184,10 @@ class ChatGPTPlan:
             identity = self._identity(tokens.get('id_token', ''), client_id, attempt['nonce'])
             if attempt['subject'] and identity['sub'] != attempt['subject']:
                 raise PlanError('Selecciona la cuenta que ya vinculaste o usa Otra cuenta.')
-            previous = read_json(self.session_path, {})
+            previous = self._session()
             record = {'client_id': client_id, 'subject': identity['sub'], 'email': identity.get('email', ''),
                       'model': previous.get('model', DEFAULT_MODEL) if client_id == previous.get('client_id') else DEFAULT_MODEL}
-            write_private(self.session_path, self._with_tokens(record, tokens))
+            self._save_session(self._with_tokens(record, tokens))
 
     def _identity(self, token: str, client_id: str, nonce: str) -> dict:
         try:
@@ -232,7 +239,7 @@ class ChatGPTPlan:
 
     def _credentials(self) -> tuple[str, str]:
         with self.lock:
-            record = read_json(self.session_path, {})
+            record = self._session()
             if hold := self._active_hold(record):
                 raise PlanError(record.get('message') or 'Revisa tu conexión con ChatGPT.', hold)
             if not record.get('access_token') or not PLAN_SCOPES.issubset(record.get('scopes', [])):
@@ -249,7 +256,7 @@ class ChatGPTPlan:
                         raise
                 else:
                     record = self._with_tokens(record, tokens)
-                    write_private(self.session_path, record)
+                    self._save_session(record)
             if record['expires_at'] <= time.time():
                 raise PlanError('La sesión expiró. Vuelve a conectar ChatGPT.', 'reconnect')
             if not PLAN_SCOPES.issubset(record.get('scopes', [])):
@@ -260,11 +267,11 @@ class ChatGPTPlan:
         keep = {key: record[key] for key in ('client_id', 'subject', 'email', 'model') if key in record}
         if message:
             keep.update(hold='reconnect', message=message)
-        write_private(self.session_path, keep)
+        self._save_session(keep)
 
     def disconnect(self) -> bool:
         with self.lock:
-            record = read_json(self.session_path, {})
+            record = self._session()
             refresh = record.get('refresh_token')
             revoked = not refresh
             try:
@@ -284,10 +291,10 @@ class ChatGPTPlan:
 
     def clear_limit(self) -> None:
         with self.lock:
-            record = read_json(self.session_path, {})
+            record = self._session()
             if record.get('hold') == 'limit':
                 record.update(hold='', message='')
-                write_private(self.session_path, record)
+                self._save_session(record)
 
     def _error(self, raw: dict, status: int = 0, access: str = '', retry_after: int = 0,
                event_type: str = '') -> PlanError:
@@ -302,10 +309,10 @@ class ChatGPTPlan:
             message = (f'El cupo de ChatGPT está en pausa. La lectura se reanudará en {retry_after} segundos.'
                        if retry_after else 'El cupo de ChatGPT está en pausa. Consulta el uso de tu plan y retoma cuando esté disponible.')
             with self.lock:
-                record = read_json(self.session_path, {})
+                record = self._session()
                 if access and record.get('access_token') == access:
                     record.update(hold='limit', message=message, hold_until=time.time() + retry_after if retry_after else 0)
-                    write_private(self.session_path, record)
+                    self._save_session(record)
             return PlanError(message, 'limit', retry_after, **diagnostic)
         if status in {408, 425, 429, 500, 502, 503, 504} or code in {
                 'server_error', 'internal_error', 'rate_limit_exceeded', 'overloaded', 'timeout'}:
@@ -323,10 +330,10 @@ class ChatGPTPlan:
         if status == 401 or code in {'subscription_sharing_invalid_user', 'chatpass_v2_invalid_authorization_context'}:
             message = 'OpenAI no aceptó la sesión. Vuelve a conectar ChatGPT.'
             with self.lock:
-                record = read_json(self.session_path, {})
+                record = self._session()
                 if access and record.get('access_token') == access:
                     record.update(hold='reconnect', message=message)
-                    write_private(self.session_path, record)
+                    self._save_session(record)
             return PlanError(message, 'reconnect', **diagnostic)
         if status == 403:
             return PlanError('OpenAI no autorizó usar el plan para esta solicitud.', 'ineligible',
@@ -365,9 +372,9 @@ class ChatGPTPlan:
         with self.lock:
             if model not in {entry['id'] for entry in self.models()}:
                 raise PlanError('El modelo no aparece en la lista de este plan.', 'model')
-            record = read_json(self.session_path, {})
+            record = self._session()
             record['model'] = model
-            write_private(self.session_path, record)
+            self._save_session(record)
 
     def infer(self, instructions, content, output_type, *, effort='medium', web_search=False):
         access, model = self._credentials()

@@ -13,6 +13,7 @@ from fastapi import APIRouter
 from playwright.async_api import Error as BrowserError
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
+from . import secretos
 from .auth import read_json, write_private
 from .catalog import public_portal_origin
 from .models import Profile
@@ -39,12 +40,12 @@ def site_password(record_path: Path, create: bool, *, rotation: bool = False) ->
     if not create and not record.get(slot):
         raise ValueError('Aún no hay una contraseña guardada para este correo en este portal.')
     key_file = record_path.parent / 'vault-key.json'
-    key = read_json(key_file, None)
+    key = secretos.read_json(key_file, None, purpose=secretos.PORTAL_VAULT)
     if key is None:
         if record or any(record_path.parent.glob('*.json')):
             raise ValueError('Falta la clave privada del almacén de contraseñas del portal.')
         key = Fernet.generate_key().decode('ascii')
-        write_private(key_file, {'key': key})
+        secretos.write_json(key_file, {'key': key}, purpose=secretos.PORTAL_VAULT)
     else:
         key = key['key']
     vault = Fernet(key.encode('ascii'))

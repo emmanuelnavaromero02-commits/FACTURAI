@@ -117,6 +117,11 @@ class StaticAssets:
         self.index = page.encode()
         self.index_tag = entity_tag(self.index)
 
+    def add_script(self, source: str) -> None:
+        """One more module for the page, served by whoever stands in front of this application."""
+        self.index = self.index.replace(b'</head>', f'  <script type="module" src="{source}"></script>\n</head>'.encode(), 1)
+        self.index_tag = entity_tag(self.index)
+
     def response(self, request: Request, name: str) -> Response:
         body, version = self.files[name]
         kind = self.KINDS[Path(name).suffix]
@@ -165,7 +170,8 @@ class HistoryItem(BaseModel):
     uuid: str | None = Field(default=None, max_length=36)
 
 
-def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
+def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin: str | None = None,
+               lazy_browser: bool = False) -> FastAPI:
     load_dotenv(BASE / ".env")
     root = (data_root or Path(os.getenv("FACTURADOR_DATA", str(BASE / "data")))).resolve()
     store = Store(root)
@@ -176,13 +182,15 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     container_browser = os.getenv("FACTURADOR_CONTAINER") == "1"
     token = secrets.token_urlsafe(32)
     diagnostics_lock = asyncio.Lock()
-    permitted_origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}", "http://testserver"}
+    # Behind the entrance for several customers only its public origin talks to this application.
+    permitted_origins = ({public_origin} if public_origin else
+                         {f"http://127.0.0.1:{port}", f"http://localhost:{port}", "http://testserver"})
 
     @asynccontextmanager
     async def lifespan(app):
         store.recover_after_restart()
         try:
-            if container_browser:
+            if container_browser and not lazy_browser:
                 try:
                     await runner.open_personal()
                 except ValueError:
@@ -206,8 +214,12 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     app.state.plan = plan
     app.state.csrf_token = token
     app.include_router(sat_router(store))
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=(
+        [public_origin.partition("://")[2].partition(":")[0]] if public_origin else ["127.0.0.1", "localhost", "testserver"]))
     assets = StaticAssets(BASE / 'web')
+    if public_origin:
+        # Behind the entrance: a way to «Mi cuenta» and back to the sign-in page when the session ends.
+        assets.add_script('/acceso/panel.js')
     cacheable_paths = {'/', *('/' + name for name in assets.files)}
 
     @app.middleware("http")
@@ -255,7 +267,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     app.include_router(ia_router(root, plan))
     app.include_router(medicion_router(store))
     # Notices to the owner (browser push, own mail, bell) and the watcher that raises them once per change.
-    avisos = Avisos(store, panel_url=f'http://127.0.0.1:{port}')
+    avisos = Avisos(store, panel_url=public_origin or f'http://127.0.0.1:{port}')
     avisos_watcher = VigilanteAvisos(store, avisos, whatsapp=lambda: app.state.whatsapp)
     app.state.avisos = avisos
     app.include_router(avisos_router(store, avisos))

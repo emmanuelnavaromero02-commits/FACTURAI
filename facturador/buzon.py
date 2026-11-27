@@ -19,7 +19,7 @@ from pathlib import Path
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 
-from . import gmail
+from . import gmail, secretos
 from .auth import read_json, write_private
 
 MAX_MESSAGE = 50 * 1024 * 1024
@@ -78,12 +78,12 @@ def _account_path(root) -> Path:
 
 def _vault(root, create: bool) -> Fernet:
     key_file = _folder(root) / 'vault-key.json'
-    key = read_json(key_file, None)
+    key = secretos.read_json(key_file, None, purpose=secretos.MAIL_VAULT)
     if key is None:
         if not create:
             raise ValueError('Falta la clave privada del almacén del correo. Vuelve a conectar la cuenta.')
         key = {'key': Fernet.generate_key().decode('ascii')}
-        write_private(key_file, key)
+        secretos.write_json(key_file, key, purpose=secretos.MAIL_VAULT)
     return Fernet(key['key'].encode('ascii'))
 
 
@@ -115,12 +115,15 @@ def account_password(root) -> str:
             raise ValueError('Conecta tu cuenta de correo en Ajustes.')
         try:
             return _vault(root, create=False).decrypt(record['secret'].encode('ascii')).decode('utf-8')
+        except secretos.SealedSecrets:
+            raise  # A master key problem is not solved by connecting the account again.
         except (InvalidToken, UnicodeError, ValueError):
             raise ValueError('No se pudo abrir la contraseña guardada del correo. Vuelve a conectar la cuenta.') from None
 
 
 def remove_account(root) -> None:
     with ACCOUNT_LOCK:
+        secretos.check(_folder(root) / 'vault-key.json', purpose=secretos.MAIL_VAULT)
         _account_path(root).unlink(missing_ok=True)
         (_folder(root) / 'vault-key.json').unlink(missing_ok=True)
 

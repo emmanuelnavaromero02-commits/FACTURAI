@@ -19,7 +19,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from .auth import PlanError, read_json, write_private
-from . import uso_ia
+from . import secretos, uso_ia
 
 CHATGPT = 'chatgpt'
 KEY_PROVIDERS = {'openai': 'OpenAI (llave de API)', 'anthropic': 'Claude de Anthropic (llave de API)'}
@@ -66,12 +66,13 @@ class AjustesIA:
         write_private(self.path, record)
 
     def _vault(self, create: bool) -> Fernet:
-        key = read_json(self.key_file, None)
+        # With a master key configured the vault key itself is stored sealed.
+        key = secretos.read_json(self.key_file, None, purpose=secretos.IA_VAULT)
         if key is None:
             if not create:
                 raise ValueError('Falta la clave privada del almacén de la IA. Vuelve a escribir la llave.')
             key = {'key': Fernet.generate_key().decode('ascii')}
-            write_private(self.key_file, key)
+            secretos.write_json(self.key_file, key, purpose=secretos.IA_VAULT)
         return Fernet(key['key'].encode('ascii'))
 
     # -- keys
@@ -132,7 +133,7 @@ class AjustesIA:
                 record['proveedor'] = CHATGPT  # Without a key the program falls back to the plan.
             self._write(record)
             if not record.get('llaves'):
-                self.key_file.unlink(missing_ok=True)
+                secretos.remove(self.key_file, purpose=secretos.IA_VAULT)
 
     # -- active provider
     def active(self) -> str:

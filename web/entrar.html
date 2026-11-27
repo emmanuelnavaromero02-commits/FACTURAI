@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#142722">
+  <meta name="referrer" content="no-referrer">
+  <title>Entrar · FACTURAI</title>
+  <link rel="stylesheet" href="/acceso/entrar.css">
+  <script type="module" src="/acceso/entrar.js"></script>
+</head>
+<body>
+  <main class="door">
+    <p class="brand"><span class="brand-icon" aria-hidden="true"></span>FACTURAI</p>
+
+    <section id="vista-entrar" class="card" aria-labelledby="titulo-entrar" hidden>
+      <h1 id="titulo-entrar">Entrar</h1>
+      <p class="lead">Escribe tu usuario y tu contraseña.</p>
+      <form id="form-entrar">
+        <label>Usuario
+          <input name="usuario" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64" required>
+        </label>
+        <label>Contraseña
+          <input name="contrasena" type="password" autocomplete="current-password" maxlength="256" required>
+        </label>
+        <label class="check"><input type="checkbox" data-ver="contrasena"> Mostrar contraseña</label>
+        <button class="primary" type="submit">Entrar</button>
+      </form>
+    </section>
+
+    <section id="vista-invitacion" class="card" aria-labelledby="titulo-invitacion" hidden>
+      <h1 id="titulo-invitacion">Crear tu cuenta</h1>
+      <p class="lead" id="texto-invitacion">Revisando tu invitación…</p>
+      <form id="form-invitacion" hidden>
+        <label>Usuario
+          <input name="usuario" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" minlength="3" maxlength="64" required>
+        </label>
+        <label>Contraseña nueva
+          <input name="contrasena" type="password" autocomplete="new-password" minlength="12" maxlength="256" required aria-describedby="ayuda-contrasena">
+        </label>
+        <p class="hint" id="ayuda-contrasena">Mínimo 12 caracteres. Una frase que solo tú conozcas funciona bien.</p>
+        <label>Repite la contraseña
+          <input name="repetir" type="password" autocomplete="new-password" minlength="12" maxlength="256" required>
+        </label>
+        <label class="check"><input type="checkbox" data-ver="contrasena repetir"> Mostrar contraseña</label>
+        <button class="primary" type="submit">Crear cuenta y entrar</button>
+      </form>
+      <a class="link" id="ir-a-entrar" href="/entrar" hidden>Ir a Entrar</a>
+    </section>
+
+    <p id="aviso" class="notice" role="alert" hidden></p>
+  </main>
+</body>
+</html>

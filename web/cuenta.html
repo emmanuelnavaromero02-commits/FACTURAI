@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#142722">
+  <meta name="referrer" content="no-referrer">
+  <title>Mi cuenta · FACTURAI</title>
+  <link rel="stylesheet" href="/acceso/entrar.css">
+  <script type="module" src="/acceso/cuenta.js"></script>
+</head>
+<body>
+  <main class="door wide">
+    <p class="brand"><span class="brand-icon" aria-hidden="true"></span>FACTURAI</p>
+    <p id="aviso" class="notice" role="alert" hidden></p>
+
+    <section class="card" aria-labelledby="titulo-cuenta">
+      <h1 id="titulo-cuenta">Mi cuenta</h1>
+      <p class="lead" id="quien">Cargando…</p>
+      <div class="buttons">
+        <a class="secondary" id="volver" href="/">Volver a mis tickets</a>
+        <button class="secondary" id="cerrar-otras" type="button">Cerrar mis otras sesiones</button>
+        <button class="danger" id="salir" type="button">Cerrar sesión</button>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="titulo-contrasena">
+      <h2 id="titulo-contrasena">Cambiar contraseña</h2>
+      <form id="form-contrasena">
+        <input name="usuario" type="text" autocomplete="username" hidden>
+        <label>Contraseña actual
+          <input name="actual" type="password" autocomplete="current-password" maxlength="256" required>
+        </label>
+        <label>Contraseña nueva
+          <input name="nueva" type="password" autocomplete="new-password" minlength="12" maxlength="256" required aria-describedby="ayuda-nueva">
+        </label>
+        <p class="hint" id="ayuda-nueva">Mínimo 12 caracteres. Al cambiarla se cierran tus otras sesiones.</p>
+        <label>Repite la contraseña nueva
+          <input name="repetir" type="password" autocomplete="new-password" minlength="12" maxlength="256" required>
+        </label>
+        <label class="check"><input type="checkbox" data-ver="actual nueva repetir"> Mostrar contraseñas</label>
+        <button class="primary" type="submit">Cambiar contraseña</button>
+      </form>
+    </section>
+
+    <section class="card" id="admin" aria-labelledby="titulo-admin" hidden>
+      <h2 id="titulo-admin">Personas con acceso</h2>
+      <p class="lead">Aquí invitas a alguien o le quitas el acceso. Nadie más que cada persona puede ver sus tickets y facturas.</p>
+      <ul class="rows" id="usuarios"></ul>
+
+      <h2 class="section-gap">Invitar a alguien</h2>
+      <form id="form-invitar">
+        <label>Usuario para esa persona (opcional)
+          <input name="usuario" type="text" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
+        </label>
+        <label>La invitación vence en
+          <select name="horas">
+            <option value="24">1 día</option>
+            <option value="72" selected>3 días</option>
+            <option value="168">7 días</option>
+          </select>
+        </label>
+        <button class="primary" type="submit">Crear invitación</button>
+      </form>
+      <div class="copy" id="invitacion-lista" hidden>
+        <p class="lead">Envía este enlace a esa persona. Sirve una sola vez y no se volverá a mostrar.</p>
+        <input id="enlace" type="text" readonly aria-label="Enlace de invitación">
+        <button class="secondary" id="copiar" type="button">Copiar enlace</button>
+      </div>
+      <ul class="rows" id="invitaciones"></ul>
+    </section>
+  </main>
+</body>
+</html>

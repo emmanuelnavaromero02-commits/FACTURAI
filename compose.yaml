@@ -15,6 +15,51 @@ services:
       - no-new-privileges:true
       - seccomp=./docker/chromium-seccomp.json
     restart: unless-stopped
+    # ── Varios usuarios, detrás de un proxy con TLS (APAGADO) ─────────────────────────────
+    # Tal como está, este archivo arranca el modo de siempre: una persona, sin cuentas y el
+    # panel solo en 127.0.0.1. Para entregar FACTURAI a varios clientes:
+    #   1. Crea la llave maestra FUERA del volumen de datos y del repositorio, y deja que la
+    #      lea el usuario del contenedor (10001):
+    #        mkdir -p ../facturai-llave
+    #        openssl rand -base64 32 > ../facturai-llave/llave-maestra.key
+    #        sudo chown 10001 ../facturai-llave/llave-maestra.key
+    #        sudo chmod 400 ../facturai-llave/llave-maestra.key
+    #      Guarda una copia en otro lugar seguro: sin ella no se abren los secretos guardados.
+    #   2. Quita «#u » al inicio de cada línea marcada en este archivo y pon tu dominio aquí
+    #      y en docker/Caddyfile.ejemplo. Con varios navegadores a la vez conviene subir
+    #      shm_size (por ejemplo a 1g).
+    #   3. Arranca y crea el primer administrador (la contraseña se escribe con el teclado):
+    #        docker compose up -d --build
+    #        docker compose exec facturador python -m facturador crear-admin
+    #u environment:
+    #u   FACTURADOR_MODO: usuarios
+    #u   FACTURADOR_ORIGEN_PUBLICO: https://facturas.ejemplo.com
+    #u   FACTURADOR_ARCHIVO_LLAVE: /run/secrets/llave_maestra
+    #u   # Red de Docker desde la que llega el proxy; de ahí se toma la dirección real de quien entra.
+    #u   FACTURADOR_PROXIES: 172.16.0.0/12
+    #u   FACTURADOR_NAVEGADORES_MAX: '3'
+    #u secrets:
+    #u   - llave_maestra
+
+  # Proxy con TLS: el único servicio que abre puertos hacia fuera (80 y 443).
+  #u proxy:
+  #u   image: caddy:2
+  #u   ports:
+  #u     - '80:80'
+  #u     - '443:443'
+  #u   volumes:
+  #u     - ./docker/Caddyfile.ejemplo:/etc/caddy/Caddyfile:ro
+  #u     - proxy_datos:/data
+  #u     - proxy_config:/config
+  #u   depends_on:
+  #u     - facturador
+  #u   restart: unless-stopped
+
+#u secrets:
+#u   llave_maestra:
+#u     file: ../facturai-llave/llave-maestra.key
 
 volumes:
   expedientes:
+  #u proxy_datos:
+  #u proxy_config:

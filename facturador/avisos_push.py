@@ -19,7 +19,8 @@ from urllib.parse import urlsplit
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from .auth import read_json, write_private
+from . import secretos
+from .auth import read_json, write_private  # noqa: F401 - kept as patch points
 from .db import now
 
 _LOG = logging.getLogger(__name__)
@@ -58,7 +59,8 @@ def _keys(root) -> dict:
     """Read the key pair, creating it on the first call. Generated exactly once per data folder."""
     path = _key_path(root)
     with KEY_LOCK:
-        record = read_json(path, None)
+        # With a master key configured the private key is stored sealed.
+        record = secretos.read_json(path, None, purpose=secretos.PUSH_KEYS)
         if isinstance(record, dict) and record.get('private_pem') and record.get('public'):
             return record
         private = ec.generate_private_key(ec.SECP256R1())
@@ -67,7 +69,7 @@ def _keys(root) -> dict:
         public = private.public_key().public_bytes(serialization.Encoding.X962,
                                                    serialization.PublicFormat.UncompressedPoint)
         record = {'private_pem': pem, 'public': _b64(public), 'created': int(time.time())}
-        write_private(path, record)
+        secretos.write_json(path, record, purpose=secretos.PUSH_KEYS)
         try:
             path.chmod(0o600)
         except OSError:

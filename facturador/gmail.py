@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from . import secretos
 from .auth import read_json, write_private
 from .read_http import read_with_retry
 from .ingest import IMAGE_EXT, MAX_UPLOAD, save_inputs, write_original
@@ -58,18 +59,18 @@ class GmailConnection:
         except (KeyError, TypeError, UnicodeError, ValueError) as exc:
             raise ValueError('Selecciona el JSON de un cliente OAuth de escritorio de Google.') from exc
         with GMAIL_LOCK:
-            existing = read_json(self.client, {}).get('installed', {})
+            existing = secretos.read_json(self.client, {}, purpose=secretos.GMAIL_CLIENT).get('installed', {})
             installed = {'client_id': client['client_id'], 'client_secret': client['client_secret']}
             if existing == installed:
                 return
             if self.token.exists() and existing.get('client_id') != installed['client_id']:
                 raise ValueError('Desvincula Gmail antes de cambiar de cliente OAuth.')
-            write_private(self.client, {'installed': installed})
+            secretos.write_json(self.client, {'installed': installed}, purpose=secretos.GMAIL_CLIENT)
             self.pending.clear()
 
     def start(self, send: bool = False) -> str:
         with GMAIL_LOCK:
-            client = read_json(self.client, {}).get('installed')
+            client = secretos.read_json(self.client, {}, purpose=secretos.GMAIL_CLIENT).get('installed')
             if not client:
                 raise ValueError('Carga primero el cliente OAuth de escritorio de Google.')
             state, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(64)
@@ -91,7 +92,7 @@ class GmailConnection:
                 raise GmailAuthorizationError('caducado', 'La solicitud de Gmail caducó.')
             if error or not code:
                 raise GmailAuthorizationError('consentimiento', 'La autorización de Gmail no se completó.')
-            client = read_json(self.client)['installed']
+            client = secretos.read_json(self.client, purpose=secretos.GMAIL_CLIENT)['installed']
             tokens = exchange({'grant_type': 'authorization_code', 'redirect_uri': self.redirect, 'code': code,
                                'code_verifier': pending[0], **client})
             record = record_from(tokens)
@@ -105,13 +106,13 @@ class GmailConnection:
                     raise ValueError
             except (ValueError, httpx.HTTPError) as exc:
                 raise GmailAuthorizationError('buzon', 'Verifica que Gmail API esté habilitada para el cliente y que la cuenta tenga Gmail.') from exc
-            write_private(self.token, record)
+            secretos.write_json(self.token, record, purpose=secretos.GMAIL_TOKEN)
             self.pending.clear()
 
     def disconnect(self):
         with GMAIL_LOCK:
             self.pending.clear()
-            self.token.unlink(missing_ok=True)
+            secretos.remove(self.token, purpose=secretos.GMAIL_TOKEN)
 
 
 def exchange(form: dict) -> dict:
@@ -144,19 +145,19 @@ def record_from(tokens: dict, previous: dict | None = None) -> dict:
 def access_token(root: Path) -> str:
     with GMAIL_LOCK:
         path = root / 'gmail_token.json'
-        credentials = read_json(path, {})
+        credentials = secretos.read_json(path, {}, purpose=secretos.GMAIL_TOKEN)
         if not credentials.get('token'):
             raise ValueError('Conecta Gmail de solo lectura desde Ajustes.')
         if credentials.get('expires_at', 0) > time.time() + 45:
             return credentials['token']
         if not credentials.get('refresh_token'):
             raise ValueError('La conexión de Gmail expiró. Vuelve a vincular la cuenta.')
-        client = read_json(root / 'google_client.json', {}).get('installed')
+        client = secretos.read_json(root / 'google_client.json', {}, purpose=secretos.GMAIL_CLIENT).get('installed')
         if not client:
             raise ValueError('Falta el cliente de escritorio de Google.')
         tokens = exchange({'grant_type': 'refresh_token', 'refresh_token': credentials['refresh_token'], **client})
         record = record_from(tokens, {**credentials, 'scope': credentials.get('scope') or SCOPE})
-        write_private(path, record)
+        secretos.write_json(path, record, purpose=secretos.GMAIL_TOKEN)
         return record['token']
 
 
@@ -324,7 +325,7 @@ def recover_attachments(root: Path, key: str, query: str) -> list[Path]:
 
 def can_send(root: Path) -> bool:
     """True only when the owner granted the optional Gmail send permission."""
-    scope = read_json(root / 'gmail_token.json', {}).get('scope', '')
+    scope = secretos.read_json(root / 'gmail_token.json', {}, purpose=secretos.GMAIL_TOKEN).get('scope', '')
     return isinstance(scope, str) and SEND_SCOPE in scope.split()
 
 

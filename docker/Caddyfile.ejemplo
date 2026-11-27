@@ -1,0 +1,14 @@
+# Ejemplo de proxy con TLS para FACTURAI con varios usuarios. APAGADO por omisión: solo se usa
+# si activas el servicio «proxy» de compose.yaml (lee ahí los pasos).
+#
+# Cambia el dominio por el tuyo. Debe apuntar a este servidor y los puertos 80 y 443 deben
+# estar abiertos: Caddy pide y renueva el certificado por su cuenta.
+# El mismo dominio, con https://, va en FACTURADOR_ORIGEN_PUBLICO.
+
+facturas.ejemplo.com {
+	# Caddy conserva el nombre del sitio (Host) y agrega la dirección real de quien entra
+	# (X-Forwarded-For), que FACTURAI solo acepta de las redes de FACTURADOR_PROXIES.
+	reverse_proxy facturador:8765
+
+	header -Server
+}
