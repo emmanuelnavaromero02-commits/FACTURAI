@@ -46,6 +46,7 @@ let gmailJob = null;
 let profileDirty = false;
 let rowSignature = '';
 let taskSignature = '';
+let engineSignature = '';
 let refreshNumber = 0;
 let appliedRefresh = 0;
 let savingAutomation = false;
@@ -452,6 +453,46 @@ function showLive(row) {
   if (state.browser.mode === 'personal' && state.browser.return_job_id === row.id) viewer.returnToJob();
 }
 
+// With several tickets at once the viewer shows one of them. These are the others that are in a portal.
+function elsewhere(row) {
+  return (state.engines || []).some(engine => engine.job_id === row.id && !engine.shown);
+}
+
+function watch(row) {
+  return perform(async () => {
+    await viewer.focus({job_id: row.id});
+    await refresh();
+    showLive(row);
+  });
+}
+
+function renderEngines() {
+  const choices = state.engines || [];
+  const picker = $('engine-picker');
+  picker.hidden = choices.length < 2;
+  if (picker.hidden) { engineSignature = ''; return; }
+  const select = $('engine-select');
+  const options = choices.map(engine => {
+    const row = state.jobs.find(job => job.id === engine.job_id);
+    const name = row ? [row.receipt.merchant || 'Ticket', row.receipt.ticket_number || row.receipt.billing_codes[0] ||
+      currency(row.receipt.amount)].filter(Boolean).join(' · ') : 'Navegador principal';
+    const note = engine.waiting ? ' — espera tu ayuda' : row ? ' — en trámite' : '';
+    return {value: String(engine.n), text: name + note, shown: engine.shown};
+  });
+  const signature = JSON.stringify(options);
+  if (signature === engineSignature || document.activeElement === select) return;
+  engineSignature = signature;
+  select.replaceChildren(...options.map(option => new Option(option.text, option.value)));
+  select.value = (options.find(option => option.shown) || options[0]).value;
+}
+
+$('engine-select').onchange = () => {
+  const engine = Number($('engine-select').value);
+  $('engine-select').blur();
+  engineSignature = '';
+  perform(() => viewer.focus({engine}));
+};
+
 function trackLive(interacting) {
   const row = liveJob();
   if (!row || handledLiveJobs.has(row.id)) return;
@@ -609,7 +650,12 @@ function chatActions(row) {
         api(`/api/jobs/${row.id}/decision`, 'POST', {decision: 'resume'})), 'primary'));
     }
   }
-  if (row.id === state.active_job && ['queued', 'running', 'issuing', 'needs_user'].includes(row.status)) {
+  if (elsewhere(row)) {
+    // Another ticket is in front: its steps are taken once the viewer shows this one.
+    actions.push(button(row.status === 'needs_user' ? 'Ver y atender' : 'Ver en vivo', () => watch(row),
+      row.status === 'needs_user' ? 'primary' : 'secondary'));
+  }
+  if ((row.id === state.active_job || elsewhere(row)) && ['queued', 'running', 'issuing', 'needs_user'].includes(row.status)) {
     actions.push(button('Detener', () => perform(() => api(`/api/jobs/${row.id}/stop`, 'POST'))));
   }
   if (realTicket && ['external', 'whatsapp_preparing'].includes(row.status)) {
@@ -658,6 +704,7 @@ function primaryAction(row, realTicket) {
     main?.focus();
   }, 'primary');
   if (isLive(row) || row.id === state.browser.return_job_id) return button('Ver en vivo', () => showLive(row), 'primary');
+  if (elsewhere(row)) return button('Ver en vivo', () => watch(row), 'primary');
   if (reading(row)) return null;
   if (row.status === 'new' && realTicket) {
     if (!state.automation?.enabled) return button(state.plan.status === 'ready' ? 'Leer ticket' : 'Leer en el contenedor',
@@ -817,7 +864,8 @@ function renderTickets(force = false) {
   $('clear-ticket-search').hidden = !search.value;
   const query = search.value.trim().toLowerCase();
   const signature = JSON.stringify([filter, query, state.jobs, history.rows.size, state.supports_ticket_retry, state.automation?.enabled,
-    state.automation?.current_id, state.automation?.phase, state.automation?.jobs, liveJob()?.id, state.plan.status, Boolean(state.profile)]);
+    state.automation?.current_id, state.automation?.phase, state.automation?.jobs, liveJob()?.id, state.plan.status, Boolean(state.profile),
+    state.engines]);
   if (!force && signature === rowSignature) return;
   rowSignature = signature;
   renderRetryStrip();
@@ -844,6 +892,7 @@ function renderTickets(force = false) {
 
 function renderBrowser() {
   syncChatBrowser();
+  renderEngines();
   const personal = state.browser.mode === 'personal';
   const opening = !personal && state.active_job && state.browser.job_id !== state.active_job;
   const browser = opening ? {open: false, revision: state.browser.revision} : state.browser;

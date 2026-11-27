@@ -12,13 +12,14 @@ import re
 import secrets
 import sqlite3
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Literal
 
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field, ValidationError
 from PIL import UnidentifiedImageError
@@ -41,6 +42,7 @@ from .ingest import IMAGE_EXT, MAX_UPLOAD, save_input, save_upload, validate_doc
 from .local_reader import read_local_page
 from .medicion import medicion_router
 from .models import Profile, Receipt
+from .motores import Engines, tickets_at_once
 from .proveedores_ia import SelectorIA
 from .runner import Runner
 from .sat import sat_router
@@ -179,6 +181,10 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
     plan = SelectorIA(root, port)
     gmail_connection = GmailConnection(root, port)
     runner = Runner(store, plan)
+    # The main engine and, when FACTURADOR_TICKETS_A_LA_VEZ asks for more than one ticket at a time,
+    # its helpers. Behind the entrance for several customers each account keeps a single engine.
+    several_accounts = bool(public_origin) or (os.getenv('FACTURADOR_MODO') or '').strip().lower() == 'usuarios'
+    engines = Engines(runner, tickets_at_once(accounts=several_accounts))
     container_browser = os.getenv("FACTURADOR_CONTAINER") == "1"
     token = secrets.token_urlsafe(32)
     diagnostics_lock = asyncio.Lock()
@@ -189,6 +195,11 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
     @asynccontextmanager
     async def lifespan(app):
         store.recover_after_restart()
+        if engines.several:
+            # Each ticket in its portal keeps a worker thread busy while the model answers; the
+            # reads, the mail and the panel must still find one free.
+            asyncio.get_running_loop().set_default_executor(
+                ThreadPoolExecutor(max_workers=16 + 4 * engines.limit, thread_name_prefix='facturai'))
         try:
             if container_browser and not lazy_browser:
                 try:
@@ -205,12 +216,13 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
             await mail_recovery.close()
             await automation.close()
             await wa_routes.watcher.close()
-            await runner.close()
+            await engines.close()
             plan.close()
 
     app = FastAPI(title="Facturador", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store
     app.state.runner = runner
+    app.state.engines = engines
     app.state.plan = plan
     app.state.csrf_token = token
     app.include_router(sat_router(store))
@@ -252,17 +264,26 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
             raise ValueError("Guarda primero tus datos fiscales en el panel")
         return Profile.model_validate_json(path.read_text(encoding="utf-8"))
 
-    automation = TicketAutomation(store, runner, plan, profile, whatsapp=lambda: app.state.whatsapp, mail=True)
+    # With a single engine the queue, the mail and the chat talk to it exactly as before.
+    automation = TicketAutomation(store, runner, plan, profile, whatsapp=lambda: app.state.whatsapp, mail=True,
+                                  engines=engines if engines.several else None)
     # The worker itself checks whether any mailbox (Gmail or IMAP) is connected.
-    mail_recovery = InvoiceMailRecovery(store, lambda: automation.enabled, lambda: runner.active_id)
+    mail_recovery = InvoiceMailRecovery(store, lambda: automation.enabled,
+                                        engines.active_tickets if engines.several else lambda: runner.active_id)
     app.state.automation = automation
-    app.include_router(chat_router(store, plan, automation, runner, profile))
+    app.include_router(chat_router(store, plan, automation, engines if engines.several else runner, profile))
     # The plan only picks a category when the rules cannot classify a merchant's question.
     wa_routes = whatsapp_router(store, runner, profile, plan)
     app.state.whatsapp = wa_routes
-    app.include_router(wa_routes)
-    app.include_router(portal_accounts_router(root, runner.viewer, profile))
-    app.include_router(portal_mail_router(root, runner.viewer, profile))
+
+    async def whatsapp_in_front(request: Request):
+        # WhatsApp lives in the main browser: a chat the person opens there is what the panel shows.
+        if request.method == 'POST' and request.url.path.rsplit('/', 1)[-1] in {'open', 'send', 'complete', 'recover'}:
+            engines.choose_main()
+
+    app.include_router(wa_routes, dependencies=[Depends(whatsapp_in_front)] if engines.several else None)
+    app.include_router(portal_accounts_router(root, engines.viewer, profile))
+    app.include_router(portal_mail_router(root, engines.viewer, profile))
     app.include_router(correo_router(root, store, profile))
     app.include_router(ia_router(root, plan))
     app.include_router(medicion_router(store))
@@ -322,16 +343,24 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
         async with diagnostics_lock:
             return await check_tools(runner, gmail_connection)
 
+    def shown(state):
+        """The state of the browser for the panel: with several engines, that of the one in front."""
+        return engines.browser_state() if engines.several else state
+
     @app.post('/api/browser/restart')
     async def restart_browser():
         if runner.has_active_jobs() or runner.lock.locked():
             raise ValueError('Termina el trámite del navegador para poder reiniciarlo.')
+        await engines.show_main()
         async with runner.lock:
             await runner.viewer.set_manual(False)
             if runner.context:
                 await runner.context.close()
             await runner.personal.close()
-        return await runner.open_personal()
+        await engines.rest_helpers(force=True)  # The helpers that rest close theirs too.
+        state = await runner.open_personal()
+        engines.choose_main()
+        return shown(state)
 
     @app.post('/api/chatgpt/connect')
     def openai_connect(new_account: bool = Body(default=False, embed=True), consent: bool = Body(default=False, embed=True)):
@@ -405,40 +434,63 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
     async def open_browser(provider: str | None = Body(default=None, max_length=64),
                            url: str | None = Body(default=None, max_length=2048),
                            confirmed_origin: str = Body(default='', max_length=300)):
+        engines.check_portal_free(provider, url)  # Never beside a ticket that another engine has on that portal.
+        await engines.show_main()
         await runner.open_portal(provider, url, confirmed_origin)
-        return runner.browser_state()
+        engines.choose_main()
+        return engines.browser_state()
 
     @app.post('/api/browser/personal')
     async def personal_browser(url: str | None = Body(default=None, max_length=2048),
                                channel: str = Body(default='', max_length=64)):
-        return await runner.open_personal(url, channel)
+        await engines.show_main(channel)
+        state = await runner.open_personal(url, channel)
+        engines.choose_main()
+        return shown(state)
 
     @app.post('/api/browser/personal/tabs')
     async def personal_tabs(action: Literal['new', 'select', 'close'] = Body(),
                             tab_id: str | None = Body(default=None, max_length=64),
                             channel: str = Body(default='', max_length=64)):
-        return await runner.open_personal(channel=channel, action=action, tab_id=tab_id)
+        await engines.show_main(channel)
+        state = await runner.open_personal(channel=channel, action=action, tab_id=tab_id)
+        engines.choose_main()
+        return shown(state)
+
+    @app.post('/api/browser/focus')
+    async def browser_focus(engine: int | None = Body(default=None, ge=1, le=8),
+                            job_id: str | None = Body(default=None, max_length=100),
+                            channel: str = Body(default='', max_length=64)):
+        """The person picks which ticket in progress the viewer shows (only with several at once)."""
+        await engines.show(engine=engine, job_id=job_id, channel=channel)
+        return engines.browser_state()
 
     def check_captcha_ticket(key):
-        pending = runner.pending.get(key)
-        if (key != runner.active_id or not pending or pending['kind'] != 'captcha' or
-                pending['future'].done() or pending['page'] is not runner.viewer.page or
-                runner.page_job.get(runner.viewer.page) != key):
+        """The engine whose viewer shows the verification this ticket waits for."""
+        engine = engines.of(key)
+        pending = engine.pending.get(key)
+        if (key != engine.active_id or not pending or pending['kind'] != 'captcha' or
+                pending['future'].done() or pending['page'] is not engine.viewer.page or
+                engine.page_job.get(engine.viewer.page) != key):
             raise ValueError('El ticket ya no solicita esta verificación. Actualiza el panel.')
+        return engine
 
     @app.post('/api/browser/return')
     async def return_to_job(channel: str = Body(default='', embed=True, max_length=64),
                             job_id: str | None = Body(default=None, max_length=100)):
         if job_id is not None:
             check_captcha_ticket(job_id)
-        return await runner.return_to_job(channel)
+        state = await runner.return_to_job(channel)
+        if job_id is not None:
+            engines.choose(job_id)
+        return shown(state)
 
     @app.get('/api/browser/frame')
     async def browser_frame(revision: int, have: str = Query(default='', max_length=64),
                             w: int | None = Query(default=None, ge=160, le=2560)):
-        view = runner.screen
-        value, digest = await view.frame_update(revision, have, w)
-        if view is not runner.screen:
+        view, revision = engines.view_at(revision)
+        value, digest = await view.frame_update(revision, have, w) if view is not None else (None, '')
+        if view is not engines.screen:
             value, digest = None, ''
         headers = {'X-Frame-Hash': digest} if digest else {}
         # 204 when there is no frame or it is identical to the one the panel already shows.
@@ -447,17 +499,21 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
 
     @app.post('/api/browser/control')
     async def browser_control(revision: int = Body(embed=True), job_id: str | None = Body(default=None, max_length=100)):
-        view = runner.screen
-        if job_id is None and view is runner.viewer:
-            key = runner.page_job.get(view.page) if view.page is not None else None
-            pending = runner.pending.get(key)
-            if pending and key == runner.active_id:
+        # Control is taken on the screen the panel shows, of the engine in front.
+        engine = engines.focused()
+        view, revision = engines.view_at(revision)
+        if view is None:
+            raise ValueError('Espera a que el navegador quede disponible para intervenir.')
+        if job_id is None and view is engine.viewer:
+            key = engine.page_job.get(view.page) if view.page is not None else None
+            pending = engine.pending.get(key)
+            if pending and key == engine.active_id:
                 if pending['kind'] == 'captcha':
                     job_id = key
                 else:
                     def check_job():
-                        if (view is not runner.viewer or runner.screen is not view or
-                                runner.active_id != key or runner.pending.get(key) is not pending or
+                        if (view is not engine.viewer or engines.screen is not view or
+                                engine.active_id != key or engine.pending.get(key) is not pending or
                                 pending['future'].done() or pending['page'] is not view.page):
                             raise ValueError('El visor ya no corresponde al ticket pendiente.')
                     channel = await view.take_control(revision, check=check_job)
@@ -472,8 +528,8 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
         if job_id is None:
             return {'channel': await view.take_control(revision)}
         def check():
-            check_captcha_ticket(job_id)
-            if view is not runner.viewer or runner.screen is not view:
+            if (check_captcha_ticket(job_id) is not engine or view is not engine.viewer
+                    or engines.screen is not view):
                 raise ValueError('Vuelve al visor de este ticket para resolver la verificación.')
         channel = await view.take_control(revision, check=check)
         try:
@@ -485,51 +541,51 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
 
     @app.post('/api/browser/control/alive')
     async def captcha_control_alive(job_id: str = Body(max_length=100), channel: str = Body(max_length=64)):
-        check_captcha_ticket(job_id)
-        if runner.screen is not runner.viewer:
+        engine = check_captcha_ticket(job_id)
+        if engines.screen is not engine.viewer:
             raise ValueError('La pantalla del ticket cambió.')
-        runner.viewer.require_control(channel)
+        engine.viewer.require_control(channel)
         return {'active': True}
 
     @app.post('/api/browser/release')
     async def browser_release(channel: str = Body(embed=True), abandon: bool = Body(default=False)):
         if abandon:
-            await runner.viewer.release(channel)
-            await runner.personal.view.release(channel)
+            await engines.abandon(channel)
         else:
-            await runner.release_control(channel)
+            await engines.release_control(channel)
         return {'released': True}
 
     @app.post('/api/browser/input')
     async def browser_input(value: ViewerInput | ViewerBatch):
         if isinstance(value, ViewerBatch):
-            await runner.screen.send_batch(value)
+            await engines.screen.send_batch(value)
             return {'sent': True, 'count': len(value.events)}
-        await runner.screen.send(value)
+        await engines.screen.send(value)
         return {'sent': True}
 
     @app.post('/api/browser/dialog')
     async def browser_dialog(dialog_id: str = Body(embed=True), accept: bool = Body(embed=True)):
-        await runner.screen.answer(dialog_id, accept)
+        await engines.screen.answer(dialog_id, accept)
         return {'answered': True}
 
     @app.post('/api/browser/text')
     async def browser_text(channel: str = Body(embed=True, max_length=64)):
-        return {'text': await runner.screen.visible_text(channel)}
+        return {'text': await engines.screen.visible_text(channel)}
 
     @app.post('/api/browser/screenshot')
     async def browser_screenshot(channel: str = Body(embed=True, max_length=64)):
-        return Response(content=await runner.screen.screenshot(channel), media_type='image/png',
+        return Response(content=await engines.screen.screenshot(channel), media_type='image/png',
                         headers={'Content-Disposition': 'attachment; filename="captura-portal.png"'})
 
     @app.post('/api/browser/history')
     async def browser_history(channel: str = Body(default='', max_length=64), direction: Literal['back', 'forward', 'reload'] = Body()):
-        view = runner.screen
+        engine = engines.focused()
+        view = engine.screen
         personal = view is runner.personal.view
-        if runner.has_active_jobs() and not personal:
+        if engine.has_active_jobs() and not personal:
             raise ValueError('El historial está disponible al navegar por cuenta propia.')
         await view.history(channel, direction, personal=personal)
-        return runner.browser_state()
+        return engines.browser_state()
 
     @app.post('/api/browser/upload')
     async def browser_upload(channel: str = Form(max_length=64), request_id: str = Form(max_length=64),
@@ -542,7 +598,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
             if mime != mimetypes.guess_type(name)[0]:
                 raise ValueError('La extensión no coincide con el contenido del documento.')
             payload = {'name': name, 'buffer': data, 'mimeType': mime}
-        await runner.screen.attach(channel, request_id, payload)
+        await engines.screen.attach(channel, request_id, payload)
         return {'attached': payload is not None}
 
     @app.get('/api/browser/downloads')
@@ -555,7 +611,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
         return FileResponse(path, filename=path.name[17:])
 
     def panel_row(row: dict) -> dict:
-        row['retry_action'] = runner.retry_action(row)
+        row['retry_action'] = engines.retry_action(row)
         row['can_retry'] = bool(row['status'] == 'blocked' and row['billing_profile'] and
                                 not (row['issue_attempted'] or row['human_exposed'] or row['issuance_seen'] or row['uuid']))
         row.pop("source_path", None)
@@ -564,22 +620,25 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
         row.pop('auto_stage', None)
         row.pop('confirmed_payment', None)
         row["has_pdf"], row["has_xml"] = bool(row.pop("pdf")), bool(row.pop("xml"))
-        row["human_kind"] = runner.pending.get(row["id"], {}).get("kind")
+        row["human_kind"] = engines.waiting_kind(row["id"])
         return row
 
     @app.get("/api/state")
     def state(request: Request):
         path = root / "profile.json"
         status = automation.status()
-        keep = {runner.active_id, status.get('current_id'), *runner.pending, *(status.get('jobs') or {})}
+        keep = {*engines.open_tickets(), status.get('current_id'), *(status.get('jobs') or {})}
         jobs, cursor = store.panel_jobs(RECENT_JOBS, tuple(key for key in keep if isinstance(key, str)))
+        # With several engines the viewer shows one of them: the browser and the active ticket are its own,
+        # and the list of what else can be shown comes along.
+        several = {'engines': engines.panel()} if engines.several else {}
         # Recent and open tickets only; the rest of the history is paged from /api/jobs.
         return tagged_json(request, {
             "token": token, "profile": read_json(path), "jobs": [panel_row(row) for row in jobs],
             "jobs_summary": store.job_summary(), "history_cursor": encode_cursor(cursor),
             "supports_ticket_retry": True, "supports_captcha_control": True, 'catalog_url': '/api/catalog',
             'plan': plan.status(), 'gmail': gmail_connection.status(), 'automation': status,
-            'browser': runner.browser_state(), 'active_job': runner.active_id})
+            'browser': engines.browser_state(), 'active_job': engines.active_id, **several})
 
     @app.get('/api/catalog')
     def catalog(request: Request):
@@ -697,24 +756,29 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
             raise ValueError('Conecta tu IA en Ajustes antes de encolar.')
         if row['receipt']['provider'] == CUSTOM_PORTAL and (not value.confirmed_url or value.confirmed_url != row['receipt'].get('portal_url')):
             raise ValueError('Confirma la dirección actual del comercio antes de iniciar el trámite.')
-        runner.schedule(key, profile(), value.auto_issue, manual=value.mode == 'manual', confirmed_url=value.confirmed_url)
+        engines.schedule(key, profile(), value.auto_issue, manual=value.mode == 'manual', confirmed_url=value.confirmed_url)
+        engines.choose(key)  # Among several, the ticket the person just started is the one shown.
         return {"queued": True}
 
     @app.post("/api/jobs/{key}/decision")
     async def decision(key: str, decision: str = Body(embed=True)):
         if decision not in {"approve", "resume", "cancel", "manual"}:
             raise ValueError("Decisión inválida")
-        await runner.continue_job(key, decision)
+        await engines.continue_job(key, decision)
+        if decision != 'cancel':
+            engines.choose(key)
         return {"continued": True}
 
     @app.post("/api/jobs/{key}/stop")
     async def stop(key: str):
-        await runner.stop(key)
+        await engines.stop(key)
         return {"stopped": True}
 
     @app.post('/api/jobs/{key}/retry')
     async def retry_ticket(key: str):
-        return await runner.retry_job(key, profile)
+        result = await engines.retry_job(key, profile)
+        engines.choose(key)
+        return result
 
     @app.get("/api/jobs/{key}/events")
     def events(key: str, after: int | None = Query(default=None, ge=0)):
@@ -747,7 +811,7 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
 
     def recovery_profile(key: str) -> Profile:
         row = store.get(key)
-        if key in runner.job_tasks:
+        if engines.busy_with(key):
             raise ValueError('Espera a que termine el trámite abierto para recuperar el comprobante.')
         return Profile.model_validate_json(row['billing_profile']) if row['billing_profile'] else profile()
 
@@ -803,7 +867,9 @@ def create_app(data_root: Path | None = None, *, port: int = 8765, public_origin
 
     @app.post("/api/whatsapp/open")
     async def whatsapp_open():
+        await engines.show_main()
         await runner.open_whatsapp()
+        engines.choose_main()
         return {"opened": True}
 
     @app.post("/api/whatsapp/capture")

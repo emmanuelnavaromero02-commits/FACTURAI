@@ -141,6 +141,22 @@ El motor es general: no hay reglas por comercio en su código.
 
   Cada portal se corre en dos pasadas: la segunda mide lo que ahorra la memoria. El comando imprime un resumen en español y guarda las cifras en el JSON.
 
+### Varios tickets a la vez
+
+Por omisión FACTURAI trabaja un ticket a la vez en el portal, y un ticket que espera a la persona (una verificación, una aprobación, un acceso) hace esperar a los demás. `FACTURADOR_TICKETS_A_LA_VEZ` (de 1 a 4; por omisión 1) permite que varios tickets recorran sus portales al mismo tiempo. Con 1 nada cambia.
+
+- **Cada ticket simultáneo usa otro navegador.** El de siempre es el principal. Los demás se abren cuando reciben un ticket, cada uno con su propia carpeta de sesión (`browser_profile_2`, `browser_profile_3`…), y se cierran solos tras un minuto sin trabajo (quince minutos si guardan la página de un ticket de resultado incierto).
+- **Un ticket que espera a la persona ya no detiene a los otros:** ocupa solo su navegador.
+- **Nunca dos tickets del mismo portal a la vez.** La sesión, la cuenta y el alta de un portal son de una sola visita. El segundo ticket espera con «Esperando a que termine otro ticket del mismo portal.» y después usa el navegador que ya tiene esa sesión.
+- **Los candados de emisión son los mismos.** Cada navegador corre el mismo motor, ticket por ticket, con los mismos cotejos y topes.
+- **Una sola vista en vivo.** El panel muestra el ticket que más lleva esperando a la persona; si ninguno espera, el que elegiste; si no, el del navegador principal. Con más de un trámite en un portal aparece «Trámite a la vista» sobre el visor para elegir cuál ver, y cada ticket ofrece «Ver en vivo». El control de la página se toma siempre sobre lo que se ve.
+- **Una sola pregunta abierta en el chat.** Si dos tickets necesitan preguntarte algo, la segunda pregunta espera a que contestes la primera o a que venza. Esa espera no se le cobra al trámite.
+- **WhatsApp, el navegador personal y los envíos de correo** usan solo el navegador principal.
+- **Memoria.** En una PC con Windows, con Chrome sin ventana y una página de prueba sencilla, cada navegador extra ocupó unos 380 MB (cerca de 260 MB de Chrome y 120 MB de su controlador). Un portal real pesa más y en el servidor no se midió: sube el valor de uno en uno y vigila la memoria. En Docker la variable va en `environment:` del servicio en `compose.yaml`, y conviene subir `shm_size`.
+- **No aplica con varios usuarios** (`FACTURADOR_MODO=usuarios`): ahí cada cuenta trabaja un ticket a la vez y el tope de navegadores entre cuentas es `FACTURADOR_NAVEGADORES_MAX`.
+
+Un valor que no sea de 1 a 4 se toma como 1 y deja un aviso en el registro. Esto se probó con los portales inventados del banco y la IA guionizada, no con portales reales.
+
 ### Permisos de una sola vez
 
 En **Ajustes → Permisos** dejas autorizado lo que no quieres confirmar en cada ticket. Todos empiezan apagados y puedes quitarlos cuando quieras. Cada cambio deja un evento de auditoría con su fecha.
@@ -246,7 +262,7 @@ El modo local es una instancia privada para una persona. Con el modo de varios u
 
 **Local** (por omisión, `FACTURADOR_MODO=local`): una persona, sin cuentas, panel en `127.0.0.1`. No hace falta configurar nada. La llave maestra es opcional.
 
-**Varios usuarios** (`FACTURADOR_MODO=usuarios`): una puerta de entrada maneja cuentas y sesiones y entrega cada petición a la instancia de ese cliente, con su propia carpeta de datos, su perfil, su navegador y sus conexiones. Las instancias arrancan al primer uso y se cierran en reposo solo si no tienen trámites ni tareas pendientes. Las contraseñas se guardan con scrypt, la sesión viaja en una cookie `__Host-` que el navegador manda solo por `https`, hay freno a los intentos de adivinar contraseñas y las invitaciones son de un solo uso. El administrador gestiona cuentas e invitaciones, pero no ve los datos de un cliente ni entra como él.
+**Varios usuarios** (`FACTURADOR_MODO=usuarios`): una puerta de entrada maneja cuentas y sesiones y entrega cada petición a la instancia de ese cliente, con su propia carpeta de datos, su perfil, su navegador y sus conexiones. Las instancias arrancan al primer uso y se cierran en reposo solo si no tienen trámites ni tareas pendientes. Las contraseñas se guardan con scrypt, la sesión viaja en una cookie `__Host-` que el navegador manda solo por `https`, hay freno a los intentos de adivinar contraseñas y las invitaciones son de un solo uso. El administrador gestiona cuentas e invitaciones, pero no ve los datos de un cliente ni entra como él. `FACTURADOR_TICKETS_A_LA_VEZ` no aplica en este modo: cada cuenta trabaja un ticket a la vez.
 
 Cómo activarlo (los mismos pasos están comentados en `compose.yaml`, apagados por omisión):
 

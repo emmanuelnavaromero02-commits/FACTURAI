@@ -405,7 +405,9 @@ export function installViewer({api, token, showError, perform, accountEmail = ()
     byId(id).addEventListener('click', () => perform(() => api('/api/browser/dialog', 'POST', {dialog_id: browser.dialog.id, accept})));
   }
   frameLoop();
-  return {update, hasControl: () => Boolean(channel), openPersonal: navigation.openPersonal,
+  // With several tickets at once the viewer shows one of them; the lease of the screen it leaves goes along.
+  const focus = target => api('/api/browser/focus', 'POST', {...target, channel});
+  return {update, hasControl: () => Boolean(channel), openPersonal: navigation.openPersonal, focus,
     returnToJob: navigation.returnToJob, gmail: navigation.gmail, acquireControl, releaseControl,
     returnToCaptcha: id => api('/api/browser/return', 'POST', {channel, job_id: id})};
 }

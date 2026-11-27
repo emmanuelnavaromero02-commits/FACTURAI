@@ -14,6 +14,7 @@ import time
 import traceback
 import weakref
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -337,11 +338,23 @@ async def visible_challenge(page, snapshot: str) -> str | None:
     return None
 
 
+def no_turn(_key: str):
+    """A single engine has nobody to wait for."""
+    return nullcontext()
+
+
 class Runner:
-    def __init__(self, store: Store, plan: ChatGPTPlan | None = None):
+    def __init__(self, store: Store, plan: ChatGPTPlan | None = None, *, profile_suffix: str = ''):
         self.store = store
         self.plan = plan or ChatGPTPlan(store.root)
         self.owns_plan = plan is None
+        # Several engines may work at once (see motores.py): each one is a whole Runner with its own
+        # browser profile folder. Their coordinator sets the three hooks below; alone, an engine
+        # starts its tickets itself, waits for no other and asks in the chat whenever it needs to.
+        self.profile_suffix = profile_suffix
+        self.dispatch = None        # takes a ticket the store just queued, in place of start_queued
+        self.portal_turn = no_turn  # holds a ticket while another engine works on the same portal
+        self.chat_turn = None       # lock shared by the engines: one open question in the chat
         self.viewer = BrowserView()
         self.widgets = WidgetTransport()
         self.personal = PersonalBrowser(store.root, lambda download: self.track_download(download, None))
@@ -409,19 +422,19 @@ class Runner:
                     self.playwright = await async_playwright().start()
                 if headed_chrome:
                     self.context = await launch_chrome(self.playwright.chromium.launch_persistent_context,
-                        self.store.root / 'browser_profile_chrome', executable_path='/usr/bin/google-chrome-stable',
+                        self.profile_folder('_chrome'), executable_path='/usr/bin/google-chrome-stable',
                         headless=False, chromium_sandbox=True, **settings)
                     self.engine = 'Google Chrome'
                 else:
                     try:
                         self.context = await self.playwright.chromium.launch_persistent_context(
-                            self.store.root / 'browser_profile', executable_path=os.getenv('FACTURADOR_CHROMIUM_PATH'), headless=True,
+                            self.profile_folder(), executable_path=os.getenv('FACTURADOR_CHROMIUM_PATH'), headless=True,
                             chromium_sandbox=True, **settings)
                         self.engine = 'Chromium'
                     except BrowserError:
                         # Keep interception available in Firefox; Playwright blocks worker registration separately.
                         self.context = await self.playwright.firefox.launch_persistent_context(
-                            self.store.root / 'browser_profile_firefox', headless=True,
+                            self.profile_folder('_firefox'), headless=True,
                             firefox_user_prefs={'dom.serviceWorkers.enabled': True}, **settings)
                         self.engine = 'Firefox'
             except Exception as exc:
@@ -445,6 +458,10 @@ class Runner:
             for page in self.context.pages:
                 self.register_page(page)
             await self.context.route('**/*', self.guard_navigation)
+
+    def profile_folder(self, browser: str = '') -> Path:
+        """Where this engine keeps its browser session: browser_profile, browser_profile_chrome…, plus its own suffix."""
+        return self.store.root / ('browser_profile' + browser + self.profile_suffix)
 
     def register_page(self, page):
         async def widget_frame_arrived(frame):
@@ -794,6 +811,10 @@ class Runner:
     def schedule(self, key: str, profile: Profile, auto_issue: bool = False, manual: bool = False, confirmed_url: str = ''):
         if not self.store.queue(key, profile, confirmed_url):
             raise ValueError('Solo se puede encolar un ticket revisado y sin emisión previa.')
+        (self.dispatch or self.start_queued)(key, profile, auto_issue, manual)
+
+    def start_queued(self, key: str, profile: Profile, auto_issue: bool = False, manual: bool = False):
+        """Work on a ticket the store already has in the queue."""
         if not self.personal.interacting:
             self.personal_at_revision = None
         self.track_job(key, self.run(key, profile, auto_issue, manual))
@@ -827,7 +848,7 @@ class Runner:
         return True
 
     async def recover_queued(self, key, profile):
-        async with self.lock:
+        async with self.portal_turn(key), self.lock:
             if self.store.get(key)['status'] in FINAL:
                 return
             self.active_id = key
@@ -1295,7 +1316,23 @@ class Runner:
         while it is open and for a while after, so the chat hands the answer over here without
         storing it, and a code that arrives late goes nowhere. It is not a question of the model:
         it does not count among them nor enter the record of the ones already asked.
+
+        Several engines share one conversation, so only one of their questions is open at a time:
+        the person's next message answers that one. The others wait for their turn, and that
+        wait is not charged to the attempt either.
         """
+        if self.chat_turn is None:
+            return await self._ask_chat(key, question, secreto)
+        queued_since = time.monotonic()
+        if self.chat_turn.locked():
+            self.store.running_message(key, 'Tengo una pregunta para ti. La hago en el chat cuando se conteste la anterior.')
+        async with self.chat_turn:
+            meter = self.meters.get(key)
+            if meter:
+                meter.waited += time.monotonic() - queued_since
+            return await self._ask_chat(key, question, secreto)
+
+    async def _ask_chat(self, key: str, question: str, secreto: bool) -> str:
         future = asyncio.get_running_loop().create_future()
         self.questions[key] = future
         question = ' '.join(question.split())[:600]
@@ -1690,7 +1727,8 @@ class Runner:
 
     async def run(self, key: str, profile: Profile, auto_issue: bool = False, manual: bool = False):
         with en_ticket(key):  # Every model call of this run is counted for this ticket.
-            await self._run(key, profile, auto_issue, manual)
+            async with self.portal_turn(key):
+                await self._run(key, profile, auto_issue, manual)
 
     async def _run(self, key: str, profile: Profile, auto_issue: bool = False, manual: bool = False):
         async with self.lock:

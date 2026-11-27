@@ -508,11 +508,14 @@ READ_PHASES = {
 
 
 class TicketAutomation:
-    def __init__(self, store, runner, plan, get_profile, *, whatsapp=None, mail=None):
+    def __init__(self, store, runner, plan, get_profile, *, whatsapp=None, mail=None, engines=None):
         """`whatsapp` returns the WhatsApp routes (or None); `mail` is a mail outbox, or True for the program's own.
 
-        Without them a ticket that asks for a direct request waits for the person."""
+        Without them a ticket that asks for a direct request waits for the person. `engines` is the
+        coordinator of several engines (motores.py): with it a ready ticket starts as soon as one of
+        them can take it; `runner` stays the main one, the only one that uses WhatsApp and the mail."""
         self.store, self.runner, self.plan, self.get_profile = store, runner, plan, get_profile
+        self.engines = engines
         self.whatsapp = whatsapp
         self.mail = MailOutbox(store) if mail is True else mail
         # Only tickets created after this start may be requested by the queue: a new
@@ -743,11 +746,18 @@ class TicketAutomation:
         except ValueError:
             self._set('waiting_profile', key, 'Guarda tu perfil fiscal en Ajustes para preparar el portal.')
             return False
-        viewer = self.runner.viewer
-        if (self.runner.has_active_jobs() or self.runner.lock.locked() or viewer.channel
-                or viewer.dialog or viewer.file_request):
-            self._set('waiting_browser', key, 'Esperando a que se libere el navegador.')
-            return False
+        if self.engines is not None:
+            # Several engines: one of them must be free and nobody else on this ticket's portal.
+            waiting = self.engines.waits_for(row['receipt'])
+            if waiting:
+                self._set('waiting_browser', key, waiting)
+                return False
+        else:
+            viewer = self.runner.viewer
+            if (self.runner.has_active_jobs() or self.runner.lock.locked() or viewer.channel
+                    or viewer.dialog or viewer.file_request):
+                self._set('waiting_browser', key, 'Esperando a que se libere el navegador.')
+                return False
         # No await between checking ownership and calling schedule, which atomically claims
         # the job in SQLite and registers its task before yielding control to other handlers.
         self.runner.schedule(key, profile, auto_issue=True,
@@ -1078,9 +1088,27 @@ class TicketAutomation:
             self.store.note_review(previous, message)
             self._set('review', previous['id'], message)
             return True
-        ready = self.store.auto_candidates('ready')
-        if ready and self._prepare(ready):
-            return True
+        if self.engines is None:
+            ready = self.store.auto_candidates('ready')
+            if ready and self._prepare(ready):
+                return True
+        else:
+            # Several engines: a ticket whose portal is busy does not hold the ones behind it.
+            ready = held = None
+            for row in self._ready_inbox():
+                if ready is not None and self.engines.waits_for(row['receipt']):
+                    # Behind the oldest one, only a ticket that can start right now is prepared.
+                    if self.engines.portal_busy(row['receipt']):
+                        continue
+                    break  # Nobody can take another ticket now.
+                ready = ready or row
+                if self._prepare(row):
+                    return True
+                held = held or self._state  # What the oldest one waits for is what the panel says.
+                if not self.engines.portal_busy(row['receipt']):
+                    break  # It waits for something else, as the only ticket of a single engine would.
+            if held:
+                self._state = held
         incoming = None
         if self._read_slots() > 0:
             plan_ready = self.plan.status()['status'] == 'ready' and self.plan_read_after <= time.time()
@@ -1102,6 +1130,8 @@ class TicketAutomation:
             return True
         if ready:
             return False
+        if self.engines is not None:
+            return await self._rest_with_engines()
         if self.runner.has_active_jobs():
             key = self.runner.active_id or next(iter(self.runner.job_tasks))
             self._set('queued', key, self.store.get(key)['message'])
@@ -1112,23 +1142,53 @@ class TicketAutomation:
                     result = await self.runner.retry_job(key, self.get_profile, automatic=True)
                     self._set('recovering', key, result['message'])
                     return True
-            pending = self.store.auto_candidates('review', stage='review') or self.store.auto_candidates('ready', stage='review')
-            offline = self.store.auto_candidates('review', stage='offline')
-            retry = self.store.auto_candidates('review', stage='retry_read')
-            if retry:
-                if self._plan_ready(retry['id']):
-                    self._set('waiting_read', retry['id'], retry['message'])
-            elif pending:
-                self._set('review', pending['id'], pending['message'])
-            elif offline:
-                self._plan_ready(offline['id'])
-            elif self.reads:
-                count = len(self.reads)
-                self._set('reading', next(iter(self.reads)),
-                          'Leyendo un ticket.' if count == 1 else f'Leyendo {count} tickets.')
-            else:
-                self._reset()
+            self._explain_rest()
         return False
+
+    def _ready_inbox(self):
+        """Every inbox ticket ready for its portal, oldest first: what auto_candidates('ready') gives one by one."""
+        with self.store.connect() as db:
+            rows = db.execute(f"SELECT * FROM jobs WHERE {AUTO_ELIGIBLE} AND status='ready' AND auto_stage='' "
+                              "ORDER BY read_after,created,id LIMIT 50").fetchall()
+        return [self.store.decode(row) for row in rows]
+
+    async def _rest_with_engines(self):
+        """The end of a round with several engines: say what is in progress and recover while one is free."""
+        working = self.engines.in_progress()
+        if len(working) == 1:
+            self._set('queued', working[0], self.store.get(working[0])['message'])
+        elif working:
+            waiting = self.engines.waiting_for_person()
+            self._set('queued', None, f'{len(working)} tickets en trámite a la vez.' + (
+                ' Uno espera tu ayuda.' if waiting == 1 else f' {waiting} esperan tu ayuda.' if waiting else ''))
+        if self.engines.free_engine() is not None:
+            key = self.store.next_recovery(int(time.time()))
+            if key:
+                result = await self.engines.retry_job(key, self.get_profile, automatic=True)
+                self._set('recovering', key, result['message'])
+                return True
+        if not working:
+            self._explain_rest()
+        return False
+
+    def _explain_rest(self):
+        """No ticket is in a portal: say what the queue waits for, if anything."""
+        pending = self.store.auto_candidates('review', stage='review') or self.store.auto_candidates('ready', stage='review')
+        offline = self.store.auto_candidates('review', stage='offline')
+        retry = self.store.auto_candidates('review', stage='retry_read')
+        if retry:
+            if self._plan_ready(retry['id']):
+                self._set('waiting_read', retry['id'], retry['message'])
+        elif pending:
+            self._set('review', pending['id'], pending['message'])
+        elif offline:
+            self._plan_ready(offline['id'])
+        elif self.reads:
+            count = len(self.reads)
+            self._set('reading', next(iter(self.reads)),
+                      'Leyendo un ticket.' if count == 1 else f'Leyendo {count} tickets.')
+        else:
+            self._reset()
 
     async def _work(self):
         while not self.stopping:

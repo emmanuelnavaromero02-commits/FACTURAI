@@ -158,14 +158,18 @@ class InvoiceMailRecovery:
     def due(self, now: int) -> list[dict]:
         """Claim every waiting ticket whose next search is due and book the following one."""
         claimed, finished = [], []
+        # The ticket a browser is working on now; several of them when several engines work at once.
+        active = self.active_job()
+        busy = list(active) if isinstance(active, (list, tuple, set)) else [active or '']
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             rows = db.execute(f'''SELECT j.id,j.uuid,j.billing_profile,j.receipt,j.status,
                     COALESCE(c.attempts,0) AS attempts,c.started,COALESCE(c.detail,'') AS detail
                 FROM jobs j LEFT JOIN invoice_mail_checks c ON c.job_id=j.id
-                WHERE {_waiting_clause(db)} AND j.id<>? AND COALESCE(c.state,'searching')='searching'
+                WHERE {_waiting_clause(db)} AND j.id NOT IN ({','.join('?' * len(busy)) or "''"})
+                  AND COALESCE(c.state,'searching')='searching'
                   AND COALESCE(c.next_check,0)<=? ORDER BY j.updated,j.id''',
-                              (self.active_job() or '', now)).fetchall()
+                              (*busy, now)).fetchall()
             for row in rows:
                 started = row['started'] or now
                 delay = next_delay(now - started)
