@@ -1,4 +1,4 @@
-"""Operator-selected registration email for the HTTPS portal currently under control."""
+"""Registration email for the HTTPS portal currently under control, from any connected mailbox."""
 import asyncio
 import ctypes
 import ctypes.util
@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, File, Form, UploadFile
 from pydantic import BaseModel, Field
 
+from . import buzon
 from .catalog import public_portal_origin
 from .gmail import parse_eml, read_selected_message, search_tickets
 from .portal_accounts import REGISTRATION_PAGE, fill_portal_temporary
@@ -92,7 +93,7 @@ ENROLLMENT_CODE = re.compile(r"\bc[oó]digo (?:de (?:activaci[oó]n|registro|con
 def registration_actions(message, origin, recipient, *, from_automatic_search=False):
     host = urlsplit(origin).hostname
     if not host or public_portal_origin(origin) != origin or not matches_sender(message.get("From", ""), host):
-        raise ValueError("El remitente no corresponde al dominio del portal. Revisa el correo en Gmail.")
+        raise ValueError("El remitente no corresponde al dominio del portal. Revisa el correo en tu buzón.")
     delivered = getaddresses([str(v) for k in ("To", "Cc", "Delivered-To", "X-Original-To") for v in message.get_all(k, [])])
     if recipient.casefold() not in {addr.casefold() for _, addr in delivered}:
         raise ValueError("El correo seleccionado tiene otro destinatario.")
@@ -130,8 +131,108 @@ def registration_actions(message, origin, recipient, *, from_automatic_search=Fa
     elif from_automatic_search:
         raise ValueError("El mensaje no identifica una activación de registro.")
     if not actions:
-        raise ValueError("No se identificó una única clave temporal ni una liga de activación de este portal. Revisa el mensaje en Gmail.")
+        raise ValueError("No se identificó una única clave temporal ni una liga de activación de este portal. Revisa el mensaje en tu buzón.")
     return actions
+
+
+def gmail_authenticated(message, host):
+    """Gmail's own inbound aligned DMARC result, exactly as the Gmail-only flow requires it."""
+    sender = str(message.get("From", ""))
+    if not matches_sender(sender, host):
+        return False
+    reports = message.get_all("Authentication-Results", [])
+    if not reports:
+        return False
+    authority, _, results = str(reports[0]).partition(";")
+    if authority.strip().casefold() != buzon.GMAIL_AUTHORITY:
+        return False
+    result = re.search(r"(?:^|;)\s*dmarc=pass\b[^;]*?\bheader\.from=([a-z0-9.-]+)(?:\s|;|$)", results, re.I)
+    from_host = getaddresses([sender])[0][1].rpartition("@")[2].casefold()
+    return bool(result and result.group(1).lower() == from_host)
+
+
+def authenticated_by(message, host, authority):
+    """Require the mailbox provider's own Authentication-Results with DKIM or DMARC passed and aligned.
+
+    The provider writes its header on top. `authority` is its authserv-id, pinned when the
+    account was connected; without it nothing is accepted automatically.
+    """
+    sender = str(message.get("From", ""))
+    if not authority or not matches_sender(sender, host):
+        return False
+    reports = message.get_all("Authentication-Results", [])
+    if not reports or buzon.authserv_id(reports[0]) != authority.casefold():
+        return False
+    from_host = getaddresses([sender])[0][1].rpartition("@")[2].casefold()
+    results = re.sub(r"\([^)]*\)", " ", str(reports[0]).partition(";")[2])
+    for item in results.split(";"):
+        found = re.match(r"\s*(dmarc|dkim)\s*=\s*pass\b(.*)", item, re.I | re.S)
+        if not found:
+            continue
+        method, properties = found.group(1).lower(), found.group(2)
+        if method == "dmarc":
+            header = re.search(r"\bheader\.from\s*=\s*([a-z0-9.-]+)", properties, re.I)
+            if header and header.group(1).lower().rstrip(".") == from_host:
+                return True
+        else:
+            domain = re.search(r"\bheader\.d\s*=\s*([a-z0-9.-]+)", properties, re.I)
+            if domain and mail_domain(domain.group(1).lower().rstrip(".")) == mail_domain(from_host):
+                return True
+    return False
+
+
+def registration_email(root, origin, recipient, started, kind, *, search=None, read=None, authenticated=None,
+                       mailboxes=None):
+    """Look only at messages received after this specific enrollment began, in every connected mailbox.
+
+    Gmail keeps the same query and the same DMARC rule as before (search, read and
+    authenticated let the caller keep its own Gmail helpers). IMAP mailboxes need the
+    provider's pinned authserv-id; a message that cannot be verified is left for the person.
+    """
+    now = time.time()
+    if not 0 <= now - started <= 30 * 60:
+        raise ValueError("La solicitud de alta venció. Revisa el correo del comercio en el navegador.")
+    if not re.fullmatch(r"[A-Za-z0-9_.+%-]+@[A-Za-z0-9.-]+", recipient):
+        raise ValueError("Abre el correo del comercio en el navegador para verificar este destinatario.")
+    host = urlsplit(origin).hostname
+    others = mailboxes() if mailboxes else buzon.imap_mailboxes(root)
+    matches = []
+    if buzon.gmail_connected(root) or not others:
+        search, read = search or search_tickets, read or read_selected_message
+        authenticated = authenticated or gmail_authenticated
+        query = f"to:{recipient} from:({mail_domain(host)}) after:{int(started)} -in:spam -in:trash"
+        for row in search(root, query):
+            received = row["received_ms"] / 1000
+            if not started <= received <= now + 1 or not matches_sender(row["sender"], host):
+                continue
+            message = read(root, row["id"])
+            if not authenticated(message, host):
+                continue
+            try:
+                actions = registration_actions(message, origin, recipient, from_automatic_search=True)
+            except ValueError:
+                continue
+            if kind in actions:
+                matches.append(actions[kind])
+    for box in others:
+        if not box.authority:
+            continue
+        with box:
+            for row in box.search(since=started, sender=mail_domain(host), recipient=recipient, limit=10):
+                if not started <= row["received"] <= now + 1 or not matches_sender(row["sender"], host):
+                    continue
+                message = box.read(row["ref"])
+                if message is None or not authenticated_by(message, host, box.authority):
+                    continue
+                try:
+                    actions = registration_actions(message, origin, recipient, from_automatic_search=True)
+                except ValueError:
+                    continue
+                if kind in actions:
+                    matches.append(actions[kind])
+    if len(matches) > 1:
+        raise ValueError("Hay varios mensajes de alta que coinciden. Elige el correo correcto en el portal.")
+    return matches[0] if matches else None
 
 
 class MailContext(BaseModel):
@@ -188,21 +289,23 @@ def portal_mail_router(root, viewer, profile):
         domain = mail_domain(urlsplit(req.origin).hostname)
         if not re.fullmatch(r"[A-Za-z0-9_.+%-]+@[A-Za-z0-9.-]+", email):
             raise ValueError("Para este formato de correo usa la opción de archivo .eml.")
-        query = f"newer_than:7d to:{email} from:({domain}) -in:spam -in:trash"
-        rows = await asyncio.to_thread(search_tickets, root, query)
+        rows = await asyncio.to_thread(buzon.search_all, root, since=time.time() - 7 * 86400, sender=domain,
+                                       recipient=email, limit=10)
         choices, output = {}, []
         for row in rows:
             if matches_sender(row["sender"], urlsplit(req.origin).hostname):
                 key = secrets.token_urlsafe(14)
-                choices["message:" + key] = row["id"]
+                choices["message:" + key] = row["ref"]
                 output.append({"choice": key, "sender": row["sender"], "subject": row["subject"], "date": row["date"]})
         bind(req, choices)
         return {"messages": output}
 
     @router.post("/select")
     async def select(req: MailChoice):
-        message_id = selected(req, "message:")
-        message = await asyncio.to_thread(read_selected_message, root, message_id)
+        ref = selected(req, "message:")
+        message = await asyncio.to_thread(buzon.read_ref, root, ref)
+        if message is None:
+            raise ValueError("El correo supera el límite de tamaño.")
         return prepare(req, message)
 
     @router.post("/file")

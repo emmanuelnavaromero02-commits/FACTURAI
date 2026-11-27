@@ -8,10 +8,12 @@ from urllib.parse import urlsplit
 from playwright.async_api import Error as BrowserError
 
 from .auth import read_json, write_private
+from .buzon import mailbox_connected
 from .catalog import public_portal_origin
 from .gmail import read_selected_message, search_tickets
 from .portal_accounts import REGISTRATION_PAGE as PAGE, confirm_password_change, credential_file, prepare_form, site_password
-from .portal_mail import mail_domain, matches_sender, registration_actions
+from .portal_mail import mail_domain, matches_sender, registration_actions  # noqa: F401 - kept as patch points
+from .portal_mail import registration_email as mailbox_registration_email
 
 
 ACCOUNT_UI = re.compile(r'contrase[ñn]a|password|registr|crear.{0,12}cuenta|activaci[oó]n|activa tu cuenta|'
@@ -43,31 +45,10 @@ def authenticated_registration(message, host):
 
 
 def registration_email(root, origin, recipient, started, kind):
-    """Look only at messages received by Gmail after this specific enrollment began."""
-    now = time.time()
-    if not 0 <= now - started <= 30 * 60:
-        raise ValueError('La solicitud de alta venció. Revisa el correo del comercio en el navegador.')
-    if not re.fullmatch(r'[A-Za-z0-9_.+%-]+@[A-Za-z0-9.-]+', recipient):
-        raise ValueError('Abre el correo del comercio en el navegador para verificar este destinatario.')
-    host = urlsplit(origin).hostname
-    query = f'to:{recipient} from:({mail_domain(host)}) after:{int(started)} -in:spam -in:trash'
-    matches = []
-    for row in search_tickets(root, query):
-        received = row['received_ms'] / 1000
-        if not started <= received <= now + 1 or not matches_sender(row['sender'], host):
-            continue
-        message = read_selected_message(root, row['id'])
-        if not authenticated_registration(message, host):
-            continue
-        try:
-            actions = registration_actions(message, origin, recipient, from_automatic_search=True)
-        except ValueError:
-            continue
-        if kind in actions:
-            matches.append(actions[kind])
-    if len(matches) > 1:
-        raise ValueError('Hay varios mensajes de alta que coinciden. Elige el correo correcto en el portal.')
-    return matches[0] if matches else None
+    """Look only at messages received after this specific enrollment began, in any connected mailbox."""
+    # The Gmail readers and its DMARC rule are passed from here so they stay patchable in this module.
+    return mailbox_registration_email(root, origin, recipient, started, kind, search=search_tickets,
+                                      read=read_selected_message, authenticated=authenticated_registration)
 
 
 class PortalAccountFlow:
@@ -87,8 +68,8 @@ class PortalAccountFlow:
     async def _message(self, record, kind):
         if record.get('registration_job') != self.job_id or not record.get('registration_started'):
             raise ValueError('Verifica el correo directamente. Este ticket no inició el alta que muestra el portal.')
-        if not (self.root / 'gmail_token.json').is_file():
-            raise ValueError('El comercio requiere verificar el alta. Vincula Gmail en Ajustes y pulsa Continuar, '
+        if not mailbox_connected(self.root):
+            raise ValueError('El comercio requiere verificar el alta. Vincula tu correo en Ajustes y pulsa Continuar, '
                              'o usa Tomar control → Cuenta y datos fiscales → Revisar correo en FACTURAI para abrir un .eml. '
                              'También puedes consultar el correo en Navegación libre y volver al trámite.')
         if self.progress:

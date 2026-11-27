@@ -30,6 +30,7 @@ from .auth import CALLBACK, ChatGPTPlan, PlanError, read_json, write_private
 from .automation import TicketAutomation
 from .catalog import CATALOG, CUSTOM_PORTAL, portal_suggestions
 from .chat import chat_router
+from .correo_ajustes import correo_router
 from .db import Store
 from .diagnostics import check_tools
 from .invoice_mail import InvoiceMailRecovery
@@ -229,14 +230,15 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         return Profile.model_validate_json(path.read_text(encoding="utf-8"))
 
     automation = TicketAutomation(store, runner, plan, profile)
-    mail_recovery = InvoiceMailRecovery(store, lambda: automation.enabled and gmail_connection.status() == 'connected',
-                                        lambda: runner.active_id)
+    # The worker itself checks whether any mailbox (Gmail or IMAP) is connected.
+    mail_recovery = InvoiceMailRecovery(store, lambda: automation.enabled, lambda: runner.active_id)
     app.state.automation = automation
     app.include_router(chat_router(store, plan, automation, runner, profile))
     wa_routes = whatsapp_router(store, runner, profile)
     app.include_router(wa_routes)
     app.include_router(portal_accounts_router(root, runner.viewer, profile))
     app.include_router(portal_mail_router(root, runner.viewer, profile))
+    app.include_router(correo_router(root, store, profile))
 
     @app.exception_handler(ValueError)
     async def invalid(request, exc):
@@ -334,8 +336,9 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
         return gmail_connection.status()
 
     @app.post('/api/gmail/connect')
-    def gmail_start():
-        return {'url': gmail_connection.start()}
+    def gmail_start(send: bool = Body(default=False, embed=True)):
+        # Sending through Gmail is optional and asked only when the person chooses it.
+        return {'url': gmail_connection.start(send)}
 
     @app.get('/auth/gmail/callback')
     def gmail_callback(state: str = '', code: str = '', error: str = ''):

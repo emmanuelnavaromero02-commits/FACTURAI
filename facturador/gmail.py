@@ -20,6 +20,8 @@ from .read_http import read_with_retry
 from .ingest import IMAGE_EXT, MAX_UPLOAD, save_inputs, write_original
 
 SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
+# Optional and never requested by default: only to send an invoice request the owner confirmed.
+SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send'
 AUTHORIZE = 'https://accounts.google.com/o/oauth2/v2/auth'
 TOKEN = 'https://oauth2.googleapis.com/token'
 GMAIL = 'https://gmail.googleapis.com/gmail/v1/users/me/messages'
@@ -65,7 +67,7 @@ class GmailConnection:
             write_private(self.client, {'installed': installed})
             self.pending.clear()
 
-    def start(self) -> str:
+    def start(self, send: bool = False) -> str:
         with GMAIL_LOCK:
             client = read_json(self.client, {}).get('installed')
             if not client:
@@ -78,7 +80,7 @@ class GmailConnection:
                 del self.pending[next(iter(self.pending))]
             self.pending[state] = (verifier, now + 600)
             params = {'client_id': client['client_id'], 'redirect_uri': self.redirect, 'response_type': 'code',
-                      'scope': SCOPE, 'access_type': 'offline', 'prompt': 'consent', 'state': state,
+                      'scope': SCOPE + (' ' + SEND_SCOPE if send else ''), 'access_type': 'offline', 'prompt': 'consent', 'state': state,
                       'code_challenge_method': 'S256', 'code_challenge': challenge}
             return AUTHORIZE + '?' + urlencode(params)
 
@@ -318,3 +320,21 @@ def recover_attachments(root: Path, key: str, query: str) -> list[Path]:
             return result
     except httpx.HTTPError as exc:
         raise ValueError('No se pudo recuperar el correo. Revisa la conexión de Gmail y la consulta.') from exc
+
+
+def can_send(root: Path) -> bool:
+    """True only when the owner granted the optional Gmail send permission."""
+    scope = read_json(root / 'gmail_token.json', {}).get('scope', '')
+    return isinstance(scope, str) and SEND_SCOPE in scope.split()
+
+
+def send_raw(root: Path, data: bytes) -> str:
+    """Send one already composed message. A single POST: it is never retried automatically."""
+    if not can_send(root):
+        raise ValueError('Gmail no tiene permiso de envío. Usa una cuenta de correo con envío.')
+    raw = base64.urlsafe_b64encode(data).decode('ascii')
+    response = httpx.post(GMAIL + '/send', headers={'Authorization': 'Bearer ' + access_token(root)},
+                          json={'raw': raw}, timeout=60, follow_redirects=False)
+    response.raise_for_status()
+    sent = response.json()
+    return str(sent.get('id', ''))[:200] if isinstance(sent, dict) else ''
