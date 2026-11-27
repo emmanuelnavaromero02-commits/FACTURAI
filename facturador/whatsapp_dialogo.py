@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict
 
 from .db import now
 from .models import SAT_PAYMENT_LABELS, Profile, Receipt
+from .uso_ia import en_ticket
 
 _LOG = logging.getLogger(__name__)
 
@@ -332,7 +333,9 @@ class Conversaciones:
             # Earlier messages of the same burst only matter if they steer or deliver.
             earlier = [por_reglas(t) for t in textos[:-1]]
             klass = next((c for c in earlier if c and c.category in {'persona', 'entregada'}), None)
-            klass = klass or clasificar(last, plan)
+            if klass is None:
+                with en_ticket(key):  # A model call here is counted for this ticket.
+                    klass = clasificar(last, plan)
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM whatsapp_conversations WHERE job_id=?', (key,)).fetchone()

@@ -15,6 +15,7 @@ from pypdf.errors import PyPdfError
 
 from .ai import AI
 from .auth import PlanError, read_json, write_private
+from .uso_ia import en_ticket
 from .catalog import CATALOG, CUSTOM_PORTAL, allowed_url, portal_suggestions, public_portal_origin
 from .db import READ_DELAYS
 from .local_reader import read_local_page
@@ -592,7 +593,8 @@ class TicketAutomation:
         self._track(key, claim)
         started, timing = time.monotonic(), {}
         try:
-            result = await self._read_claimed(key, row, claim, automatic, offline, timing)
+            with en_ticket(key):  # Every model call of this read is counted for this ticket.
+                result = await self._read_claimed(key, row, claim, automatic, offline, timing)
         except asyncio.CancelledError:
             # Shutdown: free the ticket now instead of waiting for the next start.
             self.store.release_read(key, claim)

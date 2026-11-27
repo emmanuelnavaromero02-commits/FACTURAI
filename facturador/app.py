@@ -36,9 +36,12 @@ from .diagnostics import check_tools
 from .invoice_mail import InvoiceMailRecovery
 from .documents import browser_file, browser_files, reconcile, save_candidate
 from .gmail import GmailAuthorizationError, GmailConnection, cfdi_parts, import_eml, import_tickets, parse_eml, recover_attachments, search_tickets, ticket_parts
+from .ia_ajustes import ia_router
 from .ingest import IMAGE_EXT, MAX_UPLOAD, save_input, save_upload, validate_document
 from .local_reader import read_local_page
+from .medicion import medicion_router
 from .models import Profile, Receipt
+from .proveedores_ia import SelectorIA
 from .runner import Runner
 from .sat import sat_router
 from .portal_accounts import portal_accounts_router
@@ -161,7 +164,8 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     load_dotenv(BASE / ".env")
     root = (data_root or Path(os.getenv("FACTURADOR_DATA", str(BASE / "data")))).resolve()
     store = Store(root)
-    plan = ChatGPTPlan(root, port)
+    # The selector behaves exactly like the ChatGPT plan until the owner configures a pay-per-use key.
+    plan = SelectorIA(root, port)
     gmail_connection = GmailConnection(root, port)
     runner = Runner(store, plan)
     container_browser = os.getenv("FACTURADOR_CONTAINER") == "1"
@@ -241,6 +245,8 @@ def create_app(data_root: Path | None = None, *, port: int = 8765) -> FastAPI:
     app.include_router(portal_accounts_router(root, runner.viewer, profile))
     app.include_router(portal_mail_router(root, runner.viewer, profile))
     app.include_router(correo_router(root, store, profile))
+    app.include_router(ia_router(root, plan))
+    app.include_router(medicion_router(store))
 
     @app.exception_handler(ValueError)
     async def invalid(request, exc):
