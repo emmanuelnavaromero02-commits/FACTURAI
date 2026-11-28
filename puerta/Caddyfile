@@ -1,0 +1,80 @@
+# Puerta pública del panel de FACTURAI de una sola persona (ver puerta/LEEME.md).
+#
+# FACTURAI_PUERTA_SITIO es el nombre y el puerto por los que se entra, por ejemplo
+# facturas.ejemplo.com:8443. El puerto debe ser 1024 o mayor y el mismo por fuera y por dentro:
+# con él se abre el puerto y con él se compara el origen de cada petición del panel.
+# El certificado y su llave los entrega systemd como credenciales.
+# El panel escucha en 127.0.0.1:8765 y la puerta (puerta.py) en 127.0.0.1:8766.
+#
+# Caddy toma como permiso cualquier respuesta 2xx de la puerta, y la puerta solo contesta 2xx
+# cuando la petición trae la llave de un aparato aprobado.
+{
+	admin off
+	auto_https disable_redirects
+	persist_config off
+	servers {
+		protocols h1 h2
+		# El nombre que pide la petición debe ser el mismo con el que se abrió la conexión segura.
+		strict_sni_host on
+		max_header_size 32KiB
+		timeouts {
+			read_header 15s
+			idle 2m
+		}
+	}
+}
+
+https://{$FACTURAI_PUERTA_SITIO} {
+	tls {$CREDENTIALS_DIRECTORY}/cert {$CREDENTIALS_DIRECTORY}/key
+
+	log {
+		output stderr
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+		-Via
+	}
+
+	# Un destino que no es una ruta (no empieza con /, como «x:y:/algo» o «*») no se atiende:
+	# ni la puerta ni el panel deben recibirlo.
+	@sin_ruta not path /*
+	handle @sin_ruta {
+		respond "Petición no admitida" 400
+	}
+
+	# La página donde un aparato sin permiso ve su número. Solo se lee: la puerta no recibe datos.
+	@puerta path /_puerta /_puerta/*
+	handle @puerta {
+		@no_es_lectura not method GET HEAD
+		respond @no_es_lectura "Método no admitido" 405
+		reverse_proxy 127.0.0.1:8766
+	}
+
+	# Todo lo demás pasa primero por la puerta: sin permiso, nada llega al panel.
+	handle {
+		forward_auth 127.0.0.1:8766 {
+			uri /verificar
+		}
+
+		# El panel local solo acepta peticiones de su propia página.
+		@origen_ajeno {
+			header Origin *
+			not header Origin https://{$FACTURAI_PUERTA_SITIO}
+		}
+		respond @origen_ajeno "Origen no admitido" 403
+
+		# El panel cree que lo abren en su propia máquina: no recibe cookies ni datos de quien entra.
+		reverse_proxy 127.0.0.1:8765 {
+			header_up Host 127.0.0.1:8765
+			header_up Origin .+ http://127.0.0.1:8765
+			header_up -Cookie
+			header_up -X-Forwarded-For
+			header_up -X-Forwarded-Proto
+			header_up -X-Forwarded-Host
+			header_up -Forwarded
+			header_up -X-Real-IP
+		}
+	}
+}

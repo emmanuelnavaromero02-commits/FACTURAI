@@ -1,0 +1,45 @@
+[Unit]
+Description=FACTURAI · puerta: aparatos con permiso
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 -I /opt/facturai-puerta/puerta.py servir
+Environment=FACTURAI_PUERTA_DATOS=%S/facturai-puerta
+Environment=FACTURAI_PUERTA_ADMIN=%t/facturai-puerta/admin.sock
+DynamicUser=yes
+StateDirectory=facturai-puerta
+StateDirectoryMode=0700
+RuntimeDirectory=facturai-puerta
+RuntimeDirectoryMode=0700
+Restart=always
+RestartSec=2
+MemoryMax=256M
+TasksMax=1024
+
+# Solo habla con la propia máquina y no puede tocar nada fuera de su carpeta.
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictAddressFamilies=AF_INET AF_UNIX
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

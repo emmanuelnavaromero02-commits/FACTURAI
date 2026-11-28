@@ -1,0 +1,10 @@
+[Unit]
+Description=FACTURAI · puerta: leer cada semana el certificado renovado
+
+[Timer]
+# Domingo de madrugada (04:30 en Ciudad de México): el corte dura un segundo.
+OnCalendar=Sun *-*-* 10:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

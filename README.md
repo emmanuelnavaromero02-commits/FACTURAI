@@ -301,6 +301,8 @@ El modo local es una instancia privada para una persona. Con el modo de varios u
 
 **Local** (por omisión, `FACTURADOR_MODO=local`): una persona, sin cuentas, panel en `127.0.0.1`. No hace falta configurar nada. La llave maestra es opcional.
 
+Para abrir ese panel local desde el celular sin cambiar de modo, pon delante la puerta de [`puerta/`](puerta/LEEME.md): un proxy con `https` y un permiso por aparato, sin cuentas ni contraseñas. El panel sigue escuchando solo en `127.0.0.1` y conserva tus datos y conexiones.
+
 **Varios usuarios** (`FACTURADOR_MODO=usuarios`): una puerta de entrada maneja cuentas y sesiones y entrega cada petición a la instancia de ese cliente, con su propia carpeta de datos, su perfil, su navegador y sus conexiones. Las instancias arrancan al primer uso y se cierran en reposo solo si no tienen trámites ni tareas pendientes. Las contraseñas se guardan con scrypt, la sesión viaja en una cookie `__Host-` que el navegador manda solo por `https`, hay freno a los intentos de adivinar contraseñas y las invitaciones son de un solo uso. El administrador gestiona cuentas e invitaciones, pero no ve los datos de un cliente ni entra como él. `FACTURADOR_TICKETS_A_LA_VEZ` no aplica en este modo: cada cuenta trabaja un ticket a la vez. Lo único que las cuentas comparten es lo aprendido de los portales de los comercios, sin datos de ninguna persona.
 
 Cómo activarlo (los mismos pasos están comentados en `compose.yaml`, apagados por omisión):

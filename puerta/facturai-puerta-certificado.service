@@ -1,0 +1,6 @@
+[Unit]
+Description=FACTURAI · puerta: volver a leer el certificado renovado
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl try-restart facturai-puerta-proxy.service

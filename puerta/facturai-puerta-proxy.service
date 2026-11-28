@@ -1,0 +1,45 @@
+[Unit]
+Description=FACTURAI · puerta pública con TLS
+After=network-online.target facturai-puerta.service
+Wants=network-online.target facturai-puerta.service
+
+[Service]
+# /etc/facturai-puerta.env trae FACTURAI_PUERTA_SITIO=nombre:puerto. El certificado se indica en
+# /etc/systemd/system/facturai-puerta-proxy.service.d/certificado.conf con dos líneas
+# LoadCredential=cert:/ruta/al/certificado y LoadCredential=key:/ruta/a/la/llave.
+EnvironmentFile=/etc/facturai-puerta.env
+Environment=HOME=%S/facturai-puerta-proxy
+Environment=XDG_DATA_HOME=%S/facturai-puerta-proxy/datos
+Environment=XDG_CONFIG_HOME=%S/facturai-puerta-proxy/config
+ExecStart=/opt/facturai-puerta/caddy run --config /opt/facturai-puerta/Caddyfile --adapter caddyfile
+DynamicUser=yes
+StateDirectory=facturai-puerta-proxy
+StateDirectoryMode=0700
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+MemoryMax=512M
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
